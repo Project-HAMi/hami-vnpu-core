@@ -297,7 +297,7 @@ impl ContainerManager {
                 if current_tokens < last_tokens || self.local.active_workers.load(Ordering::Relaxed) > 0 {
                     saw_progress = true;
                 }
-                if !saw_progress && start_time.elapsed() > Duration::from_millis(5) {
+                if !saw_progress && start_time.elapsed() > Duration::from_micros(50) {
                     debug!("[Manager] --- no progress for 5ms, enter STATE_MEASURING early");
                     break;
                 }
