@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/hook",
+    "crates/limiter",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+libc = "*"
+lazy_static = "1.4.0"
