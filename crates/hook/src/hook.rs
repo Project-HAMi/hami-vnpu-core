@@ -1,13 +1,10 @@
 #![allow(non_snake_case)]
-use lazy_static::lazy_static;
 use limiter::worker::SchedulerClient;
 use once_cell;
 use limiter::externed_api::{RT_ERROR_NONE, RT_ERROR_MEMORY_ALLOCATION};
 use once_cell::sync::Lazy;
 
-lazy_static!{
-    pub static ref NPU_LIMITER: SchedulerClient = SchedulerClient::new();
-}
+pub static NPU_LIMITER: SchedulerClient = SchedulerClient::empty();
 
 macro_rules! passthrough {
     ($name:expr, ($($sig:tt)*), $($arg:expr),*) => {
@@ -24,6 +21,30 @@ macro_rules! passthrough {
             (*REAL)($($arg),*)
         }
     };
+}
+
+macro_rules! passthrough_i32 {
+    ($name:expr, ($($sig:tt)*), $($arg:expr),*) => {
+        {
+            static REAL: Lazy<extern "C" fn($($sig)*) -> i32> = 
+                Lazy::new(|| unsafe {
+                    let ptr = libc::dlsym(libc::RTLD_NEXT, concat!($name, "\0").as_ptr() as *const libc::c_char);
+                    if ptr.is_null() {
+                        panic!("cannot find original function: {}", $name);
+                    }
+                    std::mem::transmute(ptr)
+                });
+            (*REAL)($($arg),*)
+        }
+    };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rtSetDevice(device: i32) -> i32 {
+    // Call on_device_changed BEFORE passthrough. We're still on the old device, so Drop
+    // can destroy streams/events without needing to call rtSetDevice (avoids re-entering hook).
+    NPU_LIMITER.on_device_changed(device);
+    passthrough!("rtSetDevice", (i32), device) as i32
 }
 
 #[unsafe(no_mangle)]
@@ -125,6 +146,209 @@ pub fn rtMemGetInfoEx(memInfoType: u64, free: *mut usize, total: *mut usize) -> 
         return 0;
     }
     return passthrough!("rtMemGetInfoEx", (u64, *mut usize,  *mut usize), memInfoType, free, total);
+}
+
+// ---------------------------------------------------------------------------
+// HCCL collective/point-to-point communication hooks (multi-device support)
+// Only comm ops that take a stream - NOT init/destroy/query
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclAllReduce(
+    sendBuf: *mut libc::c_void,
+    recvBuf: *mut libc::c_void,
+    count: u64,
+    dataType: u32,
+    op: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclAllReduce",
+        (*mut libc::c_void, *mut libc::c_void, u64, u32, u32, u64, u64),
+        sendBuf, recvBuf, count, dataType, op, comm, stream
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclBroadcast(
+    buf: *mut libc::c_void,
+    count: u64,
+    dataType: u32,
+    root: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!("HcclBroadcast", (*mut libc::c_void, u64, u32, u32, u64, u64), buf, count, dataType, root, comm, stream)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclReduceScatter(
+    sendBuf: *mut libc::c_void,
+    recvBuf: *mut libc::c_void,
+    recvCount: u64,
+    dataType: u32,
+    op: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclReduceScatter",
+        (*mut libc::c_void, *mut libc::c_void, u64, u32, u32, u64, u64),
+        sendBuf, recvBuf, recvCount, dataType, op, comm, stream
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclScatter(
+    sendBuf: *mut libc::c_void,
+    recvBuf: *mut libc::c_void,
+    recvCount: u64,
+    dataType: u32,
+    root: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclScatter",
+        (*mut libc::c_void, *mut libc::c_void, u64, u32, u32, u64, u64),
+        sendBuf, recvBuf, recvCount, dataType, root, comm, stream
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclAllGather(
+    sendBuf: *mut libc::c_void,
+    recvBuf: *mut libc::c_void,
+    sendCount: u64,
+    dataType: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclAllGather",
+        (*mut libc::c_void, *mut libc::c_void, u64, u32, u64, u64),
+        sendBuf, recvBuf, sendCount, dataType, comm, stream
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclBarrier(comm: u64, stream: u64) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!("HcclBarrier", (u64, u64), comm, stream)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclSend(
+    sendBuf: *mut libc::c_void,
+    count: u64,
+    dataType: u32,
+    destRank: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclSend",
+        (*mut libc::c_void, u64, u32, u32, u64, u64),
+        sendBuf, count, dataType, destRank, comm, stream
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclRecv(
+    recvBuf: *mut libc::c_void,
+    count: u64,
+    dataType: u32,
+    srcRank: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclRecv",
+        (*mut libc::c_void, u64, u32, u32, u64, u64),
+        recvBuf, count, dataType, srcRank, comm, stream
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclAlltoAllV(
+    sendBuf: *const libc::c_void,
+    sendCounts: *const libc::c_void,
+    sdispls: *const libc::c_void,
+    sendType: u32,
+    recvBuf: *const libc::c_void,
+    recvCounts: *const libc::c_void,
+    rdispls: *const libc::c_void,
+    recvType: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclAlltoAllV",
+        (*const libc::c_void, *const libc::c_void, *const libc::c_void, u32, *const libc::c_void, *const libc::c_void, *const libc::c_void, u32, u64, u64),
+        sendBuf, sendCounts, sdispls, sendType, recvBuf, recvCounts, rdispls, recvType, comm, stream
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclAlltoAll(
+    sendBuf: *const libc::c_void,
+    sendCount: u64,
+    sendType: u32,
+    recvBuf: *const libc::c_void,
+    recvCount: u64,
+    recvType: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclAlltoAll",
+        (*const libc::c_void, u64, u32, *const libc::c_void, u64, u32, u64, u64),
+        sendBuf, sendCount, sendType, recvBuf, recvCount, recvType, comm, stream
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclReduce(
+    sendBuf: *mut libc::c_void,
+    recvBuf: *mut libc::c_void,
+    count: u64,
+    dataType: u32,
+    op: u32,
+    root: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclReduce",
+        (*mut libc::c_void, *mut libc::c_void, u64, u32, u32, u32, u64, u64),
+        sendBuf, recvBuf, count, dataType, op, root, comm, stream
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn HcclBatchSendRecv(
+    sendRecvInfo: *mut libc::c_void,
+    itemNum: u32,
+    comm: u64,
+    stream: u64,
+) -> i32 {
+    NPU_LIMITER.wait_for_token(stream);
+    passthrough_i32!(
+        "HcclBatchSendRecv",
+        (*mut libc::c_void, u32, u64, u64),
+        sendRecvInfo, itemNum, comm, stream
+    )
 }
 
 static REAL_SIGACTION: Lazy<extern "C" fn(libc::c_int, *const libc::sigaction, *mut libc::sigaction) -> libc::c_int> = Lazy::new(|| unsafe {
