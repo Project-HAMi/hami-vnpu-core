@@ -189,9 +189,17 @@ pub struct GlobalRegistry {
 pub const LOCAL_SHMEM_NAME: &str = "vnpu_local_session";
 pub const LOCAL_SHMEM_ENV: &str = "NPU_LOCAL_SHM_NAME";
 
-/// Resolve the local shmem name from env, falling back to default.
+/// Resolve the local shmem name for a specific physical device id.
+/// We suffix the base name with the physical id so managers/workers on different
+/// devices do not collide.
+pub fn local_shmem_name_for(device_phy_id: u32) -> String {
+    let base = std::env::var(LOCAL_SHMEM_ENV).unwrap_or_else(|_| LOCAL_SHMEM_NAME.to_string());
+    format!("{}_{}", base, device_phy_id)
+}
+
+/// Backwards-compatible helper (defaults to device 0). Prefer `local_shmem_name_for`.
 pub fn local_shmem_name() -> String {
-    std::env::var(LOCAL_SHMEM_ENV).unwrap_or_else(|_| LOCAL_SHMEM_NAME.to_string())
+    local_shmem_name_for(0)
 }
 pub const MAX_WORKERS: usize = 32;
 
