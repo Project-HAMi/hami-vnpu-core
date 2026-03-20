@@ -12,4 +12,4 @@ crate-type = ["cdylib"]
 lazy_static = { workspace = true }
 libc = { workspace = true }
 limiter = { path = "../limiter" }
-once_cell = "1.18"
+once_cell = { workspace = true }
