@@ -135,6 +135,7 @@ echo " Ready Timeout(s)  : $READY_TIMEOUT"
 echo " Shared Dir        : $HOST_SHARED_DIR"
 echo " Limiter           : $LIMITER_PATH"
 echo " LD_PRELOAD Lib    : $LIBRARY_PATH"
+echo " UDS Socket Path   : $HOST_SHARED_DIR/npu_limiter_${ID}.sock"
 echo
 
 BENCH_SCRIPT=""
@@ -161,6 +162,7 @@ export NPU_MEM_QUOTA="$NPU_MEM_QUOTA"
 export NPU_GLOBAL_SHM_PATH="$GLOBAL_SHM_PATH"
 export NPU_LOCAL_SHM_NAME="vnpu_local_session_${ID}"
 export NPU_TOKEN_SCALE="$NPU_TOKEN_SCALE"
+export NPU_LIMITER_UDS_PATH="/hami-shared-region/npu_limiter_${ID}.sock"
 
 # Limiter log: info=init only, debug=updates (batch ends, MyAvg, anchor, dead leader), trace=all
 export RUST_LOG="${RUST_LOG:-limiter=info}"

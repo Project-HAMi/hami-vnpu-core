@@ -74,3 +74,26 @@ The AI application must be launched with the `LD_PRELOAD` environment variable p
 ```
 LD_PRELOAD=./target/debug/libvnpu.so python3 your_model.py
 ```
+
+## Testing Dynamic Priority with gRPC
+
+The NPU limiter daemon exposes a Unix Domain Socket (UDS) that allows you to dynamically update the priority of a running container. Because we use `tonic-reflection`, you don't even need the `.proto` files to interact with it.
+
+If you started a container using the provided scripts (e.g. `run_vllm_interactive.sh`, `run_hami_mab.sh`, or `run_hami_mab_multi.sh`), the socket will be exposed to the host in the shared region directory.
+
+### Example Usage
+
+Assuming you launched a container with ID `2` (which creates the socket at `/tmp/hami-shared-region/npu_limiter_2.sock`), you can use `grpcurl` from the host to update the priority to `80.0`:
+
+```bash
+grpcurl \
+  -plaintext \
+  -unix \
+  -d '{"priority": 80.0}' \
+  /tmp/hami-shared-region/npu_limiter_2.sock \
+  npu_limiter.LimiterControl/SetPriority
+```
+
+*Note: The limiter daemon now automatically sets the socket permissions to `0o777`, so you do not need `sudo` to run this command from the host.*
+
+---

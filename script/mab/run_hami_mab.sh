@@ -54,6 +54,7 @@ docker run --rm -it --privileged -u root \
     --name "$CONTAINER_NAME" \
     -e NPU_GLOBAL_SHM_PATH=$GLOBAL_SHM_PATH \
     -e NPU_LOCAL_SHM_NAME=vnpu_local_session_${ID} \
+    -e NPU_LIMITER_UDS_PATH=/hami-shared-region/npu_limiter_${ID}.sock \
     -e NPU_PRIORITY=$PRIORITY \
     -e ASCEND_RT_VISIBLE_DEVICES=1 \
     -e NPU_TOKEN_SCALE=200.0 \
