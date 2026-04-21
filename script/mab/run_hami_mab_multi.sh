@@ -1,34 +1,40 @@
 #!/bin/bash
 
-# 1. Validation
+# Launch a container and run multiple NPU test processes inside it.
+# Usage: ./run_hami_mab_multi.sh <ID> <NUM_PROCS> [PRIORITY] [MODEL] [BATCH] [DURATION]
+#   ID         : Instance identifier (used for container name and logs)
+#   NUM_PROCS  : Number of Python worker processes to start inside the container
+#   PRIORITY   : Container-wide priority (read by manager). Default 50.
+#   MODEL      : Optional model name (default: resnet50)
+#   BATCH      : Optional batch size (default: 32)
+#   DURATION   : Optional duration seconds (default: 120)
+
 if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 <ID> <PRIORITY>"
-    echo "Example: $0 1 20"
+    echo "Usage: $0 <ID> <NUM_PROCS> [PRIORITY] [MODEL] [BATCH] [DURATION]"
     exit 1
 fi
 
 ID=$1
-PRIORITY=$2
-CONTAINER_NAME="mab_hami${ID}"        
+NUM_PROCS=$2
+PRIORITY=${3:-50}
+MODEL=${4:-resnet50}
+BATCH=${5:-32}
+DURATION=${6:-120}
+
+CONTAINER_NAME="mab_hami${ID}"
 LOG_PREFIX="inst${ID}"
 
 # Path Configuration
 IMAGE="registry-cbu.huawei.com/ascend/vllm-ascend:v0.10.1rc1"
-HOST_PROJECT_DIR="/mnt/nvme0/mab"      
-CONTAINER_PROJECT_DIR="/mab"           
-# Host directory published to the container as /hami-shared-region (override on host: export HAMI_HOST_SHARED_DIR=...)
-HOST_SHARED_DIR="${HAMI_HOST_SHARED_DIR:-/tmp/hami-shared-region}"
+HOST_PROJECT_DIR="/mnt/nvme0/mab"
+CONTAINER_PROJECT_DIR="/mab"
+HOST_SHARED_DIR="/tmp/hami-shared-region"
 GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
-# Limit gRPC Unix socket (inside container). On the host the same file is:
-#   ${HOST_SHARED_DIR}/npu_limiter_${ID}.sock
-# Example (ID=2): /tmp/hami-shared-region/npu_limiter_2.sock
-# From host: grpcurl -plaintext -unix -d '{}' "${HOST_SHARED_DIR}/npu_limiter_${ID}.sock" npu_limiter.LimiterControl/GetUtilization
-NPU_LIMITER_SOCK_BASENAME="npu_limiter_${ID}.sock"
 LIMITER_PATH="/mab/hami-vnpu-core/target/debug/limiter"
 LIBRARY_PATH="/mab/hami-vnpu-core/target/debug/libvnpu.so"
 
 # ==========================================
-# 2. Environment Setup
+# 1. Environment Setup
 # ==========================================
 if [ ! -d "$HOST_PROJECT_DIR" ]; then
     sudo mkdir -p "$HOST_PROJECT_DIR"
@@ -41,10 +47,9 @@ if [ ! -d "$HOST_SHARED_DIR" ]; then
 fi
 
 # ==========================================
-# 3. Launch Container
+# 2. Launch Container with global preload
 # ==========================================
 echo "--- [Host] Launching Container: $CONTAINER_NAME ---"
-echo "--- [Host] Limiter gRPC socket (host): ${HOST_SHARED_DIR}/${NPU_LIMITER_SOCK_BASENAME} ---"
 
 docker run --rm -it --privileged -u root \
     --network=host --pid=host \
@@ -59,25 +64,31 @@ docker run --rm -it --privileged -u root \
     -v $HOST_PROJECT_DIR:$CONTAINER_PROJECT_DIR \
     -v /mnt/nvme0/LLMs/:/models \
     --name "$CONTAINER_NAME" \
+    -e LD_PRELOAD=$LIBRARY_PATH \
     -e NPU_GLOBAL_SHM_PATH=$GLOBAL_SHM_PATH \
     -e NPU_LOCAL_SHM_NAME=vnpu_local_session_${ID} \
-    -e NPU_LIMITER_UDS_PATH=/hami-shared-region/${NPU_LIMITER_SOCK_BASENAME} \
+    -e NPU_LIMITER_UDS_PATH=/hami-shared-region/npu_limiter_${ID}.sock \
     -e NPU_PRIORITY=$PRIORITY \
     -e ASCEND_RT_VISIBLE_DEVICES=1 \
     -e NPU_TOKEN_SCALE=200.0 \
     -e HOME=/ \
     $IMAGE \
-    bash -c "
+    bash -lc "
         cd $CONTAINER_PROJECT_DIR
-        # Enable limiter debug logs (worker debug! included)
-        # export RUST_LOG=debug
-        # export NPU_FIXED_SHARE_RATIO=1
         # 1. Start Manager
         ${LIMITER_PATH} > ${CONTAINER_PROJECT_DIR}/${LOG_PREFIX}_manager.log 2>&1 &
-        
+
         sleep 2
-        
-        # 2. Start AI App (Corrected Path below)
-        echo '[Container] Starting Interactive Test...'
-        LD_PRELOAD=${LIBRARY_PATH} python3 -u ${CONTAINER_PROJECT_DIR}/hami-vnpu-core/script/mab/interactive_test.py --prio=${PRIORITY}
+
+        # 2. Start multi-process Python test (all stdout visible here, also logged)
+        echo '[Container] Starting multi-process test...'
+        export LD_PRELOAD=${LIBRARY_PATH}
+        python3 -u ${CONTAINER_PROJECT_DIR}/hami-vnpu-core/script/mab/multi_process_test.py \
+            --num-procs ${NUM_PROCS} \
+            --model ${MODEL} \
+            --batch-size ${BATCH} \
+            --duration ${DURATION} \
+            --prio ${PRIORITY} \
+            --log-prefix ${LOG_PREFIX} \
+            | tee ${CONTAINER_PROJECT_DIR}/${LOG_PREFIX}_apps.log
     "

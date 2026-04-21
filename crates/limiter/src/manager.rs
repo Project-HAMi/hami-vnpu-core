@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::thread;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 const GLOBAL_WATCHDOG_TIMEOUT_US: u64 = 1_000_000;
 const GLOBAL_WAIT_POLL_US: u64 = 1_000;
@@ -15,7 +16,7 @@ const LOCAL_REPORT_GRACE_MS: u64 = 500;
 const MIN_TOKENS: u64 = 1;
 const MAX_TOKENS: u64 = 2_000_000;
 // Seed per-manager average; used both locally and when registering in the global scoreboard.
-const DEFAULT_AVG_US: u64 = 500;
+const DEFAULT_AVG_US: u64 = 100;
 
 #[derive(Debug, Clone, Copy)]
 struct SharePlan {
@@ -33,15 +34,17 @@ pub struct ContainerManager {
     my_pid: i32,
     my_global_idx: usize,
     current_avg_us: u64,
-    my_priority: f64,
+    my_priority: Arc<AtomicU64>,
     token_scale: f64,
     ema_alpha: f64,
     fixed_share_ratio: bool,
+    /// Early exit when no token progress (non-fixed-share); from `NPU_NO_PROGRESS_MS`.
+    no_progress_early: Duration,
     next_run_not_before: Option<Instant>,
 }
 
 impl ContainerManager {
-    pub fn new(global: &'static GlobalRegistry, local: &'static mut LocalContainerShmem, pid: i32) -> Self {
+    pub fn new(global: &'static GlobalRegistry, local: &'static mut LocalContainerShmem, pid: i32, priority_atomic: Arc<AtomicU64>) -> Self {
         let mut idx = 0;
         let mut found = false;
         
@@ -68,6 +71,12 @@ impl ContainerManager {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let no_progress_ms = std::env::var("NPU_NO_PROGRESS_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5);
+        let no_progress_early = Duration::from_millis(no_progress_ms.max(1));
+
         // default value
         let comp_priority = priority_opt.unwrap_or(1.0);
         let memory_limit = mem_opt.unwrap_or(0);
@@ -87,16 +96,23 @@ impl ContainerManager {
         local.memory_limit = AtomicU64::new(memory_limit_bytes);
         local.memory_used = AtomicU64::new(0);
 
+        // If the provided priority is the default 0.0 (which means it wasn't initialized yet),
+        // initialize it with the environment variable priority.
+        if priority_atomic.load(Ordering::Relaxed) == 0.0f64.to_bits() {
+            priority_atomic.store(comp_priority.to_bits(), Ordering::Relaxed);
+        }
+
         Self {
             global,
             local,
             my_pid: pid,
             my_global_idx: idx,
             current_avg_us: DEFAULT_AVG_US,
-            my_priority: comp_priority,
+            my_priority: priority_atomic,
             token_scale,
             ema_alpha,
             fixed_share_ratio,
+            no_progress_early,
             next_run_not_before: None,
         }
     }
@@ -209,11 +225,13 @@ impl ContainerManager {
         }
 
         let my_time = self.current_avg_us.max(1);
+        let current_priority = f64::from_bits(self.my_priority.load(Ordering::Relaxed));
+        
         // Allow sub-1.0 priorities to act as fractions only when fixed-share is requested.
         let prio_for_tokens = if self.fixed_share_ratio {
-            self.my_priority.max(0.01)
+            current_priority.max(0.01)
         } else {
-            self.my_priority.max(1.0)
+            current_priority.max(1.0)
         };
         
         // Base tokens before scaling (used for time budgeting and averaging).
@@ -233,7 +251,7 @@ impl ContainerManager {
         // Compute an off-duty window so the runtime/wait ratio depends on priority only.
         let rest_wait_us = if self.fixed_share_ratio {
             // User-requested: rest = (100 - p) * (anchor * scale)
-            let p = self.my_priority.clamp(1.0, 100.0);
+            let p = current_priority.clamp(1.0, 100.0);
             let wait = ((100.0 - p) * (anchor_speed_us as f64) * self.token_scale).round();
             wait.clamp(0.0, u64::MAX as f64) as u64
         } else {
@@ -242,7 +260,7 @@ impl ContainerManager {
 
         debug!(
             "[Sched] Anchor: {}us, MyAvg: {}us, Prio: {}, BaseTokens: {}, Scale: {}, FinalTokens: {}, Timeout: {}ms, Rest: {}ms",
-            anchor_speed_us, my_time, self.my_priority, base_tokens, self.token_scale, tokens, timeout_us / 1000, rest_wait_us / 1000
+            anchor_speed_us, my_time, current_priority, base_tokens, self.token_scale, tokens, timeout_us / 1000, rest_wait_us / 1000
         );
 
         SharePlan {
@@ -297,8 +315,11 @@ impl ContainerManager {
                 if current_tokens < last_tokens || self.local.active_workers.load(Ordering::Relaxed) > 0 {
                     saw_progress = true;
                 }
-                if !saw_progress && start_time.elapsed() > Duration::from_millis(5) {
-                    debug!("[Manager] --- no progress for 5ms, enter STATE_MEASURING early");
+                if !saw_progress && start_time.elapsed() > self.no_progress_early {
+                    debug!(
+                        "[Manager] --- no progress for {:?}, enter STATE_MEASURING early",
+                        self.no_progress_early
+                    );
                     break;
                 }
             }

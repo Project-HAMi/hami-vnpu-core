@@ -1,8 +1,8 @@
-use crate::shmem::{self, LocalContainerShmem, futex, STATE_IDLE, STATE_RUNNING, STATE_MEASURING, local_shmem_name};
+use crate::shmem::{self, LocalContainerShmem, futex, STATE_IDLE, STATE_RUNNING, STATE_MEASURING, local_shmem_name_for};
 use crate::externed_api::*; 
 use log::{info, debug, warn};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::thread;
 use std::fmt;
@@ -54,9 +54,81 @@ pub struct InnerLock {
 // =========================================================================================
 // SCHEDULER CLIENT (The Public Interface)
 // =========================================================================================
-#[derive(Clone, Debug)]
 pub struct SchedulerClient {
-    pub inner: Arc<SchedulerClientInner>,
+    pub state: RwLock<Option<Arc<SchedulerClientInner>>>,
+}
+
+impl SchedulerClient {
+    pub const fn empty() -> Self {
+        Self {
+            state: RwLock::new(None),
+        }
+    }
+
+    pub fn get_or_init(&self) -> Arc<SchedulerClientInner> {
+        {
+            let read_guard = self.state.read().unwrap();
+            if let Some(inner) = &*read_guard {
+                return inner.clone();
+            }
+        }
+        let mut write_guard = self.state.write().unwrap();
+        if let Some(inner) = &*write_guard {
+            return inner.clone();
+        }
+        let inner = Arc::new(SchedulerClientInner::new());
+        *write_guard = Some(inner.clone());
+        inner
+    }
+
+    pub fn on_device_changed(&self, new_device: i32) {
+        // Take inner out and release lock BEFORE dropping. Otherwise Drop calls rtSetDevice,
+        // which re-enters our hook and deadlocks trying to acquire the same write_guard.
+        let _to_drop = {
+            let mut write_guard = self.state.write().unwrap();
+            if let Some(ref inner) = *write_guard {
+                if inner.logical_device != new_device {
+                    info!("[Scheduler] Device changed from {} to {}, dropping old state", inner.logical_device, new_device);
+                    write_guard.take()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        // write_guard released here; Drop runs when to_drop goes out of scope, without holding the lock
+    }
+
+    pub fn wait_for_token(&self, user_stream: u64) {
+        let inner = self.get_or_init();
+        inner.wait_for_token(user_stream);
+    }
+
+    pub fn is_hbm_limited(&self) -> bool {
+        let inner = self.get_or_init();
+        inner.is_hbm_limited()
+    }
+
+    pub fn check_memory_quota(&self, size: u64) -> u64 {
+        let inner = self.get_or_init();
+        inner.check_memory_quota(size)
+    }
+
+    pub fn post_alloc_hbm(&self, p: u64, size: u64, rts_return: u64) {
+        let inner = self.get_or_init();
+        inner.post_alloc_hbm(p, size, rts_return);
+    }
+
+    pub fn post_free_hbm(&self, handle: u64, ret: u64) {
+        let inner = self.get_or_init();
+        inner.post_free_hbm(handle, ret);
+    }
+
+    pub fn get_hbm_info(&self, free: *mut usize, total: *mut usize) {
+        let inner = self.get_or_init();
+        inner.get_hbm_info(free, total);
+    }
 }
 
 // 1. Keep the struct exactly as you have it
@@ -65,6 +137,24 @@ pub struct SchedulerClientInner {
     pub my_slot_idx: usize,
     pub lock: Mutex<InnerLock>,
     pub hbm_handle_map: Mutex<HashMap<u64, u64>>,
+    pub logical_device: i32,
+    pub physical_device: u32,
+}
+
+impl Drop for SchedulerClientInner {
+    fn drop(&mut self) {
+        // Unregister from shmem
+        self.shmem.reports[self.my_slot_idx].occupied.store(0, Ordering::SeqCst);
+        // Destroy streams and events. on_device_changed is called BEFORE rtSetDevice passthrough,
+        // so we're still on this device and don't need to switch.
+        let lock = self.lock.lock().unwrap();
+        unsafe {
+            rtStreamDestroy(lock.internal_stream);
+            rtEventDestroy(lock.start_event);
+            rtEventDestroy(lock.end_event);
+            rtEventDestroy(lock.tracking_event);
+        }
+    }
 }
 
 // 2. MANUALLY IMPLEMENT DEBUG (Matches what I gave you before)
@@ -85,12 +175,27 @@ unsafe impl Sync for SchedulerClientInner {}
 
 unsafe impl Send for InnerLock {}
 unsafe impl Sync for InnerLock {}
-impl SchedulerClient {
+impl SchedulerClientInner {
     /// Initialized ONCE per NPUDeviceList (per process/device)
     pub fn new() -> Self {
         let pid = std::process::id();
         info!("[Worker PID:{}] Initialize SchedulerClient...", pid);
-        let shmem_name = local_shmem_name();
+        // Determine the physical device id so we can join the correct shared memory
+        // segment created by the matching manager thread.
+        // logical_id init to -1: "no device set"; rtGetDevice returns 0 on success.
+        let mut logical_id: i32 = -1;
+        let ret = unsafe { rtGetDevice(&mut logical_id) };
+        if ret != 0 {
+            panic!("[Scheduler] rtGetDevice failed (ret={}), device not set or error. logical_id={}", ret, logical_id);
+        }
+        if logical_id < 0 {
+            panic!("[Scheduler] rtGetDevice returned logical_id={} (invalid). Device not set?", logical_id);
+        }
+        info!("[Scheduler] [pid:{}] logical_id: {}", pid, logical_id);
+        let mut phy_id: u32 = 0;
+        check_rts!(rtGetDevicePhyIdByIndex(logical_id as u32, &mut phy_id));
+
+        let shmem_name = local_shmem_name_for(phy_id);
         let shmem = shmem::shm_setup::open_shmem::<LocalContainerShmem>(shmem_name.as_str());
 
         // 2. Register THIS Client in a free slot
@@ -138,12 +243,12 @@ impl SchedulerClient {
         };
 
         Self {
-            inner: Arc::new(SchedulerClientInner {
-                shmem,
-                my_slot_idx: idx,
-                lock: Mutex::new(inner_lock),
-                hbm_handle_map: Mutex::new(HashMap::new()),
-            }),
+            shmem,
+            my_slot_idx: idx,
+            lock: Mutex::new(inner_lock),
+            hbm_handle_map: Mutex::new(HashMap::new()),
+            logical_device: logical_id,
+            physical_device: phy_id,
         }
     }
 
@@ -151,14 +256,14 @@ impl SchedulerClient {
     pub fn wait_for_token(&self, user_stream: u64) {
         // We lock the mutex to safely access/modify internal state.
         // NOTE: In high contention, this serializes access to this check.
-        let mut lock = self.inner.lock.lock().unwrap();
+        let mut lock = self.lock.lock().unwrap();
         
         lock.last_user_stream = user_stream;
 
         loop {
             // Read Shared Memory State
-            let state = self.inner.shmem.state.load(Ordering::Acquire);
-            let global_batch = self.inner.shmem.batch_id.load(Ordering::Relaxed);
+            let state = self.shmem.state.load(Ordering::Acquire);
+            let global_batch = self.shmem.batch_id.load(Ordering::Relaxed);
 
             // 1. Reset Logic (If Manager moved to new batch)
             if lock.batch_active && global_batch != lock.current_batch_id {
@@ -171,35 +276,38 @@ impl SchedulerClient {
                 // RUNNING: Try to grab token
                 // ---------------------------------------------------------
                 STATE_RUNNING => {
-                    let tokens = self.inner.shmem.tokens_remaining.load(Ordering::Relaxed);
+                    let tokens = self.shmem.tokens_remaining.load(Ordering::Relaxed);
                     
                     if tokens == 0 {
                         // Release lock while yielding to allow other threads to enter?
                         // Actually, simpler to just yield. 
                         drop(lock); // UNLOCK
                         thread::yield_now();
-                        lock = self.inner.lock.lock().unwrap(); // RELOCK
+                        lock = self.lock.lock().unwrap(); // RELOCK
                         continue;
                     }
 
                     // Try to fetch token
-                    let prev = self.inner.shmem.tokens_remaining.fetch_sub(1, Ordering::Acquire);
+                    let prev = self.shmem.tokens_remaining.fetch_sub(1, Ordering::Acquire);
                     if prev > 0 {
                         // SUCCESS!
+                        self.shmem
+                            .tokens_consumed_cumulative
+                            .fetch_add(1, Ordering::Relaxed);
                         
                         // First Token of Batch?
                         if !lock.batch_active {
-                            debug!("[Worker PID:{} Slot:{}] get Batch {} first Token!, start record time...", std::process::id(), self.inner.my_slot_idx, global_batch);
+                            debug!("[Worker PID:{} Slot:{}] get Batch {} first Token!, start record time...", std::process::id(), self.my_slot_idx, global_batch);
 
                             lock.current_batch_id = global_batch;
                             lock.batch_active = true;
                             
                             // A. Notify Manager
-                            self.inner.shmem.active_workers.fetch_add(1, Ordering::Release);
+                            self.shmem.active_workers.fetch_add(1, Ordering::Release);
 
                             // B. CPU Start Time
                             let now_us = get_time_us();
-                            self.inner.shmem.reports[self.inner.my_slot_idx].cpu_start_us.store(now_us, Ordering::Relaxed);
+                            self.shmem.reports[self.my_slot_idx].cpu_start_us.store(now_us, Ordering::Relaxed);
                             lock.start_time_us = now_us;
 
                             // C. GPU Start Event (Internal Stream)
@@ -209,7 +317,7 @@ impl SchedulerClient {
                         return; // -> Kernel Launch
                     } else {
                         // Race failed
-                        self.inner.shmem.tokens_remaining.fetch_add(1, Ordering::Relaxed);
+                        self.shmem.tokens_remaining.fetch_add(1, Ordering::Relaxed);
                     }
                 }
 
@@ -218,14 +326,14 @@ impl SchedulerClient {
                 // ---------------------------------------------------------
                 STATE_MEASURING => {
                     if lock.batch_active && global_batch == lock.current_batch_id {
-                        debug!("[Worker PID:{} Slot:{}] start measuring Batch {} ...", std::process::id(), self.inner.my_slot_idx, global_batch);
+                        debug!("[Worker PID:{} Slot:{}] start measuring Batch {} ...", std::process::id(), self.my_slot_idx, global_batch);
                         self.measure_and_report_batch(&mut lock);
                     }
                     
                     // Wait for state change
                     drop(lock); // UNLOCK
-                    futex::wait(&self.inner.shmem.state, STATE_MEASURING);
-                    lock = self.inner.lock.lock().unwrap(); // RELOCK
+                    futex::wait(&self.shmem.state, STATE_MEASURING);
+                    lock = self.lock.lock().unwrap(); // RELOCK
                 }
 
                 // ---------------------------------------------------------
@@ -233,8 +341,8 @@ impl SchedulerClient {
                 // ---------------------------------------------------------
                 _ => {
                     drop(lock); // UNLOCK
-                    futex::wait(&self.inner.shmem.state, STATE_IDLE);
-                    lock = self.inner.lock.lock().unwrap(); // RELOCK
+                    futex::wait(&self.shmem.state, STATE_IDLE);
+                    lock = self.lock.lock().unwrap(); // RELOCK
                 }
             }
         }
@@ -295,20 +403,20 @@ impl SchedulerClient {
         }
 
         // 6. Report to Shared Memory
-        let slot = &self.inner.shmem.reports[self.inner.my_slot_idx];
+        let slot = &self.shmem.reports[self.my_slot_idx];
         slot.duration_us.store(duration_us, Ordering::Relaxed);
         slot.batch_id.store(lock.current_batch_id, Ordering::Release);
 
         debug!("!!!! duration is {:?}", duration_us);
-        self.inner.shmem.reported_count.fetch_add(1, Ordering::Release);
-        debug!("!!!! reported count is {:?}", self.inner.shmem.reported_count.load(Ordering::Acquire));
+        self.shmem.reported_count.fetch_add(1, Ordering::Release);
+        debug!("!!!! reported count is {:?}", self.shmem.reported_count.load(Ordering::Acquire));
 
         lock.batch_active = false;
         lock.start_time_us = 0;
     }
 
     pub fn check_memory_quota(&self, size: u64) -> u64 {
-        let shmem = self.inner.shmem;
+        let shmem = self.shmem;
         let limit = shmem.memory_limit.load(Ordering::Relaxed);
         
         // if no limit
@@ -353,22 +461,22 @@ impl SchedulerClient {
 
     pub fn post_alloc_hbm(&self, p: u64, size: u64, rts_return: u64) {
         if rts_return == RT_ERROR_NONE { // success
-             let mut map = self.inner.hbm_handle_map.lock().unwrap();
+             let mut map = self.hbm_handle_map.lock().unwrap();
             map.insert(p, size);
         } else { // fail
-            self.inner.shmem.memory_used.fetch_sub(size, Ordering::SeqCst);
+            self.shmem.memory_used.fetch_sub(size, Ordering::SeqCst);
         }
     }
 
     pub fn post_free_hbm(&self, handle: u64, ret: u64) {
         if ret == RT_ERROR_NONE {
             let size = {
-                let mut map = self.inner.hbm_handle_map.lock().unwrap();
+                let mut map = self.hbm_handle_map.lock().unwrap();
                 map.remove(&handle).unwrap_or(0)
             };
 
             if size > 0 {
-                self.inner.shmem.memory_used.fetch_sub(size, Ordering::SeqCst);
+                self.shmem.memory_used.fetch_sub(size, Ordering::SeqCst);
                 debug!(
                     "[Limiter] Free Success: Handle 0x{:x}, Size {} bytes returned to quota.",
                     handle, size
@@ -389,7 +497,7 @@ impl SchedulerClient {
     }
 
     pub fn get_hbm_info(&self, free: *mut usize, total: *mut usize) {
-        let shmem = self.inner.shmem;
+        let shmem = self.shmem;
         
         let quota = shmem.memory_limit.load(Ordering::Relaxed) as usize;
         let used = shmem.memory_used.load(Ordering::Relaxed) as usize;
@@ -415,7 +523,7 @@ impl SchedulerClient {
     }
 
     pub fn is_hbm_limited(&self) -> bool {
-        return self.inner.shmem.memory_limit.load(Ordering::Relaxed) > 0
+        return self.shmem.memory_limit.load(Ordering::Relaxed) > 0
     }
 }
 

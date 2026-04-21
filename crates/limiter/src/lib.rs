@@ -2,6 +2,8 @@ pub mod worker;
 pub mod manager;
 pub mod shmem;
 pub mod externed_api;
+pub mod reporter;
+pub mod memory_report;
 use ctor::ctor;
 
 #[ctor]

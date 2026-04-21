@@ -40,6 +40,24 @@ pub mod shm_setup {
         }
     }
 
+    /// Same as `open_shmem`, but returns `None` if the segment does not exist yet.
+    pub fn try_open_shmem<T>(name: &str) -> Option<&'static mut T> {
+        unsafe {
+            let c_name = CString::new(name).unwrap();
+            let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDWR, 0o666);
+            if fd < 0 {
+                return None;
+            }
+            let size = mem::size_of::<T>();
+            let ptr = libc::mmap(ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+            libc::close(fd);
+            if ptr == libc::MAP_FAILED {
+                return None;
+            }
+            Some(&mut *(ptr as *mut T))
+        }
+    }
+
     pub fn open_global_registry<T>(path: &str) -> &'static mut T {
 
         let c_path = CString::new(path).unwrap();
@@ -186,12 +204,35 @@ pub struct GlobalRegistry {
 // =========================================================================================
 // This is mapped by 1 Manager + N Workers inside a single container.
 
-pub const LOCAL_SHMEM_NAME: &str = "vnpu_local_session";
+/// Default base for `shm_open`; must be a single path segment with a leading `/`
+/// (POSIX shared memory object names).
+pub const LOCAL_SHMEM_NAME: &str = "/vnpu_local_session";
 pub const LOCAL_SHMEM_ENV: &str = "NPU_LOCAL_SHM_NAME";
 
-/// Resolve the local shmem name from env, falling back to default.
+fn posix_shm_base_name(raw: &str) -> String {
+    let name = raw.trim();
+    if name.is_empty() {
+        return LOCAL_SHMEM_NAME.to_string();
+    }
+    if name.starts_with('/') {
+        name.to_string()
+    } else {
+        format!("/{}", name)
+    }
+}
+
+/// Resolve the local shmem name for a specific physical device id.
+/// We suffix the base name with the physical id so managers/workers on different
+/// devices do not collide.
+pub fn local_shmem_name_for(device_phy_id: u32) -> String {
+    let base = std::env::var(LOCAL_SHMEM_ENV).unwrap_or_else(|_| LOCAL_SHMEM_NAME.to_string());
+    let base = posix_shm_base_name(&base);
+    format!("{}_{}", base, device_phy_id)
+}
+
+/// Backwards-compatible helper (defaults to device 0). Prefer `local_shmem_name_for`.
 pub fn local_shmem_name() -> String {
-    std::env::var(LOCAL_SHMEM_ENV).unwrap_or_else(|_| LOCAL_SHMEM_NAME.to_string())
+    local_shmem_name_for(0)
 }
 pub const MAX_WORKERS: usize = 32;
 
@@ -224,6 +265,10 @@ pub struct LocalContainerShmem {
     // --- Sync Barriers ---
     pub active_workers: AtomicU32,    // How many threads took a token?
     pub reported_count: AtomicU32,    // How many threads finished reporting?
+
+    /// Successful token `fetch_sub` count (cumulative, process-wide). The utilization
+    /// reporter uses the per-window delta: if it is 0, baton time does not count as busy.
+    pub tokens_consumed_cumulative: AtomicU64,
     
     // --- Data Slots ---
     pub reports: [LocalWorkerReport; MAX_WORKERS],
