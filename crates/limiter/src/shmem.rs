@@ -265,6 +265,10 @@ pub struct LocalContainerShmem {
     // --- Sync Barriers ---
     pub active_workers: AtomicU32,    // How many threads took a token?
     pub reported_count: AtomicU32,    // How many threads finished reporting?
+
+    /// Successful token `fetch_sub` count (cumulative, process-wide). The utilization
+    /// reporter uses the per-window delta: if it is 0, baton time does not count as busy.
+    pub tokens_consumed_cumulative: AtomicU64,
     
     // --- Data Slots ---
     pub reports: [LocalWorkerReport; MAX_WORKERS],

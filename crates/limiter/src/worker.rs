@@ -291,6 +291,9 @@ impl SchedulerClientInner {
                     let prev = self.shmem.tokens_remaining.fetch_sub(1, Ordering::Acquire);
                     if prev > 0 {
                         // SUCCESS!
+                        self.shmem
+                            .tokens_consumed_cumulative
+                            .fetch_add(1, Ordering::Relaxed);
                         
                         // First Token of Batch?
                         if !lock.batch_active {

@@ -7,8 +7,12 @@
 //
 // Window timing is independent: baton bookkeeping does not move the next
 // flush deadline; if multiple windows are overdue we flush them in sequence.
+//
+// Per-window utilization is (effective baton time) / (window length). The effective
+// baton time is 0 for a window in which no tokens were taken from the local
+// bucket, so we do not show compute utilization when nothing actually ran.
 
-use crate::shmem::{futex, GlobalRegistry};
+use crate::shmem::{futex, GlobalRegistry, LocalContainerShmem};
 use log::info;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -99,7 +103,12 @@ impl UtilizationReporter {
 
     /// Spawn the background thread. Wakes on baton handoffs (`signal_counter`)
     /// and on window boundaries; no fixed-interval polling of `lock_owner`.
-    pub fn start(self: &Arc<Self>, global: &'static GlobalRegistry, my_pid: i32) {
+    pub fn start(
+        self: &Arc<Self>,
+        global: &'static GlobalRegistry,
+        local: &'static LocalContainerShmem,
+        my_pid: i32,
+    ) {
         if self.interval_ms == 0 {
             info!("[Reporter] NPU_REPORT_INTERVAL_MS=0, utilization reporting disabled");
             return;
@@ -107,7 +116,7 @@ impl UtilizationReporter {
         let this = self.clone();
         let _ = thread::Builder::new()
             .name(format!("npu_util_reporter_{}", my_pid))
-            .spawn(move || this.run(global, my_pid));
+            .spawn(move || this.run(global, local, my_pid));
     }
 
     /// Wait until the manager registers its slot, waking on baton activity or
@@ -126,7 +135,12 @@ impl UtilizationReporter {
         }
     }
 
-    fn run(self: Arc<Self>, global: &'static GlobalRegistry, my_pid: i32) {
+    fn run(
+        self: Arc<Self>,
+        global: &'static GlobalRegistry,
+        local: &'static LocalContainerShmem,
+        my_pid: i32,
+    ) {
         let my_idx = self.locate_slot(global, my_pid);
         {
             let mut st = self.state.lock().unwrap();
@@ -144,6 +158,9 @@ impl UtilizationReporter {
         let mut window_deadline = window_start + window_dur;
 
         let mut busy_us: u64 = 0;
+        let mut last_tokens = local
+            .tokens_consumed_cumulative
+            .load(Ordering::Relaxed);
         let mut owned = global.lock_owner.load(Ordering::Acquire) == my_idx;
         let mut segment_start: Option<Instant> = if owned {
             Some(window_start)
@@ -190,10 +207,17 @@ impl UtilizationReporter {
                 }
 
                 let interval_us = flush_at.saturating_duration_since(window_start).as_micros() as u64;
-                let util_fp = if interval_us > 0 {
-                    busy_us.saturating_mul(UTIL_SCALE) / interval_us
-                } else {
+                let cur_tokens = local
+                    .tokens_consumed_cumulative
+                    .load(Ordering::Relaxed);
+                let tokens_in_window = cur_tokens.saturating_sub(last_tokens);
+                last_tokens = cur_tokens;
+                let util_fp = if interval_us == 0 {
                     0
+                } else if tokens_in_window == 0 {
+                    0
+                } else {
+                    busy_us.saturating_mul(UTIL_SCALE) / interval_us
                 }
                 .min(UTIL_SCALE);
 

@@ -172,7 +172,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 2. Start the utilization reporter. It locates its slot by
             //    matching on pid, which is written during `ContainerManager::new`
             //    just below, so a brief retry inside the reporter is expected.
-            reporter.start(global_reg, pid_for_thread);
+            reporter.start(
+                global_reg,
+                unsafe { &*(local_shm as *const LocalContainerShmem) },
+                pid_for_thread,
+            );
 
             // 3. Initialize the manager and enter its scheduling loop.
             let mut manager =
