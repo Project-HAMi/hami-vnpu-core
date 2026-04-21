@@ -62,7 +62,7 @@ Possible reasons:
 ## Implemented Improvements
 
 1. **Manager identifier in logs** – All log lines include `[Manager #N]` where N is the global slot index.
-2. **Configurable no-progress threshold** – Set `NPU_NO_PROGRESS_MS` (default 5). For vLLM, try e.g. `NPU_NO_PROGRESS_MS=50`.
+2. **Configurable no-progress threshold** – `NPU_NO_PROGRESS_MS` is read when each `ContainerManager` is constructed in `crates/limiter/src/manager.rs` (default **5** ms). For vLLM, try e.g. `NPU_NO_PROGRESS_MS=50`.
 3. **Tiered log levels** – Use `RUST_LOG` to control verbosity:
    - **`RUST_LOG=limiter=info`**: Minimal (manager init only)
    - **`RUST_LOG=limiter=debug`**: Significant updates

@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package npu_limiter;
+
+service LimiterControl {
+    rpc SetPriority (SetPriorityRequest) returns (SetPriorityResponse);
+    // Returns the compute utilization of this container, as observed by the
+    // limiter daemon's baton-hold tracker. Percentages are 0..=100.
+    rpc GetUtilization (GetUtilizationRequest) returns (GetUtilizationResponse);
+}
+
+message SetPriorityRequest {
+    double priority = 1;
+}
+
+message SetPriorityResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetUtilizationRequest {}
+
+message GetUtilizationResponse {
+    // Length of each sampling window (ms). Controlled by NPU_REPORT_INTERVAL_MS.
+    uint64 interval_ms = 1;
+    // Number of recent windows averaged for the rolling mean. Controlled by
+    // NPU_REPORT_HISTORY_SCALE.
+    uint64 history_scale = 2;
+    // Per-device measurements. One entry per device managed by this daemon.
+    repeated DeviceUtilization devices = 3;
+}
+
+message DeviceUtilization {
+    // Physical device id (matches ASCEND_RT_VISIBLE_DEVICES entries).
+    uint32 device_id = 1;
+    // True once the reporter has located this device's manager slot in the
+    // global registry and is actively tracking baton ownership.
+    bool tracked = 2;
+    // Utilization of the most recently completed window, in percent (0..=100).
+    double utilization_last_interval_percent = 3;
+    // Mean utilization over up to `history_scale` completed windows, percent.
+    double utilization_recent_windows_avg_percent = 4;
+    // Memory: quota view from `LocalContainerShmem` when NPU_MEM_QUOTA is set;
+    // otherwise rtMemGetInfoEx (runtime) for this device.
+    MemorySnapshot memory = 5;
+}
+
+message MemorySnapshot {
+    // True when NPU_MEM_QUOTA was set at limiter start (quota enforced in hook).
+    bool limit_enforced = 1;
+    uint64 total_mb = 2;
+    uint64 used_mb = 3;
+    uint64 free_mb = 4;
+}

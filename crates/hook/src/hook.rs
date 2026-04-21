@@ -44,7 +44,7 @@ pub extern "C" fn rtSetDevice(device: i32) -> i32 {
     // Call on_device_changed BEFORE passthrough. We're still on the old device, so Drop
     // can destroy streams/events without needing to call rtSetDevice (avoids re-entering hook).
     NPU_LIMITER.on_device_changed(device);
-    passthrough!("rtSetDevice", (i32), device) as i32
+    passthrough_i32!("rtSetDevice", (i32), device)
 }
 
 #[unsafe(no_mangle)]

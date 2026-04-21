@@ -204,14 +204,29 @@ pub struct GlobalRegistry {
 // =========================================================================================
 // This is mapped by 1 Manager + N Workers inside a single container.
 
-pub const LOCAL_SHMEM_NAME: &str = "vnpu_local_session";
+/// Default base for `shm_open`; must be a single path segment with a leading `/`
+/// (POSIX shared memory object names).
+pub const LOCAL_SHMEM_NAME: &str = "/vnpu_local_session";
 pub const LOCAL_SHMEM_ENV: &str = "NPU_LOCAL_SHM_NAME";
+
+fn posix_shm_base_name(raw: &str) -> String {
+    let name = raw.trim();
+    if name.is_empty() {
+        return LOCAL_SHMEM_NAME.to_string();
+    }
+    if name.starts_with('/') {
+        name.to_string()
+    } else {
+        format!("/{}", name)
+    }
+}
 
 /// Resolve the local shmem name for a specific physical device id.
 /// We suffix the base name with the physical id so managers/workers on different
 /// devices do not collide.
 pub fn local_shmem_name_for(device_phy_id: u32) -> String {
     let base = std::env::var(LOCAL_SHMEM_ENV).unwrap_or_else(|_| LOCAL_SHMEM_NAME.to_string());
+    let base = posix_shm_base_name(&base);
     format!("{}_{}", base, device_phy_id)
 }
 

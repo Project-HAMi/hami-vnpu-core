@@ -13,11 +13,11 @@ set -euo pipefail
 #   --priority <int>            NPU_PRIORITY/share percent
 #
 # Optional:
-#   --host-port <int>           Host port for vLLM (default: 9000+id)
+#   --host-port <int>           Host port for vLLM (default: 9600+id)
 #   --tokens <int>              Max tokens for each run (default: 2000)
 #   --label <string>            Label shown in benchmark output
 #   --image <string>            Container image id/tag (default set below)
-#   --ready-timeout <int>       Seconds to wait for vLLM readiness (default: 45)
+#   --ready-timeout <int>       Seconds to wait for vLLM readiness (default: 300)
 #
 # Controls inside the benchmark:
 #   s/b : start or restart generation
@@ -37,11 +37,11 @@ Required:
   --priority <PERCENT> NPU_PRIORITY / share percent
 
 Optional:
-  --host-port <PORT>   Host port for vLLM (default: 9000+ID)
+  --host-port <PORT>   Host port for vLLM (default: 9600+ID)
   --tokens <N>         Max tokens per run (default: 2000)
   --label <TEXT>       Label shown in benchmark output
   --image <TAG>        Container image (default: registry-cbu.huawei.com/ascend/vllm-ascend:v0.10.1rc1)
-  --ready-timeout <S>  Seconds to wait for vLLM to be ready (default: 45)
+  --ready-timeout <S>  Seconds to wait for vLLM to be ready (default: 300)
   -h|--help            Show this help
 EOF
 }

@@ -5,7 +5,7 @@ use limiter::reporter::UtilizationReporter;
 use limiter::shmem::{shm_setup, GlobalRegistry, LocalContainerShmem, local_shmem_name_for};
 use std::collections::BTreeSet;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::PermissionsExt;
@@ -41,8 +41,10 @@ impl LimiterControl for LimiterControlService {
         request: Request<SetPriorityRequest>,
     ) -> Result<Response<SetPriorityResponse>, Status> {
         let new_priority = request.into_inner().priority;
-        if new_priority <= 0.0 {
-            return Err(Status::invalid_argument("Priority must be > 0"));
+        if !new_priority.is_finite() || new_priority <= 0.0 {
+            return Err(Status::invalid_argument(
+                "Priority must be a finite value > 0",
+            ));
         }
         
         self.priority_atomic.store(new_priority.to_bits(), Ordering::Relaxed);
@@ -96,6 +98,10 @@ impl LimiterControl for LimiterControlService {
         }))
     }
 }
+
+/// How long the main thread waits for each manager to `shm_open` local shmem after spawn.
+const OPEN_LOCAL_SHMEM_TIMEOUT: Duration = Duration::from_secs(120);
+const OPEN_LOCAL_SHMEM_POLL: Duration = Duration::from_millis(20);
 
 fn parse_visible_devices() -> Vec<u32> {
     let raw = std::env::var("ASCEND_RT_VISIBLE_DEVICES").unwrap_or_else(|_| "0".to_string());
@@ -177,18 +183,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Map each device's local shmem for quota / used reads (managers created it above).
-    let local_shmems: Vec<&'static LocalContainerShmem> = devices
-        .iter()
-        .map(|dev| {
-            let path = local_shmem_name_for(*dev);
-            loop {
-                if let Some(ptr) = shm_setup::try_open_shmem::<LocalContainerShmem>(&path) {
-                    break unsafe { &*(ptr as *const LocalContainerShmem) };
-                }
-                thread::sleep(Duration::from_millis(20));
+    let mut local_shmems: Vec<&'static LocalContainerShmem> = Vec::with_capacity(devices.len());
+    for dev in &devices {
+        let path = local_shmem_name_for(*dev);
+        let deadline = Instant::now() + OPEN_LOCAL_SHMEM_TIMEOUT;
+        let ptr = loop {
+            if let Some(p) = shm_setup::try_open_shmem::<LocalContainerShmem>(&path) {
+                break p;
             }
-        })
-        .collect();
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {:?} waiting for local shmem {} (manager thread may have failed to create it)",
+                    OPEN_LOCAL_SHMEM_TIMEOUT, path
+                )
+                .into());
+            }
+            thread::sleep(OPEN_LOCAL_SHMEM_POLL);
+        };
+        local_shmems.push(unsafe { &*(ptr as *const LocalContainerShmem) });
+    }
 
     // Start gRPC server on UDS if configured
     let uds_path = std::env::var("NPU_LIMITER_UDS_PATH").unwrap_or_else(|_| "/tmp/npu_limiter.sock".to_string());

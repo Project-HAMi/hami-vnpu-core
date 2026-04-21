@@ -38,6 +38,8 @@ pub struct ContainerManager {
     token_scale: f64,
     ema_alpha: f64,
     fixed_share_ratio: bool,
+    /// Early exit when no token progress (non-fixed-share); from `NPU_NO_PROGRESS_MS`.
+    no_progress_early: Duration,
     next_run_not_before: Option<Instant>,
 }
 
@@ -68,6 +70,12 @@ impl ContainerManager {
         let fixed_share_ratio = std::env::var("NPU_FIXED_SHARE_RATIO")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+
+        let no_progress_ms = std::env::var("NPU_NO_PROGRESS_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5);
+        let no_progress_early = Duration::from_millis(no_progress_ms.max(1));
 
         // default value
         let comp_priority = priority_opt.unwrap_or(1.0);
@@ -104,6 +112,7 @@ impl ContainerManager {
             token_scale,
             ema_alpha,
             fixed_share_ratio,
+            no_progress_early,
             next_run_not_before: None,
         }
     }
@@ -306,8 +315,11 @@ impl ContainerManager {
                 if current_tokens < last_tokens || self.local.active_workers.load(Ordering::Relaxed) > 0 {
                     saw_progress = true;
                 }
-                if !saw_progress && start_time.elapsed() > Duration::from_micros(50) {
-                    debug!("[Manager] --- no progress for 5ms, enter STATE_MEASURING early");
+                if !saw_progress && start_time.elapsed() > self.no_progress_early {
+                    debug!(
+                        "[Manager] --- no progress for {:?}, enter STATE_MEASURING early",
+                        self.no_progress_early
+                    );
                     break;
                 }
             }
