@@ -16,8 +16,14 @@ LOG_PREFIX="inst${ID}"
 IMAGE="registry-cbu.huawei.com/ascend/vllm-ascend:v0.10.1rc1"
 HOST_PROJECT_DIR="/mnt/nvme0/mab"      
 CONTAINER_PROJECT_DIR="/mab"           
-HOST_SHARED_DIR="/tmp/hami-shared-region"
+# Host directory published to the container as /hami-shared-region (override on host: export HAMI_HOST_SHARED_DIR=...)
+HOST_SHARED_DIR="${HAMI_HOST_SHARED_DIR:-/tmp/hami-shared-region}"
 GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
+# Limit gRPC Unix socket (inside container). On the host the same file is:
+#   ${HOST_SHARED_DIR}/npu_limiter_${ID}.sock
+# Example (ID=2): /tmp/hami-shared-region/npu_limiter_2.sock
+# From host: grpcurl -plaintext -unix -d '{}' "${HOST_SHARED_DIR}/npu_limiter_${ID}.sock" npu_limiter.LimiterControl/GetUtilization
+NPU_LIMITER_SOCK_BASENAME="npu_limiter_${ID}.sock"
 LIMITER_PATH="/mab/hami-vnpu-core/target/debug/limiter"
 LIBRARY_PATH="/mab/hami-vnpu-core/target/debug/libvnpu.so"
 
@@ -38,6 +44,7 @@ fi
 # 3. Launch Container
 # ==========================================
 echo "--- [Host] Launching Container: $CONTAINER_NAME ---"
+echo "--- [Host] Limiter gRPC socket (host): ${HOST_SHARED_DIR}/${NPU_LIMITER_SOCK_BASENAME} ---"
 
 docker run --rm -it --privileged -u root \
     --network=host --pid=host \
@@ -54,7 +61,7 @@ docker run --rm -it --privileged -u root \
     --name "$CONTAINER_NAME" \
     -e NPU_GLOBAL_SHM_PATH=$GLOBAL_SHM_PATH \
     -e NPU_LOCAL_SHM_NAME=vnpu_local_session_${ID} \
-    -e NPU_LIMITER_UDS_PATH=/hami-shared-region/npu_limiter_${ID}.sock \
+    -e NPU_LIMITER_UDS_PATH=/hami-shared-region/${NPU_LIMITER_SOCK_BASENAME} \
     -e NPU_PRIORITY=$PRIORITY \
     -e ASCEND_RT_VISIBLE_DEVICES=1 \
     -e NPU_TOKEN_SCALE=200.0 \

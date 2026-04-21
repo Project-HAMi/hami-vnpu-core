@@ -40,6 +40,24 @@ pub mod shm_setup {
         }
     }
 
+    /// Same as `open_shmem`, but returns `None` if the segment does not exist yet.
+    pub fn try_open_shmem<T>(name: &str) -> Option<&'static mut T> {
+        unsafe {
+            let c_name = CString::new(name).unwrap();
+            let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDWR, 0o666);
+            if fd < 0 {
+                return None;
+            }
+            let size = mem::size_of::<T>();
+            let ptr = libc::mmap(ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+            libc::close(fd);
+            if ptr == libc::MAP_FAILED {
+                return None;
+            }
+            Some(&mut *(ptr as *mut T))
+        }
+    }
+
     pub fn open_global_registry<T>(path: &str) -> &'static mut T {
 
         let c_path = CString::new(path).unwrap();

@@ -13,6 +13,8 @@ unsafe extern "C" {
     pub fn rtGetDevicePhyIdByIndex(device_index: u32, phy_device: *mut u32) -> i32;
     pub fn rtDeviceSynchronize() -> i32;
     pub fn rtStreamGetCaptureInfo(stream: u64, status: *mut u32, model: *mut u64) -> i32;
+    /// Same as hooked in libvnpu; used by the limiter daemon when no quota is set.
+    pub fn rtMemGetInfoEx(mem_info_type: u64, free: *mut usize, total: *mut usize) -> u64;
 }
 
 // RT ERROR CODE
