@@ -1,30 +1,6 @@
 #![allow(non_snake_case)]
-use lazy_static::lazy_static;
-use limiter::worker::SchedulerClient;
-use once_cell;
+use crate::{passthrough, NPU_LIMITER};
 use limiter::externed_api::{RT_ERROR_NONE, RT_ERROR_MEMORY_ALLOCATION};
-use once_cell::sync::Lazy;
-
-lazy_static!{
-    pub static ref NPU_LIMITER: SchedulerClient = SchedulerClient::new();
-}
-
-macro_rules! passthrough {
-    ($name:expr, ($($sig:tt)*), $($arg:expr),*) => {
-        {
-            static REAL: Lazy<extern "C" fn($($sig)*) -> u64> = 
-                Lazy::new(|| unsafe {
-                    let ptr = libc::dlsym(libc::RTLD_NEXT, concat!($name, "\0").as_ptr() as *const libc::c_char);
-                    if ptr.is_null() {
-                        panic!("cannot find original function: {}", $name);
-                    }
-                    std::mem::transmute(ptr)
-                });
-            // println!("in func {:?}", $name);
-            (*REAL)($($arg),*)
-        }
-    };
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtAicpuKernelLaunchExWithArgs(kernelType: u32, opName: u64, blockDim: u32, argsInfo: u64, smDesc: u64, stm: u64, flags: u32) -> u64 {
@@ -99,7 +75,7 @@ pub extern "C" fn rtMallocPhysical(handle: u64, size: u64, prop: u64, flags: u64
 }
 
 #[unsafe(no_mangle)]
-pub fn rtFreePhysical(handle: u64) -> u64 {
+pub extern "C" fn rtFreePhysical(handle: u64) -> u64 {
     let ret = passthrough!("rtFreePhysical", (u64), handle);
     if NPU_LIMITER.is_hbm_limited() {
         NPU_LIMITER.post_free_hbm(handle, ret);
@@ -109,7 +85,7 @@ pub fn rtFreePhysical(handle: u64) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub fn rtFree(ptr: u64) -> u64 {
+pub extern "C" fn rtFree(ptr: u64) -> u64 {
     let ret = passthrough!("rtFree", (u64), ptr);
     if NPU_LIMITER.is_hbm_limited() {
         NPU_LIMITER.post_free_hbm(ptr, ret); 
@@ -119,40 +95,10 @@ pub fn rtFree(ptr: u64) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub fn rtMemGetInfoEx(memInfoType: u64, free: *mut usize, total: *mut usize) -> u64 {
+pub extern "C" fn rtMemGetInfoEx(memInfoType: u64, free: *mut usize, total: *mut usize) -> u64 {
     if NPU_LIMITER.is_hbm_limited() {
         NPU_LIMITER.get_hbm_info(free, total);
         return 0;
     }
     return passthrough!("rtMemGetInfoEx", (u64, *mut usize,  *mut usize), memInfoType, free, total);
-}
-
-static REAL_SIGACTION: Lazy<extern "C" fn(libc::c_int, *const libc::sigaction, *mut libc::sigaction) -> libc::c_int> = Lazy::new(|| unsafe {
-    let ptr = libc::dlsym(libc::RTLD_NEXT, b"sigaction\0".as_ptr() as *const libc::c_char);
-    if ptr.is_null() {
-        panic!("Cannot find original sigaction function!");
-    }
-    std::mem::transmute(ptr)
-});
-
-// workaround to solve python error
-#[unsafe(no_mangle)]
-pub extern "C" fn sigaction(
-    signum: libc::c_int,
-    act: *const libc::sigaction,
-    oldact: *mut libc::sigaction,
-) -> libc::c_int {
-    let ret = REAL_SIGACTION(signum, act, oldact);
-
-    if ret == 0 && !oldact.is_null() {
-        unsafe {
-            let handler = (*oldact).sa_sigaction;
-            if handler != libc::SIG_DFL && handler != libc::SIG_IGN {
-                
-                (*oldact).sa_sigaction = libc::SIG_DFL;
-            }
-        }
-    }
-    
-    ret
 }

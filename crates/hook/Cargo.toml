@@ -5,7 +5,7 @@ edition.workspace = true
 
 [lib]
 name = "vnpu"
-path = "src/hook.rs"
+path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
