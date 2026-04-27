@@ -1,5 +1,6 @@
-use limiter::worker::SchedulerClient;
 use once_cell::sync::Lazy;
+
+use limiter::worker::SchedulerClient;
 
 pub static NPU_LIMITER: Lazy<SchedulerClient> = Lazy::new(SchedulerClient::new);
 

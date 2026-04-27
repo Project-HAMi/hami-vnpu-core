@@ -1,10 +1,11 @@
-// manager.rs
-use crate::shmem::{GlobalRegistry, LocalContainerShmem, futex, MAX_MANAGERS, STATE_IDLE, STATE_RUNNING, STATE_MEASURING, MAX_WORKERS};
-use log::{info, debug, warn};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::thread;
-use std::sync::atomic::AtomicU64;
+
+use log::{info, debug};
+
+use crate::shmem::{GlobalRegistry, LocalContainerShmem, futex, MAX_MANAGERS, STATE_IDLE, STATE_RUNNING, STATE_MEASURING, MAX_WORKERS};
+use crate::config::ManagerConfig;
 
 const GLOBAL_WATCHDOG_TIMEOUT_US: u64 = 1_000_000;
 const GLOBAL_WAIT_POLL_US: u64 = 1_000;
@@ -16,6 +17,8 @@ const MIN_TOKENS: u64 = 1;
 const MAX_TOKENS: u64 = 2_000_000;
 // Seed per-manager average; used both locally and when registering in the global scoreboard.
 const DEFAULT_AVG_US: u64 = 500;
+
+const MB_TO_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct SharePlan {
@@ -41,7 +44,7 @@ pub struct ContainerManager {
 }
 
 impl ContainerManager {
-    pub fn new(global: &'static GlobalRegistry, local: &'static mut LocalContainerShmem, pid: i32) -> Self {
+    pub fn new(global: &'static GlobalRegistry, local: &'static LocalContainerShmem, pid: i32, config: ManagerConfig) -> Self {
         let mut idx = 0;
         let mut found = false;
         
@@ -62,30 +65,24 @@ impl ContainerManager {
         let token_scale = std::env::var("NPU_TOKEN_SCALE").unwrap_or_else(|_| "100.0".to_string()).parse::<f64>().unwrap_or(1.0).max(0.1);
         // Faster EMA by default.
         let ema_alpha = std::env::var("NPU_AVG_ALPHA").unwrap_or_else(|_| "0.7".to_string()).parse::<f64>().unwrap_or(0.7).clamp(0.05, 0.95);
-        let priority_opt = std::env::var("NPU_PRIORITY").ok().and_then(|v| v.parse::<f64>().ok());
-        let mem_opt = std::env::var("NPU_MEM_QUOTA").ok().and_then(|v| v.parse::<u64>().ok());
         let fixed_share_ratio = std::env::var("NPU_FIXED_SHARE_RATIO")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
         // default value
-        let comp_priority = priority_opt.unwrap_or(1.0);
-        let memory_limit = mem_opt.unwrap_or(0);
-
-        let prio_display = priority_opt.map_or("Not set".to_string(), |v| v.to_string());
-        let mem_display = mem_opt.map_or("Not set".to_string(), |v| v.to_string());
+        let comp_priority = config.priority;
+        let memory_limit = config.memory_limit_mb;
 
         info!(
             "[Manager] Registered as Global Manager #{} (PID: {}). Compute limit: {}, Memory limit: {}, FixedShare: {}",
-            idx, pid, prio_display, mem_display, fixed_share_ratio
+            idx, pid, comp_priority, memory_limit, fixed_share_ratio
         );
 
-        const MB_TO_BYTES: u64 = 1024 * 1024;
         let memory_limit_bytes = memory_limit * MB_TO_BYTES;
 
         // Initialize
-        local.memory_limit = AtomicU64::new(memory_limit_bytes);
-        local.memory_used = AtomicU64::new(0);
+        local.memory_limit.store(memory_limit_bytes, Ordering::Relaxed);
+        local.memory_used.store(0, Ordering::Relaxed);
 
         Self {
             global,
