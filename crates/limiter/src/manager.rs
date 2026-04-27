@@ -27,12 +27,14 @@ struct SharePlan {
     base_tokens: u64,
     expected_run_us: u64,
     rest_wait_us: u64,
+    #[allow(dead_code)]
     anchor_speed_us: u64,
 }
 
 pub struct ContainerManager {
     global: &'static GlobalRegistry,
     local: &'static LocalContainerShmem,
+    #[allow(dead_code)]
     my_pid: i32,
     my_global_idx: usize,
     current_avg_us: u64,
@@ -44,24 +46,10 @@ pub struct ContainerManager {
 }
 
 impl ContainerManager {
-    pub fn new(global: &'static GlobalRegistry, local: &'static LocalContainerShmem, pid: i32, config: ManagerConfig) -> Self {
-        let mut idx = 0;
-        let mut found = false;
-        
-        for (i, slot) in global.slots.iter().enumerate() {
-            if slot.is_active.compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-                slot.pid.store(pid, Ordering::Relaxed);
-                // Seed with a realistic starting point so anchor/token math is meaningful on first round.
-                slot.avg_kernel_time.store(DEFAULT_AVG_US, Ordering::Relaxed);
-                slot.last_heartbeat.store(get_time_us(), Ordering::Relaxed);
-                idx = i;
-                found = true;
-                break;
-            }
-        }
-        if !found { panic!("Global Registry Full!"); }
+    pub fn new(global: &'static GlobalRegistry, local: &'static LocalContainerShmem, pid: i32, config: ManagerConfig) -> Self {   
+        let idx = Self::register_global_slot(global, pid);
 
-        // Default: no extra scaling; tokens derive directly from priority and relative speed.
+        // TODO: Refactor
         let token_scale = std::env::var("NPU_TOKEN_SCALE").unwrap_or_else(|_| "100.0".to_string()).parse::<f64>().unwrap_or(1.0).max(0.1);
         // Faster EMA by default.
         let ema_alpha = std::env::var("NPU_AVG_ALPHA").unwrap_or_else(|_| "0.7".to_string()).parse::<f64>().unwrap_or(0.7).clamp(0.05, 0.95);
@@ -98,6 +86,23 @@ impl ContainerManager {
         }
     }
 
+    fn register_global_slot(global: &'static GlobalRegistry, pid: i32) -> usize {
+        for (i, slot) in global.slots.iter().enumerate() {
+            if slot
+                .is_active
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                slot.pid.store(pid, Ordering::Relaxed);
+                slot.avg_kernel_time.store(DEFAULT_AVG_US, Ordering::Relaxed);
+                slot.last_heartbeat.store(get_time_us(), Ordering::Relaxed);
+                return i;
+            }
+        }
+
+        panic!("Global registry full. Increase MAX_MANAGERS.");
+    }
+
     pub fn run(&mut self) {
         self.join_global_queue();
 
@@ -107,10 +112,10 @@ impl ContainerManager {
             self.honor_fixed_rest_wait();
             
             let plan = self.calculate_fair_share();
-            let (actual_duration, tokens_used, tokens_for_stats) = self.run_local_round(&plan);
+            let (actual_duration, tokens_used) = self.run_local_round(&plan);
             
-            if tokens_for_stats > 0 && actual_duration > 0 {
-                self.update_local_stats(actual_duration, tokens_for_stats);
+            if tokens_used > 0 && actual_duration > 0 {
+                self.update_local_stats(actual_duration, tokens_used);
             }
             self.schedule_rest_wait(plan.rest_wait_us);
             self.pass_baton();
@@ -142,7 +147,7 @@ impl ContainerManager {
             let now = get_time_us();
 
             if (now > last_heartbeat) && (now - last_heartbeat > GLOBAL_WATCHDOG_TIMEOUT_US) {
-                info!("!!! [Manager] DETECTED DEAD LEADER (Idx: {}). STEALING LOCK. !!!", owner_idx);
+                info!("[Manager] detected stale owner {}; attempting to claim global lock", owner_idx);
                 if (owner_idx as usize) < MAX_MANAGERS {
                     self.global.slots[owner_idx as usize].is_active.store(0, Ordering::Relaxed);
                 }
@@ -166,8 +171,8 @@ impl ContainerManager {
         // Advance the head to the next queued slot.
         let mut next_head = self.global.queue_head.load(Ordering::Relaxed) as usize + 1;
 
-        // Find the next active manager; skip stale queue entries that point to inactive slots.
-        let mut next_manager_idx = self.my_global_idx as u32; // safe fallback: keep baton
+        // Default to self; the scan may also select our own re-enqueued slot.
+        let mut next_manager_idx = self.my_global_idx as u32; 
         for _ in 0..MAX_MANAGERS {
             let slot_idx = next_head % MAX_MANAGERS;
             let candidate = self.global.queue[slot_idx].load(Ordering::Acquire);
@@ -215,7 +220,7 @@ impl ContainerManager {
         
         // Base tokens before scaling (used for time budgeting and averaging).
         // Formula: tokens = priority * (anchor / my_time)
-        let raw_tokens = (prio_for_tokens * (anchor_speed_us as f64 / my_time as f64));
+        let raw_tokens = prio_for_tokens * (anchor_speed_us as f64 / my_time as f64);
         let mut base_tokens = raw_tokens.ceil() as u64;
         base_tokens = base_tokens.clamp(MIN_TOKENS, MAX_TOKENS);
 
@@ -252,20 +257,31 @@ impl ContainerManager {
         }
     }
 
-    fn run_local_round(&self, plan: &SharePlan) -> (u64, u64, u64) {
+    fn start_local_batch(&self, batch_id: u64, tokens: u64) {
+        self.local.batch_id.store(batch_id, Ordering::Relaxed);
+        self.local.tokens_remaining.store(tokens, Ordering::Relaxed);
+        self.local.active_workers.store(0, Ordering::Relaxed);
+        self.local.reported_count.store(0, Ordering::Relaxed);
+
+        self.local.state.store(STATE_RUNNING, Ordering::Release);
+        futex::wake_all(&self.local.state);
+    }
+
+    fn enter_measuring_state(&self) {
+        self.local.tokens_remaining.store(0, Ordering::Relaxed);
+        self.update_heartbeat();
+        self.local.state.store(STATE_MEASURING, Ordering::Release);
+        futex::wake_all(&self.local.state);
+    }
+
+    fn run_local_round(&self, plan: &SharePlan) -> (u64, u64) {
         let tokens = plan.tokens;
         let base_tokens = plan.base_tokens;
         let batch_id = self.local.batch_id.load(Ordering::Relaxed) + 1;
         debug!("\n=======================================================");
         debug!("[Manager] >>> Start Batch ID: {}. initial Tokens: {}, base_tokens: {}, time_limit: {} us, budget: {} us", batch_id, tokens, base_tokens, plan.time_limit_us, plan.expected_run_us);
 
-        self.local.batch_id.store(batch_id, Ordering::Relaxed);
-        self.local.tokens_remaining.store(tokens, Ordering::Relaxed);
-        self.local.active_workers.store(0, Ordering::Relaxed);
-        self.local.reported_count.store(0, Ordering::Relaxed);
-        
-        self.local.state.store(STATE_RUNNING, Ordering::Release);
-        futex::wake_all(&self.local.state);
+        self.start_local_batch(batch_id, tokens);
 
         let start_time = Instant::now();
         let timeout_duration = Duration::from_micros(plan.time_limit_us);
@@ -275,12 +291,13 @@ impl ContainerManager {
         let mut tokens_consumed_for_stats = 0u64;
         
         loop {
-            if self.local.tokens_remaining.load(Ordering::Relaxed) == 0 { 
+            let current_tokens = self.local.tokens_remaining.load(Ordering::Relaxed);
+
+            if current_tokens == 0 { 
                 debug!("[Manager] --- Token all used, enter STATE_MEASURING ");
                 break;
             }
 
-            let current_tokens = self.local.tokens_remaining.load(Ordering::Relaxed);
             if self.fixed_share_ratio {
                 // Hold the lock for the full budgeted runtime even if no worker progresses,
                 // so the run/wait ratio follows the configured priority.
@@ -319,11 +336,8 @@ impl ContainerManager {
             tokens_consumed_for_stats = tokens.saturating_sub(remaining);
         }
 
-        self.local.tokens_remaining.store(0, Ordering::Relaxed);
-        self.update_heartbeat(); // refresh while switching state
-        self.local.state.store(STATE_MEASURING, Ordering::Release);
-        futex::wake_all(&self.local.state);
-
+        self.enter_measuring_state();
+        
         let report_start = Instant::now();
         // Wait longer when batches are long: at least LOCAL_REPORT_GRACE_MS, or 1/4 of limit_us.
         let grace_duration = Duration::from_millis(LOCAL_REPORT_GRACE_MS)
@@ -356,7 +370,7 @@ impl ContainerManager {
             debug!("[Manager] <<< Batch {} ends. consume Token (for stats): {}, duration: {} us", batch_id, tokens_used, duration);
         }
 
-        (duration, tokens_used, tokens_used)
+        (duration, tokens_used)
     }
 
     fn honor_fixed_rest_wait(&mut self) {
