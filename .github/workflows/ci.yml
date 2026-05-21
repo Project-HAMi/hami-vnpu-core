@@ -15,8 +15,8 @@ jobs:
     strategy:
       matrix:
         platform:
-          - { runner: "ubuntu-22.04-arm", arch: "arm64"}
-          - { runner: "ubuntu-22.04", arch: "amd64"}
+          - { runner: "ubuntu-22.04-arm"}
+          - { runner: "ubuntu-22.04"}
     runs-on: ${{ matrix.platform.runner }}
     container:
       image: ascendai/cann:8.5.1
@@ -27,4 +27,22 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build
+        run: |
+          echo $LD_LIBRARY_PATH
+          ldd /usr/local/Ascend/ascend-toolkit/latest/lib64/libruntime.so
+          cargo build
+
+  test:
+    runs-on: "ubuntu-22.04"
+    container:
+      image: ascendai/cann:8.5.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: test
+        run: |
+          export LD_LIBRARY_PATH=/usr/local/Ascend/cann/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/cann/x86_64-linux/devlib:$LD_LIBRARY_PATH
+          cargo test
