@@ -1,10 +1,87 @@
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::thread;
 
 use log::{info, debug};
 
-use crate::shmem::{GlobalRegistry, LocalContainerShmem, futex, MAX_MANAGERS, STATE_IDLE, STATE_RUNNING, STATE_MEASURING, MAX_WORKERS};
+const MAX_DCMI_PROCS: usize = 64;
+const DCMI_UPDATE_INTERVAL_SECS: u64 = 5;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct DcmiProcMemInfo {
+    proc_id: i32,
+    proc_mem_usage: u64,
+}
+
+unsafe extern "C" {
+    fn dcmi_init() -> i32;
+    fn dcmi_get_card_list(card_num: *mut i32, card_list: *mut i32, list_len: i32) -> i32;
+    fn dcmi_get_device_resource_info(
+        card_id: i32,
+        device_id: i32,
+        proc_info: *mut DcmiProcMemInfo,
+        proc_num: *mut i32,
+    ) -> i32;
+}
+
+/// Discover (card_id, device_id) pairs for all present NPU logic devices.
+fn discover_npu_devices() -> Vec<(i32, i32)> {
+    unsafe { dcmi_init(); }
+    let mut card_num: i32 = 0;
+    let mut card_list: [i32; 8] = [0; 8];
+    unsafe { dcmi_get_card_list(&mut card_num, card_list.as_mut_ptr(), 8); }
+    if card_num <= 0 || card_num > 8 {
+        return Vec::new();
+    }
+    // Each card has one device (device_id=0) on 310P
+    card_list[..card_num as usize]
+        .iter()
+        .map(|&card_id| (card_id, 0i32))
+        .collect()
+}
+
+/// Standalone DCMI update — reads hardware process memory and writes to shmem.
+/// Runs in a dedicated thread, independent of the scheduling run loop.
+fn discover_and_update(local: &LocalContainerShmem) {
+    let devices = discover_npu_devices();
+    for (idx, &(card_id, device_id)) in devices.iter().enumerate() {
+        let mut procs: [DcmiProcMemInfo; MAX_DCMI_PROCS] =
+            unsafe { std::mem::zeroed() };
+        let mut proc_num: i32 = MAX_DCMI_PROCS as i32;
+        unsafe {
+            if dcmi_get_device_resource_info(card_id, device_id, procs.as_mut_ptr(), &mut proc_num) != 0 {
+                continue;
+            }
+        }
+        if proc_num <= 0 || proc_num as usize > MAX_DCMI_PROCS {
+            continue;
+        }
+        let dcmimap: HashMap<i32, u64> = procs[..proc_num as usize]
+            .iter()
+            .filter(|p| p.proc_id > 0)
+            .map(|p| (p.proc_id, p.proc_mem_usage))
+            .collect();
+        let dev = idx % NPU_DEVICE_MAX;
+        for slot in &local.procs {
+            let host_pid = slot.host_pid.load(Ordering::Relaxed);
+            if host_pid == 0 {
+                continue;
+            }
+            if let Some(&mem) = dcmimap.get(&host_pid) {
+                slot.hbm_used[dev].store(mem, Ordering::Release);
+            }
+        }
+    }
+    let mut total: u64 = 0;
+    for slot in &local.procs {
+        total += slot.hbm_used[0].load(Ordering::Acquire);
+    }
+    local.memory_used.store(total, Ordering::Release);
+}
+
+use crate::shmem::{GlobalRegistry, LocalContainerShmem, futex, MAX_MANAGERS, NPU_DEVICE_MAX, STATE_IDLE, STATE_RUNNING, STATE_MEASURING, MAX_WORKERS};
 use crate::config::ManagerConfig;
 
 const GLOBAL_WATCHDOG_TIMEOUT_US: u64 = 1_000_000;
@@ -104,6 +181,15 @@ impl ContainerManager {
     }
 
     pub fn run(&mut self) {
+        // Spawn a dedicated thread for DCMI updates, independent of the scheduling loop
+        let local_shmem = self.local;
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(DCMI_UPDATE_INTERVAL_SECS));
+                discover_and_update(local_shmem);
+            }
+        });
+
         self.join_global_queue();
 
         loop {
