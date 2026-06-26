@@ -4,12 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::thread;
 use std::fmt;
 use std::collections::HashMap;
+use std::fs;
 
 use log::{info, debug, warn};
 
-use crate::shmem::{self, LocalContainerShmem, futex, STATE_IDLE, STATE_RUNNING, STATE_MEASURING};
-use crate::config::{local_shmem_name, VIRTUAL_OVERHEAD_MB};
-use crate::externed_api::*; 
+use crate::shmem::{self, LocalContainerShmem, futex, MAX_WORKERS, STATE_IDLE, STATE_RUNNING, STATE_MEASURING};
+use crate::config::{local_shmem_path, VIRTUAL_OVERHEAD_MB};
+use crate::externed_api::*;
 use crate::check_rts;
 
 #[derive(Debug)]
@@ -33,6 +34,8 @@ pub struct SchedulerClient {
 struct SchedulerClientInner {
     shmem: &'static LocalContainerShmem,
     my_slot_idx: usize,
+    my_proc_idx: usize,
+    device_id: usize,
     lock: Mutex<InnerLock>,
     hbm_handle_map: Mutex<HashMap<u64, u64>>,
 }
@@ -41,7 +44,8 @@ impl fmt::Debug for SchedulerClientInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SchedulerClientInner")
             .field("my_slot_idx", &self.my_slot_idx)
-            .field("shmem", &self.shmem) 
+            .field("my_proc_idx", &self.my_proc_idx)
+            .field("shmem", &self.shmem)
             .finish()
     }
 }
@@ -49,35 +53,49 @@ impl fmt::Debug for SchedulerClientInner {
 impl SchedulerClient {
     /// Initialized ONCE per NPUDeviceList (per process/device)
     pub fn new() -> Self {
-        info!("[Worker PID:{}] Initialize SchedulerClient...", std::process::id());
+        let my_pid = std::process::id() as i32;
+        info!("[Worker PID:{}] Initialize SchedulerClient...", my_pid);
 
-        let shmem_name = local_shmem_name();
-        let shmem = shmem::setup::open_shmem::<LocalContainerShmem>(shmem_name.as_str());
+        let shmem_path = local_shmem_path();
+        // Wait for manager daemon to create the shmem file (it may start concurrently)
+        let shmem = loop {
+            if let Some(s) = shmem::setup::try_open_shmem::<LocalContainerShmem>(shmem_path.as_str()) {
+                break s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
 
-        // Register THIS Client in a free slot
-        let my_slot_idx = Self::register_worker_slot(shmem);
-        debug!("[Scheduler] Client Registered at Slot {}", my_slot_idx);
+        // Register THIS Client in a free worker report slot
+        let my_slot_idx = Self::register_worker_slot(shmem, my_pid);
+        debug!("[Scheduler] Client Registered at worker slot {}", my_slot_idx);
+
+        // Register THIS Process in a free process slot
+        let my_proc_idx = Self::register_proc_slot(shmem, my_pid);
+        info!("[Worker PID:{}] Registered at proc slot {}", my_pid, my_proc_idx);
 
         // Initialize internal NPU resources used for timing.
+        let mut dev: i32 = 0;
+        unsafe { rtGetDevice(&mut dev); }
+        let device_id = dev.max(0) as usize;
+
         let inner_lock = Self::create_inner_lock();
 
         Self {
             inner: Arc::new(SchedulerClientInner {
                 shmem,
                 my_slot_idx,
+                my_proc_idx,
+                device_id,
                 lock: Mutex::new(inner_lock),
                 hbm_handle_map: Mutex::new(HashMap::new()),
             }),
         }
     }
 
-    fn register_worker_slot(shmem: &'static LocalContainerShmem) -> usize {
+    fn register_worker_slot(shmem: &'static LocalContainerShmem, pid: i32) -> usize {
+        // Pass 1: reuse our own existing slot
         for (i, slot) in shmem.reports.iter().enumerate() {
-            if slot
-                .occupied
-                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed)
-                .is_ok()
-            {
+            if slot.pid.load(Ordering::Relaxed) == pid {
                 slot.batch_id.store(0, Ordering::Relaxed);
                 slot.cpu_start_us.store(0, Ordering::Relaxed);
                 slot.duration_us.store(0, Ordering::Relaxed);
@@ -85,7 +103,46 @@ impl SchedulerClient {
             }
         }
 
-        panic!("[Scheduler] Registry full. Increase MAX_WORKERS.");
+        // Pass 2: claim a free slot or CAS-reclaim a dead process's slot
+        for (i, slot) in shmem.reports.iter().enumerate() {
+            let slot_pid = slot.pid.load(Ordering::Relaxed);
+            if slot_pid == 0 {
+                if slot.occupied.compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                    slot.pid.store(pid, Ordering::Relaxed);
+                    return i;
+                }
+            } else if !proc_alive(slot_pid) {
+                // Try to atomically swap our PID in — only one thread wins
+                if slot.pid.compare_exchange(slot_pid, pid, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                    slot.batch_id.store(0, Ordering::Relaxed);
+                    slot.cpu_start_us.store(0, Ordering::Relaxed);
+                    slot.duration_us.store(0, Ordering::Relaxed);
+                    return i;
+                }
+                // Lost the race — slot_pid already changed, continue searching
+            }
+        }
+
+        panic!("[Scheduler] Registry full ({} workers). Increase MAX_WORKERS.", MAX_WORKERS);
+    }
+
+    fn register_proc_slot(shmem: &'static LocalContainerShmem, pid: i32) -> usize {
+        let host_pid = read_host_pid(pid);
+        for (i, slot) in shmem.procs.iter().enumerate() {
+            if slot
+                .is_active
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                slot.pid.store(pid, Ordering::Relaxed);
+                slot.host_pid.store(host_pid, Ordering::Relaxed);
+                for dev in 0..shmem::NPU_DEVICE_MAX {
+                    slot.hbm_used[dev].store(0, Ordering::Relaxed);
+                }
+                return i;
+            }
+        }
+        panic!("[Scheduler] Process registry full. Increase MAX_PROCESSES.");
     }
 
     fn create_inner_lock() -> InnerLock {
@@ -119,7 +176,7 @@ impl SchedulerClient {
         // We lock the mutex to safely access/modify internal state.
         // NOTE: In high contention, this serializes access to this check.
         let mut lock = self.inner.lock.lock().unwrap();
-        
+
         lock.last_user_stream = user_stream;
 
         loop {
@@ -264,9 +321,12 @@ impl SchedulerClient {
     pub fn check_memory_quota(&self, size: u64) -> u64 {
         let shmem = self.inner.shmem;
         let limit = shmem.memory_limit.load(Ordering::Relaxed);
-        
+
         // if no limit
         if limit == 0 { return 0; }
+
+        // Clean up dead processes and get accurate usage before checking
+        let _ = self.recalculate_usage();
 
         let mut current_used = shmem.memory_used.load(Ordering::Acquire);
 
@@ -295,10 +355,9 @@ impl SchedulerClient {
                         "[Worker] Memory Quota Reserved: {} bytes. Total used: {} bytes",
                         size, new_used
                     );
-                    return 0; // success
+                    return 0;
                 }
                 Err(actual) => {
-                    // If updated by another thread, update the local value and retry.
                     current_used = actual;
                 }
             }
@@ -306,10 +365,14 @@ impl SchedulerClient {
     }
 
     pub fn post_alloc_hbm(&self, p: u64, size: u64, rts_return: u64) {
-        if rts_return == RT_ERROR_NONE { // success
-             let mut map = self.inner.hbm_handle_map.lock().unwrap();
+        if rts_return == RT_ERROR_NONE {
+            let mut map = self.inner.hbm_handle_map.lock().unwrap();
             map.insert(p, size);
-        } else { // fail
+            // Track in process slot (per-device)
+            let dev = self.current_device();
+            let slot = &self.inner.shmem.procs[self.inner.my_proc_idx];
+            slot.hbm_used[dev].fetch_add(size, Ordering::Release);
+        } else {
             self.inner.shmem.memory_used.fetch_sub(size, Ordering::SeqCst);
         }
     }
@@ -323,16 +386,17 @@ impl SchedulerClient {
 
             if size > 0 {
                 self.inner.shmem.memory_used.fetch_sub(size, Ordering::SeqCst);
+                let dev = self.current_device();
+                let slot = &self.inner.shmem.procs[self.inner.my_proc_idx];
+                slot.hbm_used[dev].fetch_sub(size, Ordering::Release);
                 debug!(
                     "[Limiter] Free Success: Handle 0x{:x}, Size {} bytes returned to quota.",
                     handle, size
                 );
             } else {
-                // ptr not exist in hamp
                 warn!("[Limiter] Free Success but Handle 0x{:x} was untracked!", handle);
             }
         } else {
-            // rtFree Failed
             warn!(
                 "[Limiter] rtFreePhysical FAILED (code: {}), handle: 0x{:x}. Quota not released.",
                 ret, handle
@@ -340,11 +404,63 @@ impl SchedulerClient {
         }
     }
 
+    /// Iterate all process slots, sum hbm_used from alive processes,
+    /// clean up dead process slots. Returns corrected total usage.
+    fn current_device(&self) -> usize {
+        self.inner.device_id
+    }
+
+    pub fn recalculate_usage(&self) -> u64 {
+        self.recalculate_usage_for_device(self.current_device())
+    }
+
+    pub fn recalculate_usage_for_device(&self, device: usize) -> u64 {
+        let shmem = self.inner.shmem;
+        let mut total = 0u64;
+        let mut cleaned = 0u64;
+
+        for slot in &shmem.procs {
+            let pid = slot.pid.load(Ordering::Acquire);
+            if pid == 0 { continue; }
+            if !proc_alive(pid) {
+                // CAS the PID to 0 — only the winner cleans up
+                if slot.pid.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    let leaked = slot.hbm_used[device].swap(0, Ordering::Release);
+                    slot.is_active.store(0, Ordering::Release);
+                    cleaned += leaked;
+                }
+                continue;
+            }
+            total += slot.hbm_used[device].load(Ordering::Acquire);
+        }
+
+        // Correct the global counter if there's a discrepancy from dead processes
+        if cleaned > 0 {
+            warn!(
+                "[Limiter] Cleaned {} bytes from dead processes, correcting memory_used",
+                cleaned
+            );
+            shmem.memory_used.fetch_sub(cleaned, Ordering::Release);
+        }
+
+        // Correct global counter to match slot sum
+        let current = shmem.memory_used.load(Ordering::Acquire);
+        if total > current {
+            let add = total - current;
+            shmem.memory_used.fetch_add(add, Ordering::Release);
+        } else if total < current {
+            let sub = current - total;
+            shmem.memory_used.fetch_sub(sub, Ordering::Release);
+        }
+
+        total
+    }
+
     pub fn get_hbm_info(&self, free: *mut usize, total: *mut usize) {
         let shmem = self.inner.shmem;
-        
+
         let quota = shmem.memory_limit.load(Ordering::Relaxed) as usize;
-        let used = shmem.memory_used.load(Ordering::Relaxed) as usize;
+        let used = self.recalculate_usage_for_device(self.current_device()) as usize;
         let overhead_bytes = (VIRTUAL_OVERHEAD_MB * 1024 * 1024) as usize;
 
         let logical_free = if quota > used {
@@ -353,7 +469,6 @@ impl SchedulerClient {
             0
         };
 
-        // 返回给用户的 Free = max(0, 逻辑剩余 - 预留缓冲)
         let reported_free = if logical_free > overhead_bytes {
             logical_free - overhead_bytes
         } else {
@@ -369,9 +484,91 @@ impl SchedulerClient {
     pub fn is_hbm_limited(&self) -> bool {
         self.inner.shmem.memory_limit.load(Ordering::Relaxed) > 0
     }
+
+    pub fn get_hbm_quota(&self) -> u64 {
+        self.inner.shmem.memory_limit.load(Ordering::Relaxed)
+    }
+
+    /// Create a no-op stub for environments without shared memory (e.g. TBE subprocesses).
+    /// All HBM limit checks and compute tracking will be disabled.
+    pub fn stub() -> Self {
+        // Leak a zeroed shmem on the heap so we have a static reference.
+        let shmem: &'static LocalContainerShmem = Box::leak(Box::new(unsafe { std::mem::zeroed() }));
+        Self {
+            inner: Arc::new(SchedulerClientInner {
+                shmem,
+                my_slot_idx: 0,
+                device_id: 0,
+                my_proc_idx: 0,
+                lock: Mutex::new(InnerLock {
+                    internal_stream: 0,
+                    start_event: 0,
+                    end_event: 0,
+                    tracking_event: 0,
+                    batch_active: false,
+                    current_batch_id: 0,
+                    last_user_stream: 0,
+                    start_time_us: 0,
+                }),
+                hbm_handle_map: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Returns the raw device utilization (no per-pod split).
+    pub fn get_compute_share(&self, device_util: u32) -> u32 {
+        device_util
+    }
+}
+
+fn proc_alive(pid: i32) -> bool {
+    match fs::read_to_string(format!("/proc/{}/stat", pid)) {
+        Ok(stat) => {
+            // Extract the process state character (3rd field, after pid and comm)
+            // Format: pid (comm) state ...
+            if let Some(pos) = stat.rfind(')') {
+                let rest = &stat[pos + 2..]; // skip ") "
+                if let Some(ch) = rest.chars().next() {
+                    return ch != 'Z' && ch != 'X' && ch != 'x';
+                }
+            }
+            true // If we can't parse, assume alive
+        }
+        Err(_) => false, // /proc/pid/stat doesn't exist → process is dead
+    }
+}
+
+/// Read the host PID from /proc/self/status NSpid field.
+/// Falls back to container PID if NSpid is not available.
+fn read_host_pid(container_pid: i32) -> i32 {
+    match fs::read_to_string("/proc/self/status") {
+        Ok(status) => {
+            for line in status.lines() {
+                if line.starts_with("NSpid:") {
+                    // Format: "NSpid:\t10\t33538" — last field is host PID
+                    if let Some(last) = line.split_whitespace().last() {
+                        if let Ok(host_pid) = last.parse::<i32>() {
+                            return host_pid;
+                        }
+                    }
+                }
+            }
+            container_pid
+        }
+        Err(_) => container_pid,
+    }
 }
 
 // Helper
 fn get_time_us() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64
+}
+
+impl Drop for SchedulerClientInner {
+    fn drop(&mut self) {
+        let slot = &self.shmem.procs[self.my_proc_idx];
+        slot.pid.store(0, Ordering::Release);
+        slot.is_active.store(0, Ordering::Release);
+        // Don't zero hbm_used — it will be cleaned up by recalculate_usage
+    }
 }

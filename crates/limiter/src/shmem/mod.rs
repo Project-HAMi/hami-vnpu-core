@@ -15,6 +15,7 @@ pub struct GlobalManagerSlot {
     pub avg_kernel_time: AtomicU64,
     pub last_heartbeat: AtomicU64,
     pub is_active: AtomicU32,
+    pub priority: AtomicU64,
 }
 
 #[repr(C)]
@@ -36,6 +37,8 @@ pub struct GlobalRegistry {
 // =========================================================================================
 
 pub const MAX_WORKERS: usize = 32;
+pub const MAX_PROCESSES: usize = 64;
+pub const NPU_DEVICE_MAX: usize = 8;
 
 pub type LocalState = u32;
 
@@ -50,6 +53,16 @@ pub struct LocalWorkerReport {
     pub cpu_start_us: AtomicU64,
     pub duration_us: AtomicU64,
     pub occupied: AtomicU32,
+    pub pid: AtomicI32,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct ProcessSlot {
+    pub pid: AtomicI32,          // container PID, 0 = free
+    pub host_pid: AtomicI32,     // host PID from /proc/self/status NSpid
+    pub hbm_used: [AtomicU64; NPU_DEVICE_MAX],
+    pub is_active: AtomicU32,    // 1 = registered
 }
 
 #[repr(C)]
@@ -57,6 +70,7 @@ pub struct LocalWorkerReport {
 pub struct LocalContainerShmem {
     pub memory_limit: AtomicU64,
     pub memory_used: AtomicU64,
+    pub compute_priority: AtomicU64,
 
     pub state: AtomicU32,
     pub batch_id: AtomicU64,
@@ -67,4 +81,6 @@ pub struct LocalContainerShmem {
     pub reported_count: AtomicU32,
 
     pub reports: [LocalWorkerReport; MAX_WORKERS],
+
+    pub procs: [ProcessSlot; MAX_PROCESSES],
 }
