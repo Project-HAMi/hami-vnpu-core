@@ -1,8 +1,27 @@
-use once_cell::sync::Lazy;
+use std::sync::Mutex;
 
 use limiter::worker::SchedulerClient;
 
-pub static NPU_LIMITER: Lazy<SchedulerClient> = Lazy::new(SchedulerClient::new);
+/// PID-aware factory: detects fork and creates a fresh SchedulerClient for the child.
+/// Falls back to a no-op stub if shmem is not available (e.g. in TBE compiler subprocesses).
+static LIMITER: Mutex<Option<(i32, SchedulerClient)>> = Mutex::new(None);
+
+pub fn npu_limiter() -> SchedulerClient {
+    let pid = std::process::id() as i32;
+    let mut guard = LIMITER.lock().unwrap();
+    if let Some((old_pid, ref client)) = *guard {
+        if old_pid == pid {
+            return client.clone();
+        }
+    }
+    let client = std::panic::catch_unwind(std::panic::AssertUnwindSafe(SchedulerClient::new))
+        .unwrap_or_else(|e| {
+            log::warn!("SchedulerClient init failed (PID {}), using stub: {:?}", pid, e);
+            SchedulerClient::stub()
+        });
+    *guard = Some((pid, client.clone()));
+    client
+}
 
 macro_rules! passthrough {
     ($name:expr, ($($sig:tt)*), $($arg:expr),*) => {
@@ -20,8 +39,6 @@ macro_rules! passthrough {
         }
     };
 }
-
-pub(crate) use passthrough;
 
 mod hook;
 mod signal_compat;

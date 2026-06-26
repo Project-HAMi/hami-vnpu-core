@@ -143,11 +143,15 @@ impl ContainerManager {
             idx, pid, comp_priority, memory_limit, fixed_share_ratio
         );
 
+        // Write our priority to the global slot so other pods can calculate compute share
+        global.slots[idx].priority.store(comp_priority as u64, Ordering::Release);
+
         let memory_limit_bytes = memory_limit * MB_TO_BYTES;
 
         // Initialize
         local.memory_limit.store(memory_limit_bytes, Ordering::Relaxed);
         local.memory_used.store(0, Ordering::Relaxed);
+        local.compute_priority.store(comp_priority as u64, Ordering::Relaxed);
 
         Self {
             global,
@@ -200,7 +204,8 @@ impl ContainerManager {
             let plan = self.calculate_fair_share();
             let (actual_duration, tokens_used) = self.run_local_round(&plan);
             
-            if tokens_used > 0 && actual_duration > 0 {
+            let has_workers = tokens_used > 0 && actual_duration > 0;
+            if has_workers {
                 self.update_local_stats(actual_duration, tokens_used);
             }
             self.schedule_rest_wait(plan.rest_wait_us);
