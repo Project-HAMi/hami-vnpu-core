@@ -19,7 +19,7 @@ fn main() {
     // 1.Create SHM
     let global_reg = setup::open_global_registry(&config.global_shm_path);
 
-    let local_shm = setup::create_shmem::<LocalContainerShmem>(&config.local_shm_name);
+    let local_shm = setup::create_shmem::<LocalContainerShmem>(&config.local_shm_path);
 
     // Initialize Manager
     let mut manager = ContainerManager::new(global_reg, local_shm, std::process::id() as _, config);

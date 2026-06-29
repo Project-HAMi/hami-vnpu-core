@@ -13,3 +13,4 @@ lazy_static = { workspace = true }
 libc = { workspace = true }
 limiter = { path = "../limiter" }
 once_cell = "1.18"
+log = "0.4"
