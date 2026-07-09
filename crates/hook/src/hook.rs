@@ -21,9 +21,21 @@ pub extern "C" fn rtKernelLaunchWithFlagV2(stubFunc: u64, blockDim: u32, argsInf
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn rtKernelLaunchWithHandle(handle: u64, tilingKey: u64, blockDim: u32, argsInfo: u64, smDesc: u64, stm: u64, kernelInfo: u64) -> u64 {
+    npu_limiter().wait_for_token(stm);
+    return passthrough!("rtKernelLaunchWithHandle", (u64, u64, u32, u64, u64, u64, u64), handle, tilingKey, blockDim, argsInfo, smDesc, stm, kernelInfo);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn rtKernelLaunchWithHandleV2(handle: u64, tilingKey: u64, blockDim: u32, argsInfo: u64, smDesc: u64, stm: u64, cfgInfo: u64) -> u64 {
     npu_limiter().wait_for_token(stm);
     return passthrough!("rtKernelLaunchWithHandleV2", (u64, u64, u32, u64, u64, u64, u64), handle, tilingKey, blockDim, argsInfo, smDesc, stm, cfgInfo);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rtVectorCoreKernelLaunchWithHandle(handle: u64, tilingKey: u64, blockDim: u32, argsInfo: u64, smDesc: u64, stm: u64, cfgInfo: u64) -> u64 {
+    npu_limiter().wait_for_token(stm);
+    return passthrough!("rtVectorCoreKernelLaunchWithHandle", (u64, u64, u32, u64, u64, u64, u64), handle, tilingKey, blockDim, argsInfo, smDesc, stm, cfgInfo);
 }
 
 #[unsafe(no_mangle)]
