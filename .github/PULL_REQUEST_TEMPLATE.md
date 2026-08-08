@@ -19,6 +19,11 @@ Fixes #
 
 **Special notes for your reviewer**:
 
+**Verification performed**:
+
+- Test commands and results:
+- Manual validation:
+
 **Does this PR introduce a user-facing change?**:
 
 **AI Disclosure**:

@@ -10,4 +10,8 @@ labels: enhancement
 
 **Why is this needed**:
 
+**Acceptance criteria**:
+
+**Verification expectations**:
+
 **Anything else we need to know?**:

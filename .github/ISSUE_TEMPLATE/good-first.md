@@ -10,6 +10,10 @@ labels: "good first issue"
 
 **Suggested solution**:
 
+**Definition of done**:
+
+**Test or verification steps**:
+
 **Who can take this task**:
 
 This issue is intended for a first-time contributor beginning their contribution journey.

@@ -8,6 +8,13 @@ labels: question
 
 **What have you already tried or investigated?**:
 
+**Relevant runtime diagnostics**:
+
+- Shared-region mounts and permissions:
+- `NPU_GLOBAL_SHM_PATH`, `NPU_MEM_QUOTA`, and `NPU_PRIORITY` values:
+- Relevant `LD_PRELOAD` value:
+- Relevant, time-bounded `libvnpu.so` or driver log excerpts:
+
 Before posting, include only relevant, time-bounded excerpts and remove or mask credentials, tokens, NPU identifiers, process or workload identifiers, host paths, node or host identifiers, and internal image names.
 
 **Environment**:
