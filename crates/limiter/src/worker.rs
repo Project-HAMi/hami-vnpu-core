@@ -218,6 +218,20 @@ impl SchedulerClient {
 
 // Limit computing power
 impl SchedulerClient {
+    /// Reserve exactly one ticket, without a transient zero-to-MAX underflow.
+    /// The shared balance can change between the initial load and decrement.
+    /// Never expose a wrapped balance that another process could consume.
+    #[inline]
+    fn try_consume_one_token(&self) -> bool {
+        let remaining = &self.inner.shmem.tokens_remaining;
+        let current = remaining.load(Ordering::Acquire);
+        // On contention, return to the caller to recheck state/batch rather
+        // than retrying against a potentially replenished round's balance.
+        current != 0 && remaining.compare_exchange(
+            current, current - 1, Ordering::AcqRel, Ordering::Acquire,
+        ).is_ok()
+    }
+
     /// The Main Entry Point
     pub fn wait_for_token(&self, user_stream: u64) {
         if self.inner.is_stub {
@@ -256,9 +270,7 @@ impl SchedulerClient {
                         continue;
                     }
 
-                    // Try to fetch token
-                    let prev = self.inner.shmem.tokens_remaining.fetch_sub(1, Ordering::Acquire);
-                    if prev > 0 {
+                    if self.try_consume_one_token() {
                         // SUCCESS!
                         
                         // First Token of Batch
@@ -281,9 +293,6 @@ impl SchedulerClient {
                         }
                         
                         return; // -> Kernel Launch
-                    } else {
-                        // Race failed
-                        self.inner.shmem.tokens_remaining.fetch_add(1, Ordering::Relaxed);
                     }
                 }
 
