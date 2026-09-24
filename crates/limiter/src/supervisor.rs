@@ -38,11 +38,6 @@ const MANAGER_MIN_AGE_SECS: u64 = 3;
 /// (loops forever electing/watching); returns early only when this process cannot or
 /// should not host a manager, in which case the process runs worker-only.
 pub fn run() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .parse_default_env()
-        .try_init();
-
     block_all_signals();
 
     let my_pid = std::process::id() as i32;
