@@ -1,5 +1,4 @@
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Mutex;
 
 use limiter::worker::SchedulerClient;
 
@@ -11,8 +10,7 @@ static SUPERVISOR_PID: AtomicI32 = AtomicI32::new(0);
 /// short-lived TBE-compiler subprocesses CANN/torch spawn), and a supervisor in each made
 /// them all thrash the single manager role. Gating on "actually used the NPU" excludes them.
 /// Only spawns a thread (returns immediately) to stay off the dynamic-linker load lock.
-fn ensure_supervisor() {
-    let me = std::process::id() as i32;
+fn ensure_supervisor(me: i32) {
     let cur = SUPERVISOR_PID.load(Ordering::Acquire);
     if cur == me {
         return;
@@ -39,24 +37,18 @@ fn ensure_supervisor() {
 
 /// PID-aware factory: detects fork and creates a fresh SchedulerClient for the child.
 /// Falls back to a no-op stub if shmem is not available (e.g. in TBE compiler subprocesses).
-static LIMITER: Mutex<Option<(i32, SchedulerClient)>> = Mutex::new(None);
+static LIMITER: process::ProcessLocal<SchedulerClient> = process::ProcessLocal::new();
 
-pub fn npu_limiter() -> SchedulerClient {
-    ensure_supervisor();
-    let pid = std::process::id() as i32;
-    let mut guard = LIMITER.lock().unwrap();
-    if let Some((old_pid, ref client)) = *guard {
-        if old_pid == pid {
-            return client.clone();
-        }
-    }
-    let client = std::panic::catch_unwind(std::panic::AssertUnwindSafe(SchedulerClient::new))
-        .unwrap_or_else(|e| {
-            log::warn!("SchedulerClient init failed (PID {}), using stub: {:?}", pid, e);
-            SchedulerClient::stub()
-        });
-    *guard = Some((pid, client.clone()));
-    client
+pub fn npu_limiter() -> &'static SchedulerClient {
+    let pid = std::process::id();
+    ensure_supervisor(pid as i32);
+    LIMITER.get_or_init(pid, || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(SchedulerClient::new))
+            .unwrap_or_else(|e| {
+                log::warn!("SchedulerClient init failed (PID {}), using stub: {:?}", pid, e);
+                SchedulerClient::stub()
+            })
+    })
 }
 
 macro_rules! passthrough {
@@ -77,4 +69,5 @@ macro_rules! passthrough {
 }
 
 mod hook;
+mod process;
 mod signal_compat;
