@@ -1,4 +1,5 @@
 #![allow(dead_code, non_snake_case)]
+mod wait_observer;
 extern crate self as limiter;
 #[macro_export]
 macro_rules! check_rts { ($call:expr) => {{ (unsafe { $call }) as u32 }}; }
