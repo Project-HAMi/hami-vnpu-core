@@ -11,4 +11,3 @@ edition = "2024"
 
 [workspace.dependencies]
 libc = "*"
-lazy_static = "1.4.0"
