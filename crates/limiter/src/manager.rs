@@ -179,7 +179,7 @@ impl ContainerManager {
         // Write our priority to the global slot so other pods can calculate compute share
         global.slots[idx].priority.store(comp_priority as u64, Ordering::Release);
 
-        let memory_limit_bytes = memory_limit * MB_TO_BYTES;
+        let memory_limit_bytes = memory_limit.saturating_mul(MB_TO_BYTES);
 
         local.memory_limit.store(memory_limit_bytes, Ordering::Relaxed);
         if local.initialized.load(Ordering::Acquire) == 0 {
