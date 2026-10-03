@@ -477,8 +477,12 @@ impl SchedulerClient {
 
     pub fn recalculate_usage_for_device(&self, device: usize) -> u64 {
         let shmem = self.inner.shmem;
-        let mut total = 0u64;
-        let mut cleaned = 0u64;
+        if device >= shmem::NPU_DEVICE_MAX {
+            return 0;
+        }
+
+        let mut device_total = 0u64;
+        let mut all_device_total = 0u64;
 
         for slot in &shmem.procs {
             let pid = slot.pid.load(Ordering::Acquire);
@@ -486,35 +490,37 @@ impl SchedulerClient {
             if !proc_alive(pid) {
                 // CAS the PID to 0 — only the winner cleans up
                 if slot.pid.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                    let leaked = slot.hbm_used[device].swap(0, Ordering::Release);
+                    // The process slot owns one counter per NPU device. Clear all of them
+                    // before publishing the slot as inactive, otherwise a later scan will
+                    // skip the slot and strand usage from the other devices forever.
+                    for used in &slot.hbm_used {
+                        let _ = used.swap(0, Ordering::AcqRel);
+                    }
                     slot.is_active.store(0, Ordering::Release);
-                    cleaned += leaked;
                 }
                 continue;
             }
-            total += slot.hbm_used[device].load(Ordering::Acquire);
+            for (index, used) in slot.hbm_used.iter().enumerate() {
+                let bytes = used.load(Ordering::Acquire);
+                all_device_total = all_device_total.saturating_add(bytes);
+                if index == device {
+                    device_total = device_total.saturating_add(bytes);
+                }
+            }
         }
 
-        // Correct the global counter if there's a discrepancy from dead processes
-        if cleaned > 0 {
-            warn!(
-                "[Limiter] Cleaned {} bytes from dead processes, correcting memory_used",
-                cleaned
-            );
-            atomic_saturating_sub(&shmem.memory_used, cleaned);
-        }
-
-        // Correct global counter to match slot sum
+        // `memory_used` is a container-wide quota counter, so reconcile it with the
+        // sum across every device rather than with the caller's current device only.
         let current = shmem.memory_used.load(Ordering::Acquire);
-        if total > current {
-            let add = total - current;
+        if all_device_total > current {
+            let add = all_device_total - current;
             shmem.memory_used.fetch_add(add, Ordering::Release);
-        } else if total < current {
-            let sub = current - total;
+        } else if all_device_total < current {
+            let sub = current - all_device_total;
             atomic_saturating_sub(&shmem.memory_used, sub);
         }
 
-        total
+        device_total
     }
 
     pub fn get_hbm_info(&self, free: *mut usize, total: *mut usize) {
