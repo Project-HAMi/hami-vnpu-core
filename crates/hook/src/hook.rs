@@ -49,7 +49,7 @@ pub extern "C" fn rtMalloc(devPtr: u64, size: u64, t: u32, moduleId: u16) -> u64
             return  RT_ERROR_MEMORY_ALLOCATION;
         }
     }
-    
+
     return passthrough!("rtMalloc", (u64, u64, u32, u16), devPtr, size, t, moduleId);
 }
 
@@ -88,7 +88,38 @@ pub extern "C" fn rtFreePhysical(handle: u64) -> u64 {
 pub extern "C" fn rtFree(ptr: u64) -> u64 {
     let ret = passthrough!("rtFree", (u64), ptr);
     if npu_limiter().is_hbm_limited() {
-        npu_limiter().post_free_hbm(ptr, ret); 
+        npu_limiter().post_free_hbm(ptr, ret);
+    }
+
+    return ret;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rtMallocCached(devPtr: u64, size: u64, t: u32, moduleId: u16) -> u64 {
+    if npu_limiter().is_hbm_limited() {
+        if npu_limiter().check_memory_quota(size) == 0 {
+            let ret = passthrough!("rtMallocCached", (u64, u64, u32, u16), devPtr, size, t, moduleId);
+            if ret == RT_ERROR_NONE { // malloc successfully
+                let actual_ptr = unsafe { *(devPtr as *const u64) };
+                npu_limiter().post_alloc_hbm(actual_ptr, size, ret);
+                return RT_ERROR_NONE;
+            } else { // malloc failed
+                npu_limiter().post_alloc_hbm(0, size, ret);
+                return RT_ERROR_MEMORY_ALLOCATION;
+            }
+        } else {
+            return RT_ERROR_MEMORY_ALLOCATION;
+        }
+    }
+
+    return passthrough!("rtMallocCached", (u64, u64, u32, u16), devPtr, size, t, moduleId);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rtFreeWithDevSync(ptr: u64) -> u64 {
+    let ret = passthrough!("rtFreeWithDevSync", (u64), ptr);
+    if npu_limiter().is_hbm_limited() {
+        npu_limiter().post_free_hbm(ptr, ret);
     }
 
     return ret;
