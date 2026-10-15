@@ -115,7 +115,7 @@ fn discover_and_update(local: &LocalContainerShmem) {
 }
 
 use crate::shmem::{GlobalRegistry, LocalContainerShmem, futex, MAX_MANAGERS, NPU_DEVICE_MAX, STATE_IDLE, STATE_RUNNING, STATE_MEASURING, MAX_WORKERS};
-use crate::config::ManagerConfig;
+use crate::config::{ManagerConfig, SchedPolicy};
 use crate::worker::proc_alive;
 
 const GLOBAL_WATCHDOG_TIMEOUT_US: u64 = 1_000_000;
@@ -148,10 +148,10 @@ pub struct ContainerManager {
     my_pid: i32,
     my_global_idx: usize,
     current_avg_us: u64,
-    my_priority: f64,
+    compute_limit: f64,
     token_scale: f64,
     ema_alpha: f64,
-    fixed_share_ratio: bool,
+    sched_policy: SchedPolicy,
     next_run_not_before: Option<Instant>,
 }
 
@@ -163,21 +163,19 @@ impl ContainerManager {
         let token_scale = std::env::var("NPU_TOKEN_SCALE").unwrap_or_else(|_| "100.0".to_string()).parse::<f64>().unwrap_or(1.0).max(0.1);
         // Faster EMA by default.
         let ema_alpha = std::env::var("NPU_AVG_ALPHA").unwrap_or_else(|_| "0.7".to_string()).parse::<f64>().unwrap_or(0.7).clamp(0.05, 0.95);
-        let fixed_share_ratio = std::env::var("NPU_FIXED_SHARE_RATIO")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let sched_policy = config.sched_policy;
 
         // default value
-        let comp_priority = config.priority;
+        let compute_limit = f64::from(config.compute_limit);
         let memory_limit = config.memory_limit_mb;
 
         info!(
-            "[Manager] Registered as Global Manager #{} (PID: {}). Compute limit: {}, Memory limit: {}, FixedShare: {}",
-            idx, pid, comp_priority, memory_limit, fixed_share_ratio
+            "[Manager] Registered as Global Manager #{} (PID: {}). Compute limit: {}%, Memory limit: {} MB, Policy: {}",
+            idx, pid, compute_limit, memory_limit, sched_policy.as_str()
         );
 
-        // Write our priority to the global slot so other pods can calculate compute share
-        global.slots[idx].priority.store(comp_priority as u64, Ordering::Release);
+        // Publish the configured scheduling share for diagnostics
+        global.slots[idx].compute_limit.store(compute_limit as u64, Ordering::Release);
 
         let memory_limit_bytes = memory_limit.saturating_mul(MB_TO_BYTES);
 
@@ -185,7 +183,7 @@ impl ContainerManager {
         if local.initialized.load(Ordering::Acquire) == 0 {
             local.memory_used.store(0, Ordering::Relaxed);
         }
-        local.compute_priority.store(comp_priority as u64, Ordering::Relaxed);
+        local.compute_limit.store(compute_limit as u64, Ordering::Relaxed);
         local.manager_global_idx.store(idx as i32, Ordering::Release);
         local.initialized.store(1, Ordering::Release);
 
@@ -195,10 +193,10 @@ impl ContainerManager {
             my_pid: pid,
             my_global_idx: idx,
             current_avg_us: DEFAULT_AVG_US,
-            my_priority: comp_priority,
+            compute_limit,
             token_scale,
             ema_alpha,
-            fixed_share_ratio,
+            sched_policy,
             next_run_not_before: None,
         })
     }
@@ -346,16 +344,12 @@ impl ContainerManager {
         }
 
         let my_time = self.current_avg_us.max(1);
-        // Allow sub-1.0 priorities to act as fractions only when fixed-share is requested.
-        let prio_for_tokens = if self.fixed_share_ratio {
-            self.my_priority.max(0.01)
-        } else {
-            self.my_priority.max(1.0)
-        };
-        
+        // Config validation guarantees an integer in [1,100].
+        let limit_for_tokens = self.compute_limit;
+
         // Base tokens before scaling (used for time budgeting and averaging).
-        // Formula: tokens = priority * (anchor / my_time)
-        let raw_tokens = prio_for_tokens * (anchor_speed_us as f64 / my_time as f64);
+        // Formula: tokens = compute_limit * (anchor / my_time)
+        let raw_tokens = limit_for_tokens * (anchor_speed_us as f64 / my_time as f64);
         let mut base_tokens = raw_tokens.ceil() as u64;
         base_tokens = base_tokens.clamp(MIN_TOKENS, MAX_TOKENS);
 
@@ -369,10 +363,10 @@ impl ContainerManager {
             .saturating_add(expected_run_us / 2)
             .saturating_add(50_000);
 
-        // Compute an off-duty window so the runtime/wait ratio depends on priority only.
-        let rest_wait_us = if self.fixed_share_ratio {
+        // Compute an off-duty window so the runtime/wait ratio follows the configured percentage.
+        let rest_wait_us = if self.sched_policy.is_fixed() {
             // User-requested: rest = (100 - p) * (anchor * scale)
-            let p = self.my_priority.clamp(1.0, 100.0);
+            let p = self.compute_limit.clamp(1.0, 100.0);
             let wait = ((100.0 - p) * (anchor_speed_us as f64) * self.token_scale).round();
             wait.clamp(0.0, u64::MAX as f64) as u64
         } else {
@@ -380,8 +374,8 @@ impl ContainerManager {
         };
 
         debug!(
-            "[Sched] Anchor: {}us, MyAvg: {}us, Prio: {}, BaseTokens: {}, Scale: {}, FinalTokens: {}, Timeout: {}ms, Rest: {}ms",
-            anchor_speed_us, my_time, self.my_priority, base_tokens, self.token_scale, tokens, timeout_us / 1000, rest_wait_us / 1000
+            "[Sched] Anchor: {}us, MyAvg: {}us, ComputeLimit: {}, BaseTokens: {}, Scale: {}, FinalTokens: {}, Timeout: {}ms, Rest: {}ms",
+            anchor_speed_us, my_time, self.compute_limit, base_tokens, self.token_scale, tokens, timeout_us / 1000, rest_wait_us / 1000
         );
 
         SharePlan {
@@ -435,9 +429,9 @@ impl ContainerManager {
                 break;
             }
 
-            if self.fixed_share_ratio {
+            if self.sched_policy.is_fixed() {
                 // Hold the lock for the full budgeted runtime even if no worker progresses,
-                // so the run/wait ratio follows the configured priority.
+                // so the run/wait ratio follows the configured percentage.
                 if start_time.elapsed() >= budget_duration {
                     tokens_consumed_for_stats = tokens.saturating_sub(current_tokens);
                     break;
@@ -511,7 +505,7 @@ impl ContainerManager {
     }
 
     fn honor_fixed_rest_wait(&mut self) {
-        if !self.fixed_share_ratio {
+        if !self.sched_policy.is_fixed() {
             return;
         }
         if let Some(deadline) = self.next_run_not_before {
@@ -585,7 +579,7 @@ impl ContainerManager {
     }
 
     fn schedule_rest_wait(&mut self, rest_wait_us: u64) {
-        if !self.fixed_share_ratio || rest_wait_us == 0 {
+        if !self.sched_policy.is_fixed() || rest_wait_us == 0 {
             self.next_run_not_before = None;
             return;
         }

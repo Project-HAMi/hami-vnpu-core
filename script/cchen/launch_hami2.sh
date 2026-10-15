@@ -1,9 +1,9 @@
 #!/bin/bash
 
 CONTAINER_NAME="cchen_hami2"        
-PRIORITY="80"                      # 调度优先级
+COMPUTE_LIMIT="80"                      # dynamic 策略下的相对份额
 LOG_PREFIX="inst2"                  # 日志文件前缀
-NPU_MEM_QUOTA="28672"
+NPU_MEMORY_LIMIT_MB="28672"
 
 # 路径配置
 IMAGE="registry-cbu.huawei.com/ascend/vllm-ascend:v0.10.1rc1"
@@ -41,8 +41,9 @@ docker run -d --rm -i --privileged -u root \
     -v /mnt/nvme0/LLMs/:/models \
     --name $CONTAINER_NAME \
     -e NPU_GLOBAL_SHM_PATH=$GLOBAL_SHM_PATH \
-    -e NPU_PRIORITY=$PRIORITY \
-     -e NPU_MEM_QUOTA=$NPU_MEM_QUOTA \
+    -e NPU_COMPUTE_LIMIT=$COMPUTE_LIMIT \
+    -e NPU_SCHED_POLICY=dynamic \
+     -e NPU_MEMORY_LIMIT_MB=$NPU_MEMORY_LIMIT_MB \
     -e HOME=/ \
     $IMAGE \
     bash -c "
@@ -51,7 +52,7 @@ docker run -d --rm -i --privileged -u root \
 
         # Manager 现已内置于 libvnpu.so，随 LD_PRELOAD 自动启动，无需单独拉起 limiter
         echo '[Container] Starting AI Application with LD_PRELOAD...'
-        LD_PRELOAD=${LIBRARY_PATH} python3 /${CONTAINER_PROJECT_DIR}/hami-vnpu-core/test/resnet50.py --prio=${PRIORITY} 2>&1 | tee /${CONTAINER_PROJECT_DIR}/${LOG_PREFIX}_app.log
+        LD_PRELOAD=${LIBRARY_PATH} python3 /${CONTAINER_PROJECT_DIR}/hami-vnpu-core/test/resnet50.py --prio=${COMPUTE_LIMIT} 2>&1 | tee /${CONTAINER_PROJECT_DIR}/${LOG_PREFIX}_app.log
     "
 
 echo "--- [Host] 容器 $CONTAINER_NAME 已在后台启动 ---"
