@@ -55,7 +55,7 @@ SHM Volume: Map the host's shared region (e.g.`/tmp/hami-shared-region`) to a co
 
 - **NPU_COMPUTE_LIMIT**: Integer from `1` to `100`, default `1`. Its interpretation depends on `NPU_SCHED_POLICY`.
 
-- **NPU_SCHED_POLICY**: `dynamic` (default) or `fixed`. With `dynamic`, the compute limit is a relative scheduling share and idle capacity can be borrowed; it is not a strict percentage ceiling. With `fixed`, the compute limit is the target percentage used to control the run/rest ratio. Actual limiting accuracy depends on the scheduling mechanism.
+- **NPU_SCHED_POLICY**: `dynamic` (default), `fixed`, or `overdraft`. With `dynamic`, the compute limit is a relative scheduling share and idle capacity can be borrowed; it is not a strict percentage ceiling. With `fixed`, the compute limit is the target percentage used to control the run/rest ratio. Actual limiting accuracy depends on the scheduling mechanism. `overdraft` retains Dynamic scheduling and adds the bounded IDLE borrowing described below.
 
 The current library no longer accepts `NPU_MEM_QUOTA`, `NPU_PRIORITY`, or `NPU_FIXED_SHARE_RATIO`; setting them reports a migration error. Use the new variables above instead. The `fixed` policy corresponds to the previous fixed-share setting of `true`, while `dynamic` corresponds to `false`. Upgrade an older deployed library before using the new variables; older binaries do not recognize them.
 
@@ -64,6 +64,27 @@ export NPU_GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
 export NPU_MEMORY_LIMIT_MB=10240 # 10 GiB HBM
 export NPU_COMPUTE_LIMIT=20 # target 20% run/rest ratio with fixed policy
 export NPU_SCHED_POLICY=fixed
+```
+
+#### Optional Overdraft Policy
+
+`NPU_SCHED_POLICY=overdraft` builds on the normal Dynamic rotation and adds a bounded shared borrowing pool when a Pod is in `IDLE`. The policy itself enables borrowing. The removed `NPU_OVERDRAFT_ENABLED` variable is rejected with a migration error directing users to `NPU_SCHED_POLICY=overdraft`. This implements the bounded-pool direction discussed in [issue #29](https://github.com/Project-HAMi/hami-vnpu-core/issues/29). Historical ResNet results in that issue are not measurements of this implementation.
+
+The strategy uses internal defaults: a shared pool of `10` admission tickets, a `5000`-microsecond cumulative blocking threshold for one kernel-admission call, and a `1000`-microsecond futex polling interval. These parameters are not exposed as environment variables. Enable the strategy only through `NPU_SCHED_POLICY=overdraft`. Borrowing is permitted only while in `IDLE`; the timer does not restart on entry to `IDLE`.
+
+Blocking time accumulates from entry to each kernel-admission wait, including waits on the RWLock and in `RUNNING` or `MEASURING`; changing state does not reset it. A timed-out worker can fill an empty, open pool, including after it is exhausted again in the same scheduling round. Every borrowed admission consumes one ticket, including the worker that triggers a fill. The pool holds at most `10` tickets; this is not a cumulative per-round admission limit. The `5000`-microsecond threshold applies to each waiting call, not a global refill interval: several workers that have already timed out may trigger successive fills as the pool empties. Closing the pool prevents refills until the manager opens a new round. Borrowed work is allowed only in `IDLE` and does not contribute to normal `active_workers` accounting or normal completion events. Multiple Pods may therefore execute borrowed work concurrently; the policy does not guarantee a strict compute percentage or complete fairness. Tickets count admissions, not kernel runtime or outstanding kernel execution.
+
+The added shared-memory fields are appended after the existing layout so monitoring tools retain the old field offsets. This does not make old process mappings compatible with the extended layout. Before upgrading, stop all old processes in the same Pod and use a fresh `NPU_LOCAL_SHM_PATH` file (for example `/tmp/vnpu_local_shmem_overdraft_v2`). All participating processes in that Pod must use the new mapping; do not mix old and new mappings.
+
+The pool uses a non-wrapping 32-bit round tag. After approximately 4.29 billion rounds on one local shared-memory file, borrowing stays disabled while normal scheduling continues. Stop the participating processes and use a fresh local shared-memory file to restore borrowing.
+
+Example configuration (after preparing the shared directory and the fresh local shared-memory path):
+
+```bash
+export NPU_GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
+export NPU_MEMORY_LIMIT_MB=10240
+export NPU_COMPUTE_LIMIT=20
+export NPU_SCHED_POLICY=overdraft
 ```
 
 #### Step 3. Launching the AI App:

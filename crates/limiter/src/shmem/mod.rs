@@ -96,6 +96,12 @@ pub struct LocalContainerShmem {
     pub manager_heartbeat: AtomicU64,  // manager heartbeat (us); stale => eligible for takeover
     pub manager_global_idx: AtomicI32, // global slot the manager holds (for takeover reclaim)
     pub initialized: AtomicU32,        // 1 once manager published resource configuration; workers wait on it
+
+    // Append only: the monitor's existing reports/procs offsets remain stable.
+    pub overdraft_pool: crate::overdraft::OverdraftPool,
+    pub overdraft_limit: AtomicU32,
+    pub overdraft_timeout_us: AtomicU64,
+    pub overdraft_poll_interval_us: AtomicU64,
 }
 
 // Keep offsets consumed by the device-plugin monitor unchanged.
@@ -103,4 +109,7 @@ const _: () = {
     assert!(std::mem::size_of::<GlobalManagerSlot>() == 40);
     assert!(std::mem::offset_of!(GlobalManagerSlot, compute_limit) == 32);
     assert!(std::mem::offset_of!(LocalContainerShmem, compute_limit) == 16);
+    assert!(std::mem::offset_of!(LocalContainerShmem, reports) == 56);
+    assert!(std::mem::offset_of!(LocalContainerShmem, procs) == 1080);
+    assert!(std::mem::offset_of!(LocalContainerShmem, overdraft_pool) == 6224);
 };

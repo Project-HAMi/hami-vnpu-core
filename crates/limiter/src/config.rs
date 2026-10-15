@@ -6,7 +6,7 @@ pub const ENV_LOCAL_SHM_PATH: &str = "NPU_LOCAL_SHM_PATH";
 pub const ENV_MEMORY_LIMIT_MB: &str = "NPU_MEMORY_LIMIT_MB";
 /// 算力配置百分比，整数 1..=100；具体执行方式由调度策略决定。
 pub const ENV_COMPUTE_LIMIT: &str = "NPU_COMPUTE_LIMIT";
-/// 调度策略：dynamic（动态份额）或 fixed（固定比例）。
+/// 调度策略：dynamic、fixed 或 overdraft。
 pub const ENV_SCHED_POLICY: &str = "NPU_SCHED_POLICY";
 
 pub const DEFAULT_LOCAL_SHMEM_PATH: &str = "/tmp/vnpu_local_shmem";
@@ -15,16 +15,37 @@ pub const DEFAULT_COMPUTE_LIMIT: u32 = 1;
 pub const DEFAULT_MEMORY_LIMIT_MB: u64 = 0;
 pub const DEFAULT_SCHED_POLICY: SchedPolicy = SchedPolicy::Dynamic;
 
+#[derive(Debug, Clone, Copy)]
+pub struct OverdraftConfig {
+    pub limit: u32,
+    pub timeout_us: u64,
+    pub poll_interval_us: u64,
+}
+
+// Policy internals, not additional environment settings. Keep tuning in one place.
+const OVERDRAFT_DEFAULTS: OverdraftConfig = OverdraftConfig {
+    limit: 10,
+    timeout_us: 5000,
+    poll_interval_us: 1000,
+};
+
+const _: () = {
+    assert!(OVERDRAFT_DEFAULTS.limit > 0 && OVERDRAFT_DEFAULTS.limit <= crate::overdraft::MAX_LIMIT);
+    assert!(OVERDRAFT_DEFAULTS.timeout_us > 0 && OVERDRAFT_DEFAULTS.poll_interval_us > 0);
+};
+
 /// HBM虚拟开销预留大小（128MB）
 pub const VIRTUAL_OVERHEAD_MB: usize = 128; // Reserve 128MB as HBM overhead
 
-/// 两种现有时分调度策略。空间切分后端不由这个枚举隐式接入。
+/// Named compute policies; every new policy must define its behavior explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedPolicy {
     /// 按配置数值分配相对份额，允许空闲资源借用，不提供绝对百分比上限。
     Dynamic,
     /// 按配置百分比计算运行/休息比例，沿用现有 fixed-share 算法。
     Fixed,
+    /// Dynamic rotation plus a bounded allowance while this Pod is IDLE.
+    Overdraft,
 }
 
 impl SchedPolicy {
@@ -32,13 +53,14 @@ impl SchedPolicy {
         match self {
             Self::Dynamic => "dynamic",
             Self::Fixed => "fixed",
+            Self::Overdraft => "overdraft",
         }
     }
 
     pub fn is_fixed(self) -> bool {
         // Exhaustive matching forces new policies to choose their behavior.
         match self {
-            Self::Dynamic => false,
+            Self::Dynamic | Self::Overdraft => false,
             Self::Fixed => true,
         }
     }
@@ -51,7 +73,8 @@ impl std::str::FromStr for SchedPolicy {
         match value.trim() {
             "dynamic" => Ok(Self::Dynamic),
             "fixed" => Ok(Self::Fixed),
-            _ => Err(format!("{ENV_SCHED_POLICY} must be dynamic or fixed")),
+            "overdraft" => Ok(Self::Overdraft),
+            _ => Err(format!("{ENV_SCHED_POLICY} must be dynamic, fixed, or overdraft")),
         }
     }
 }
@@ -70,6 +93,7 @@ pub struct ManagerConfig {
     pub compute_limit: u32,
     pub memory_limit_mb: u64,
     pub sched_policy: SchedPolicy,
+    pub overdraft: OverdraftConfig,
 }
 
 impl ManagerConfig {
@@ -87,6 +111,7 @@ impl ManagerConfig {
             ("NPU_MEM_QUOTA", ENV_MEMORY_LIMIT_MB),
             ("NPU_PRIORITY", ENV_COMPUTE_LIMIT),
             ("NPU_FIXED_SHARE_RATIO", ENV_SCHED_POLICY),
+            ("NPU_OVERDRAFT_ENABLED", ENV_SCHED_POLICY),
         ] {
             if get(old)?.is_some() {
                 return Err(format!("{old} has been replaced by {new}; remove the old variable"));
@@ -118,14 +143,15 @@ impl ManagerConfig {
             None => DEFAULT_SCHED_POLICY,
             Some(value) => value.parse::<SchedPolicy>()?,
         };
-        Ok(Self { global_shm_path, local_shm_path, compute_limit, memory_limit_mb, sched_policy })
+        let overdraft = OVERDRAFT_DEFAULTS;
+        Ok(Self { global_shm_path, local_shm_path, compute_limit, memory_limit_mb, sched_policy, overdraft })
     }
 }
 
 /// Validate explicit resource settings before a worker can enter the stub path.
 pub fn validate_requested_limits() -> Result<(), String> {
     let requested = [ENV_MEMORY_LIMIT_MB, ENV_COMPUTE_LIMIT, ENV_SCHED_POLICY,
-        "NPU_MEM_QUOTA", "NPU_PRIORITY", "NPU_FIXED_SHARE_RATIO"]
+        "NPU_MEM_QUOTA", "NPU_PRIORITY", "NPU_FIXED_SHARE_RATIO", "NPU_OVERDRAFT_ENABLED"]
         .iter().any(|name| std::env::var_os(name).is_some());
     if requested {
         ManagerConfig::from_env().map(|_| ())
@@ -150,11 +176,12 @@ mod tests {
 
     #[test]
     fn policy_names_round_trip_through_the_enum() {
-        for policy in [SchedPolicy::Dynamic, SchedPolicy::Fixed] {
+        for policy in [SchedPolicy::Dynamic, SchedPolicy::Fixed, SchedPolicy::Overdraft] {
             assert_eq!(policy.as_str().parse::<SchedPolicy>().unwrap(), policy);
             assert_eq!(policy.to_string(), policy.as_str());
         }
         assert!(!SchedPolicy::Dynamic.is_fixed());
+        assert!(!SchedPolicy::Overdraft.is_fixed());
         assert!(SchedPolicy::Fixed.is_fixed());
     }
 
@@ -241,4 +268,24 @@ mod tests {
         }).unwrap_err();
         assert!(error.contains("invalid Unicode"));
     }
+    #[test]
+    fn overdraft_uses_internal_defaults_without_more_environment_settings() {
+        let cfg = ManagerConfig::from_lookup(|name| {
+            assert!([ENV_GLOBAL_SHM_PATH, ENV_LOCAL_SHM_PATH, ENV_MEMORY_LIMIT_MB,
+                ENV_COMPUTE_LIMIT, ENV_SCHED_POLICY, "NPU_MEM_QUOTA", "NPU_PRIORITY",
+                "NPU_FIXED_SHARE_RATIO", "NPU_OVERDRAFT_ENABLED"].contains(&name),
+                "unexpected environment setting: {name}");
+            Ok(match name {
+                ENV_GLOBAL_SHM_PATH => Some("/tmp/global".into()),
+                ENV_SCHED_POLICY => Some("overdraft".into()),
+                _ => None,
+            })
+        }).unwrap();
+        assert_eq!(cfg.sched_policy, SchedPolicy::Overdraft);
+        assert_eq!(cfg.overdraft.limit, 10);
+        assert_eq!(cfg.overdraft.timeout_us, 5000);
+        assert_eq!(cfg.overdraft.poll_interval_us, 1000);
+        assert!(config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), ("NPU_OVERDRAFT_ENABLED", "true")]).is_err());
+    }
+
 }
