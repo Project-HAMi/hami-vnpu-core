@@ -48,17 +48,22 @@ SHM Volume: Map the host's shared region (e.g.`/tmp/hami-shared-region`) to a co
 - `--privileged` is required for Ascend NPUs to be shared between containers when start docker containers.
 
 #### Step 2. Set Environment Variables:
-- **NPU_GLOBAL_SHM_PATH**: Define a unique filename within the **shared region**.
+- **NPU_GLOBAL_SHM_PATH** (required): Define a unique filename within the **shared region**.
 > Note: You do NOT need to create this file manually; the manager (embedded in `libvnpu.so`) handles file creation and initialization. However, the path must be identical across all Pods to allow coordination.
 
-- **NPU_MEM_QUOTA**: Memory limit for the specific Pod (in MB).
+- **NPU_MEMORY_LIMIT_MB**: Total memory limit for the Pod, in MB (1 MB = 1024 * 1024 bytes). The default is `0`, which disables the memory limit.
 
-- **NPU_PRIORITY**: Set the scheduling priority (e.g., 20).
+- **NPU_COMPUTE_LIMIT**: Integer from `1` to `100`, default `1`. Its interpretation depends on `NPU_SCHED_POLICY`.
+
+- **NPU_SCHED_POLICY**: `dynamic` (default) or `fixed`. With `dynamic`, the compute limit is a relative scheduling share and idle capacity can be borrowed; it is not a strict percentage ceiling. With `fixed`, the compute limit is the target percentage used to control the run/rest ratio. Actual limiting accuracy depends on the scheduling mechanism.
+
+The current library no longer accepts `NPU_MEM_QUOTA`, `NPU_PRIORITY`, or `NPU_FIXED_SHARE_RATIO`; setting them reports a migration error. Use the new variables above instead. The `fixed` policy corresponds to the previous fixed-share setting of `true`, while `dynamic` corresponds to `false`. Upgrade an older deployed library before using the new variables; older binaries do not recognize them.
 
 ```bash
 export NPU_GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
-export NPU_MEM_QUOTA=10240 # 10GB HBM
-export NPU_PRIORITY=20 # use half of computing power than another one with priority 40
+export NPU_MEMORY_LIMIT_MB=10240 # 10 GiB HBM
+export NPU_COMPUTE_LIMIT=20 # target 20% run/rest ratio with fixed policy
+export NPU_SCHED_POLICY=fixed
 ```
 
 #### Step 3. Launching the AI App:
