@@ -423,14 +423,21 @@ impl ContainerManager {
         let start_time = Instant::now();
         let timeout_duration = Duration::from_micros(plan.time_limit_us);
         let budget_duration = Duration::from_micros(plan.expected_run_us);
+
+        // Phase 1 Fix: Continuous progress tracking with absolute bounds
         let mut saw_progress = false;
         let mut last_tokens = tokens;
+        let mut no_progress_count = 0u32;
+        const MAX_NO_PROGRESS_ITERATIONS: u32 = 200; // 200 * 5ms = 1s
+        const ABSOLUTE_TIMEOUT_SECS: u64 = 120; // 2 minutes hard cap
+        let absolute_deadline = start_time + Duration::from_secs(ABSOLUTE_TIMEOUT_SECS);
+
         let mut tokens_consumed_for_stats = 0u64;
-        
+
         loop {
             let current_tokens = self.local.tokens_remaining.load(Ordering::Relaxed);
 
-            if current_tokens == 0 { 
+            if current_tokens == 0 {
                 debug!("[Manager] --- Token all used, enter STATE_MEASURING ");
                 break;
             }
@@ -443,17 +450,33 @@ impl ContainerManager {
                     break;
                 }
             } else {
-                // Detect zero-progress batches (e.g., other container paused) and bail early
-                // instead of waiting full timeout_us.
-                if current_tokens < last_tokens || self.local.active_workers.load(Ordering::Relaxed) > 0 {
+                // Phase 1 Fix: Continuous progress detection
+                if current_tokens < last_tokens {
                     saw_progress = true;
+                    no_progress_count = 0;
+                } else if saw_progress {
+                    // We saw progress before, now check if it stopped
+                    no_progress_count += 1;
+                    if no_progress_count >= MAX_NO_PROGRESS_ITERATIONS {
+                        warn!("[Manager] No progress for 1s after initial activity, yielding turn");
+                        break;
+                    }
                 }
-                if !saw_progress && start_time.elapsed() > Duration::from_millis(5) {
+
+                // Original zero-progress detection for batches that never started
+                if !saw_progress && self.local.active_workers.load(Ordering::Relaxed) == 0 && start_time.elapsed() > Duration::from_millis(5) {
                     debug!("[Manager] --- no progress for 5ms, enter STATE_MEASURING early");
                     break;
                 }
             }
             last_tokens = current_tokens;
+
+            // Phase 1 Fix: Absolute timeout regardless of progress
+            if Instant::now() >= absolute_deadline {
+                warn!("[Manager] Absolute round timeout ({}s) reached, yielding turn", ABSOLUTE_TIMEOUT_SECS);
+                tokens_consumed_for_stats = tokens.saturating_sub(current_tokens);
+                break;
+            }
 
             if start_time.elapsed() > timeout_duration {
                 let remaining = self.local.tokens_remaining.load(Ordering::Relaxed);
@@ -573,13 +596,40 @@ impl ContainerManager {
     fn update_local_stats(&mut self, duration_us: u64, tokens: u64) {
         if tokens == 0 { return; }
         let new_avg = duration_us / tokens;
+
+        // Phase 1 Fix: Absolute bounds on EMA to prevent hour-long timeouts
+        const MIN_AVG_US: u64 = 50;         // 50 microseconds minimum
+        const MAX_AVG_US: u64 = 5_000_000;  // 5 seconds maximum
+
         // Clamp swings but allow faster adaptation.
         let lower = (self.current_avg_us / 4).max(1);
         let upper = self.current_avg_us.saturating_mul(4).max(1);
         let clamped_avg = new_avg.clamp(lower, upper);
+
         let alpha = self.ema_alpha;
-        self.current_avg_us = ((self.current_avg_us as f64 * (1.0 - alpha)) + (clamped_avg as f64 * alpha)) as u64;
-        
+        let mut updated_avg = ((self.current_avg_us as f64 * (1.0 - alpha)) + (clamped_avg as f64 * alpha)) as u64;
+
+        // Phase 1 Fix: Apply absolute bounds after EMA calculation
+        updated_avg = updated_avg.clamp(MIN_AVG_US, MAX_AVG_US);
+
+        if updated_avg != self.current_avg_us {
+            let old_avg = self.current_avg_us;
+            self.current_avg_us = updated_avg;
+
+            // Log significant changes for debugging
+            let delta = if updated_avg > old_avg {
+                updated_avg - old_avg
+            } else {
+                old_avg - updated_avg
+            };
+            if delta > old_avg / 2 {
+                debug!(
+                    "[Manager] EMA updated: {} us -> {} us (new measurement: {} us, tokens: {})",
+                    old_avg, updated_avg, new_avg, tokens
+                );
+            }
+        }
+
         self.global.slots[self.my_global_idx].avg_kernel_time.store(self.current_avg_us, Ordering::Relaxed);
         self.global.slots[self.my_global_idx].last_heartbeat.store(get_time_us(), Ordering::Relaxed);
     }

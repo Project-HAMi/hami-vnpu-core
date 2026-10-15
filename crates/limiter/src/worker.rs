@@ -391,6 +391,31 @@ impl SchedulerClient {
             duration_us = (ms * 1000.0) as u64;
         }
 
+        // Phase 1 Fix: Sanity check measurements before reporting
+        // Reject obviously wrong measurements that would pollute EMA
+        const MIN_DURATION_US: u64 = 10;           // 10 microseconds minimum
+        const MAX_DURATION_US: u64 = 5_000_000;    // 5 seconds maximum
+
+        if duration_us < MIN_DURATION_US {
+            warn!(
+                "[Worker PID:{}] Rejecting too-short measurement: {} us (batch_id={})",
+                std::process::id(), duration_us, lock.current_batch_id
+            );
+            lock.batch_active = false;
+            lock.start_time_us = 0;
+            return; // Don't report invalid measurements
+        }
+
+        if duration_us > MAX_DURATION_US {
+            warn!(
+                "[Worker PID:{}] Rejecting outlier measurement: {} us = {:.2}s (batch_id={}), likely includes idle/blocked time",
+                std::process::id(), duration_us, duration_us as f64 / 1_000_000.0, lock.current_batch_id
+            );
+            lock.batch_active = false;
+            lock.start_time_us = 0;
+            return; // Don't report outliers that pollute scheduling
+        }
+
         // Report to Shared Memory
         let slot = &self.inner.shmem.reports[self.inner.my_slot_idx];
         slot.duration_us.store(duration_us, Ordering::Relaxed);
