@@ -6,7 +6,7 @@ pub const ENV_LOCAL_SHM_PATH: &str = "NPU_LOCAL_SHM_PATH";
 pub const ENV_MEMORY_LIMIT_MB: &str = "NPU_MEMORY_LIMIT_MB";
 /// 算力配置百分比，整数 1..=100；具体执行方式由调度策略决定。
 pub const ENV_COMPUTE_LIMIT: &str = "NPU_COMPUTE_LIMIT";
-/// 调度策略：dynamic、fixed 或 overdraft。
+/// 调度策略：dynamic、fixed、overdraft 或 spatial。
 pub const ENV_SCHED_POLICY: &str = "NPU_SCHED_POLICY";
 
 pub const DEFAULT_LOCAL_SHMEM_PATH: &str = "/tmp/vnpu_local_shmem";
@@ -46,6 +46,8 @@ pub enum SchedPolicy {
     Fixed,
     /// Dynamic rotation plus a bounded allowance while this Pod is IDLE.
     Overdraft,
+    /// Cooperative Cube/Vector core budgets; no time-sliced admission gate.
+    Spatial,
 }
 
 impl SchedPolicy {
@@ -54,14 +56,31 @@ impl SchedPolicy {
             Self::Dynamic => "dynamic",
             Self::Fixed => "fixed",
             Self::Overdraft => "overdraft",
+            Self::Spatial => "spatial",
         }
     }
 
     pub fn is_fixed(self) -> bool {
         // Exhaustive matching forces new policies to choose their behavior.
         match self {
-            Self::Dynamic | Self::Overdraft => false,
+            Self::Dynamic | Self::Overdraft | Self::Spatial => false,
             Self::Fixed => true,
+        }
+    }
+
+    pub fn is_time_sliced(self) -> bool {
+        match self {
+            Self::Dynamic | Self::Fixed | Self::Overdraft => true,
+            Self::Spatial => false,
+        }
+    }
+
+    /// Workers also need the policy before constructing timing resources.
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var(ENV_SCHED_POLICY) {
+            Ok(value) => value.parse(),
+            Err(std::env::VarError::NotPresent) => Ok(DEFAULT_SCHED_POLICY),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{ENV_SCHED_POLICY} must contain valid Unicode")),
         }
     }
 }
@@ -74,7 +93,8 @@ impl std::str::FromStr for SchedPolicy {
             "dynamic" => Ok(Self::Dynamic),
             "fixed" => Ok(Self::Fixed),
             "overdraft" => Ok(Self::Overdraft),
-            _ => Err(format!("{ENV_SCHED_POLICY} must be dynamic, fixed, or overdraft")),
+            "spatial" => Ok(Self::Spatial),
+            _ => Err(format!("{ENV_SCHED_POLICY} must be dynamic, fixed, overdraft, or spatial")),
         }
     }
 }
@@ -176,13 +196,18 @@ mod tests {
 
     #[test]
     fn policy_names_round_trip_through_the_enum() {
-        for policy in [SchedPolicy::Dynamic, SchedPolicy::Fixed, SchedPolicy::Overdraft] {
+        for policy in [SchedPolicy::Dynamic, SchedPolicy::Fixed, SchedPolicy::Overdraft, SchedPolicy::Spatial] {
             assert_eq!(policy.as_str().parse::<SchedPolicy>().unwrap(), policy);
             assert_eq!(policy.to_string(), policy.as_str());
         }
         assert!(!SchedPolicy::Dynamic.is_fixed());
         assert!(!SchedPolicy::Overdraft.is_fixed());
         assert!(SchedPolicy::Fixed.is_fixed());
+        assert!(!SchedPolicy::Spatial.is_fixed());
+        assert!(!SchedPolicy::Spatial.is_time_sliced());
+        for policy in [SchedPolicy::Dynamic, SchedPolicy::Fixed, SchedPolicy::Overdraft] {
+            assert!(policy.is_time_sliced());
+        }
     }
 
     #[test]
@@ -236,11 +261,13 @@ mod tests {
 
     #[test]
     fn policy_is_explicit_instead_of_boolean() {
-        for value in ["", "true", "false", "0", "1", "spatial", "unknown"] {
+        for value in ["", "true", "false", "0", "1", "unknown"] {
             let error = config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_SCHED_POLICY, value)]).unwrap_err();
             assert!(error.contains(ENV_SCHED_POLICY));
         }
         assert_eq!(config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_SCHED_POLICY, "dynamic")]).unwrap().sched_policy, SchedPolicy::Dynamic);
+        assert_eq!(config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_SCHED_POLICY, "spatial"),
+            (ENV_COMPUTE_LIMIT, "33"), (ENV_MEMORY_LIMIT_MB, "20480")]).unwrap().sched_policy, SchedPolicy::Spatial);
     }
 
     #[test]
