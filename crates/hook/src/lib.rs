@@ -54,8 +54,8 @@ pub fn npu_limiter() -> &'static SchedulerClient {
 macro_rules! passthrough {
     ($name:expr, ($($sig:tt)*), $($arg:expr),*) => {
         {
-            static REAL: ::once_cell::sync::Lazy<extern "C" fn($($sig)*) -> u64> = 
-                ::once_cell::sync::Lazy::new(|| unsafe {
+            static REAL: ::std::sync::LazyLock<extern "C" fn($($sig)*) -> u64> =
+                ::std::sync::LazyLock::new(|| unsafe {
                     let ptr = libc::dlsym(libc::RTLD_NEXT, concat!($name, "\0").as_ptr() as *const libc::c_char);
                     if ptr.is_null() {
                         panic!("cannot find original function: {}", $name);
