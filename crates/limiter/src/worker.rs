@@ -421,7 +421,9 @@ impl SchedulerClient {
         let mut current_used = shmem.memory_used.load(Ordering::Acquire);
 
         loop {
-            let new_used = current_used + size;
+            let Some(new_used) = current_used.checked_add(size) else {
+                return RT_ERROR_MEMORY_ALLOCATION;
+            };
 
             if new_used > limit {
                 warn!(
@@ -519,11 +521,14 @@ impl SchedulerClient {
 
         let mut device_total = 0u64;
         let mut all_device_total = 0u64;
+        // The executing process is alive even if its procfs entry is inaccessible.
+        // Read the real PID on each scan so a forked child does not exempt its parent.
+        let current_pid = std::process::id() as i32;
 
         for slot in &shmem.procs {
             let pid = slot.pid.load(Ordering::Acquire);
             if pid == 0 { continue; }
-            if !proc_alive(pid) {
+            if pid != current_pid && !proc_alive(pid) {
                 // CAS the PID to 0 — only the winner cleans up
                 if slot.pid.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                     // The process slot owns one counter per NPU device. Clear all of them
