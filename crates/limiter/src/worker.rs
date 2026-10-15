@@ -1,5 +1,5 @@
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration};
 use std::thread;
 use std::fmt;
@@ -49,7 +49,7 @@ struct SchedulerClientInner {
     my_slot_idx: usize,
     my_proc_idx: usize,
     device_id: usize,
-    lock: Mutex<InnerLock>,
+    lock: RwLock<InnerLock>,
     hbm_handle_map: Mutex<HashMap<u64, u64>>,
     /// True for the no-op stub (no shmem / no manager). All limit checks are
     /// short-circuited so the worker never blocks on the state futex.
@@ -110,7 +110,7 @@ impl SchedulerClient {
                 my_slot_idx,
                 my_proc_idx,
                 device_id,
-                lock: Mutex::new(inner_lock),
+                lock: RwLock::new(inner_lock),
                 hbm_handle_map: Mutex::new(HashMap::new()),
                 is_stub: false,
             }),
@@ -232,15 +232,38 @@ impl SchedulerClient {
         ).is_ok()
     }
 
+    /// Same stream, already active batch: share the process timing state while
+    /// reserving one ticket. A writer still owns all batch/stream transitions,
+    /// GPU events and the single process report slot. No TLS ticket cache.
+    #[inline]
+    fn try_same_stream_token(&self, user_stream: u64) -> bool {
+        if let Ok(lock) = self.inner.lock.try_read() {
+            let state = self.inner.shmem.state.load(Ordering::Acquire);
+            let batch = self.inner.shmem.batch_id.load(Ordering::Relaxed);
+            if state == STATE_RUNNING
+                && lock.batch_active
+                && lock.current_batch_id == batch
+                && lock.last_user_stream == user_stream
+            {
+                return self.try_consume_one_token();
+            }
+        }
+        false
+    }
+
     /// The Main Entry Point
     pub fn wait_for_token(&self, user_stream: u64) {
         if self.inner.is_stub {
             return;
         }
 
-        // We lock the mutex to safely access/modify internal state.
-        // NOTE: In high contention, this serializes access to this check.
-        let mut lock = self.inner.lock.lock().unwrap();
+        if self.try_same_stream_token(user_stream) {
+            return;
+        }
+
+        // The shared guard is dropped before acquiring the writer lock.
+        // Batch initialization, stream changes and measurement remain exclusive.
+        let mut lock = self.inner.lock.write().unwrap();
 
         lock.last_user_stream = user_stream;
 
@@ -266,7 +289,7 @@ impl SchedulerClient {
                         // Release lock while yielding to allow other threads to enter
                         drop(lock); // UNLOCK
                         thread::yield_now();
-                        lock = self.inner.lock.lock().unwrap(); // RELOCK
+                        lock = self.inner.lock.write().unwrap(); // RELOCK
                         continue;
                     }
 
@@ -307,8 +330,10 @@ impl SchedulerClient {
                     
                     // Wait for state change
                     drop(lock); // UNLOCK
-                    futex::wait(&self.inner.shmem.state, STATE_MEASURING);
-                    lock = self.inner.lock.lock().unwrap(); // RELOCK
+                    if self.inner.shmem.state.load(Ordering::Acquire) == STATE_MEASURING {
+                        futex::wait(&self.inner.shmem.state, STATE_MEASURING);
+                    }
+                    lock = self.inner.lock.write().unwrap(); // RELOCK
                 }
 
                 // ---------------------------------------------------------
@@ -316,8 +341,10 @@ impl SchedulerClient {
                 // ---------------------------------------------------------
                 _ => {
                     drop(lock); // UNLOCK
-                    futex::wait(&self.inner.shmem.state, STATE_IDLE);
-                    lock = self.inner.lock.lock().unwrap(); // RELOCK
+                    if self.inner.shmem.state.load(Ordering::Acquire) == STATE_IDLE {
+                        futex::wait(&self.inner.shmem.state, STATE_IDLE);
+                    }
+                    lock = self.inner.lock.write().unwrap(); // RELOCK
                 }
             }
         }
@@ -570,7 +597,7 @@ impl SchedulerClient {
                 my_slot_idx: 0,
                 device_id: 0,
                 my_proc_idx: 0,
-                lock: Mutex::new(InnerLock {
+                lock: RwLock::new(InnerLock {
                     internal_stream: 0,
                     start_event: 0,
                     end_event: 0,
