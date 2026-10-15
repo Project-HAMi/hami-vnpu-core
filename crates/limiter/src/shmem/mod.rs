@@ -22,6 +22,7 @@ pub struct GlobalManagerSlot {
 pub struct GlobalRegistry {
     pub lock_owner: AtomicU32,
     pub lock_timestamp: AtomicU64,
+    pub lock_epoch: AtomicU64,  // Incremented on each takeover for fencing
 
     pub queue_head: AtomicU32,
     pub queue_tail: AtomicU32,

@@ -153,6 +153,7 @@ pub struct ContainerManager {
     ema_alpha: f64,
     fixed_share_ratio: bool,
     next_run_not_before: Option<Instant>,
+    my_epoch: u64,  // Phase 2: Track our ownership epoch for fencing
 }
 
 impl ContainerManager {
@@ -200,6 +201,7 @@ impl ContainerManager {
             ema_alpha,
             fixed_share_ratio,
             next_run_not_before: None,
+            my_epoch: global.lock_epoch.load(Ordering::Acquire),  // Phase 2: Capture current epoch
         })
     }
 
@@ -241,13 +243,23 @@ impl ContainerManager {
         self.join_global_queue();
 
         loop {
+            // Phase 2: Epoch fencing - check if we've been replaced
+            let current_epoch = self.global.lock_epoch.load(Ordering::Acquire);
+            if current_epoch != self.my_epoch {
+                warn!(
+                    "[Manager] Epoch changed {} -> {}, another manager took over. Exiting.",
+                    self.my_epoch, current_epoch
+                );
+                break;
+            }
+
             self.wait_for_global_turn();
             self.update_heartbeat();
             self.honor_fixed_rest_wait();
-            
+
             let plan = self.calculate_fair_share();
             let (actual_duration, tokens_used) = self.run_local_round(&plan);
-            
+
             let has_workers = tokens_used > 0 && actual_duration > 0;
             if has_workers {
                 self.update_local_stats(actual_duration, tokens_used);
@@ -258,13 +270,90 @@ impl ContainerManager {
     }
 
     fn join_global_queue(&self) {
+        // Phase 2: Check queue capacity before enqueuing
+        let head = self.global.queue_head.load(Ordering::Acquire);
+        let tail = self.global.queue_tail.load(Ordering::Acquire);
+        let depth = tail.wrapping_sub(head);
+
+        if depth >= MAX_MANAGERS as u32 {
+            warn!(
+                "[Manager] Queue full: head={}, tail={}, depth={}. Attempting cleanup.",
+                head, tail, depth
+            );
+
+            // Try to clean up stale entries
+            self.cleanup_queue();
+
+            // Re-check after cleanup
+            let head = self.global.queue_head.load(Ordering::Acquire);
+            let tail = self.global.queue_tail.load(Ordering::Acquire);
+            let new_depth = tail.wrapping_sub(head);
+
+            if new_depth >= MAX_MANAGERS as u32 {
+                warn!(
+                    "[Manager] Queue still full after cleanup (depth={}). Forcing enqueue anyway.",
+                    new_depth
+                );
+                // Continue to enqueue - better than deadlock
+            }
+        }
+
         let tail = self.global.queue_tail.fetch_add(1, Ordering::SeqCst) as usize;
         let slot_idx = tail % MAX_MANAGERS;
         self.global.queue[slot_idx].store(self.my_global_idx as u32, Ordering::Release);
+
+        if depth < 10 {
+            debug!("[Manager] Enqueued at tail={}, slot={}, depth={}", tail, slot_idx, depth + 1);
+        }
     }
 
-    fn wait_for_global_turn(&self) {
+    /// Phase 2: Clean up dead managers from the queue
+    fn cleanup_queue(&self) {
+        let head = self.global.queue_head.load(Ordering::Acquire);
+        let tail = self.global.queue_tail.load(Ordering::Acquire);
+
+        let mut valid_count = 0;
+        let mut stale_count = 0;
+
+        for pos in head..tail {
+            let slot_idx = (pos % MAX_MANAGERS as u32) as usize;
+            let manager_idx = self.global.queue[slot_idx].load(Ordering::Relaxed);
+
+            if manager_idx < MAX_MANAGERS as u32 {
+                let slot = &self.global.slots[manager_idx as usize];
+                let is_active = slot.is_active.load(Ordering::Relaxed);
+                let heartbeat = slot.last_heartbeat.load(Ordering::Relaxed);
+                let now = get_time_us();
+
+                // Keep if active and heartbeat is fresh
+                if is_active == 1 && now.saturating_sub(heartbeat) < GLOBAL_WATCHDOG_TIMEOUT_US * 2 {
+                    valid_count += 1;
+                } else {
+                    stale_count += 1;
+                }
+            } else {
+                stale_count += 1;
+            }
+        }
+
+        info!(
+            "[Manager] Queue cleanup: {} valid, {} stale out of {} entries",
+            valid_count, stale_count, tail.wrapping_sub(head)
+        );
+
+        // Conservative: only reset if more than half are stale
+        if stale_count > valid_count {
+            let new_head = tail.saturating_sub(valid_count as u32);
+            self.global.queue_head.store(new_head, Ordering::Release);
+            warn!("[Manager] Queue reset: head advanced from {} to {}", head, new_head);
+        }
+    }
+
+    fn wait_for_global_turn(&mut self) {
         loop {
+            // Phase 2: Refresh local heartbeat while waiting so supervisor doesn't take over
+            self.local.manager_heartbeat.store(get_time_us(), Ordering::Release);
+
             let owner_idx = self.global.lock_owner.load(Ordering::Acquire);
             if owner_idx == self.my_global_idx as u32 { return; }
 
@@ -273,6 +362,9 @@ impl ContainerManager {
                 && self.global.slots[owner_idx as usize].is_active.load(Ordering::Relaxed) == 1;
             if !owner_active {
                 if self.global.lock_owner.compare_exchange(owner_idx, self.my_global_idx as u32, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                    // Phase 2: Increment epoch to fence the old owner
+                    let new_epoch = self.global.lock_epoch.fetch_add(1, Ordering::Release) + 1;
+                    self.my_epoch = new_epoch;
                     self.update_heartbeat();
                     return;
                 }
@@ -287,8 +379,11 @@ impl ContainerManager {
                     self.global.slots[owner_idx as usize].is_active.store(0, Ordering::Relaxed);
                 }
                 if self.global.lock_owner.compare_exchange(owner_idx, self.my_global_idx as u32, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                    // Phase 2: Increment epoch to fence the old owner
+                    let new_epoch = self.global.lock_epoch.fetch_add(1, Ordering::Release) + 1;
+                    self.my_epoch = new_epoch;
                     self.update_heartbeat();
-                    return; 
+                    return;
                 }
             }
 
@@ -423,14 +518,21 @@ impl ContainerManager {
         let start_time = Instant::now();
         let timeout_duration = Duration::from_micros(plan.time_limit_us);
         let budget_duration = Duration::from_micros(plan.expected_run_us);
+
+        // Phase 1 Fix: Continuous progress tracking with absolute bounds
         let mut saw_progress = false;
         let mut last_tokens = tokens;
+        let mut no_progress_count = 0u32;
+        const MAX_NO_PROGRESS_ITERATIONS: u32 = 200; // 200 * 5ms = 1s
+        const ABSOLUTE_TIMEOUT_SECS: u64 = 120; // 2 minutes hard cap
+        let absolute_deadline = start_time + Duration::from_secs(ABSOLUTE_TIMEOUT_SECS);
+
         let mut tokens_consumed_for_stats = 0u64;
-        
+
         loop {
             let current_tokens = self.local.tokens_remaining.load(Ordering::Relaxed);
 
-            if current_tokens == 0 { 
+            if current_tokens == 0 {
                 debug!("[Manager] --- Token all used, enter STATE_MEASURING ");
                 break;
             }
@@ -443,17 +545,33 @@ impl ContainerManager {
                     break;
                 }
             } else {
-                // Detect zero-progress batches (e.g., other container paused) and bail early
-                // instead of waiting full timeout_us.
-                if current_tokens < last_tokens || self.local.active_workers.load(Ordering::Relaxed) > 0 {
+                // Phase 1 Fix: Continuous progress detection
+                if current_tokens < last_tokens {
                     saw_progress = true;
+                    no_progress_count = 0;
+                } else if saw_progress {
+                    // We saw progress before, now check if it stopped
+                    no_progress_count += 1;
+                    if no_progress_count >= MAX_NO_PROGRESS_ITERATIONS {
+                        warn!("[Manager] No progress for 1s after initial activity, yielding turn");
+                        break;
+                    }
                 }
-                if !saw_progress && start_time.elapsed() > Duration::from_millis(5) {
+
+                // Original zero-progress detection for batches that never started
+                if !saw_progress && self.local.active_workers.load(Ordering::Relaxed) == 0 && start_time.elapsed() > Duration::from_millis(5) {
                     debug!("[Manager] --- no progress for 5ms, enter STATE_MEASURING early");
                     break;
                 }
             }
             last_tokens = current_tokens;
+
+            // Phase 1 Fix: Absolute timeout regardless of progress
+            if Instant::now() >= absolute_deadline {
+                warn!("[Manager] Absolute round timeout ({}s) reached, yielding turn", ABSOLUTE_TIMEOUT_SECS);
+                tokens_consumed_for_stats = tokens.saturating_sub(current_tokens);
+                break;
+            }
 
             if start_time.elapsed() > timeout_duration {
                 let remaining = self.local.tokens_remaining.load(Ordering::Relaxed);
@@ -573,13 +691,40 @@ impl ContainerManager {
     fn update_local_stats(&mut self, duration_us: u64, tokens: u64) {
         if tokens == 0 { return; }
         let new_avg = duration_us / tokens;
+
+        // Phase 1 Fix: Absolute bounds on EMA to prevent hour-long timeouts
+        const MIN_AVG_US: u64 = 50;         // 50 microseconds minimum
+        const MAX_AVG_US: u64 = 5_000_000;  // 5 seconds maximum
+
         // Clamp swings but allow faster adaptation.
         let lower = (self.current_avg_us / 4).max(1);
         let upper = self.current_avg_us.saturating_mul(4).max(1);
         let clamped_avg = new_avg.clamp(lower, upper);
+
         let alpha = self.ema_alpha;
-        self.current_avg_us = ((self.current_avg_us as f64 * (1.0 - alpha)) + (clamped_avg as f64 * alpha)) as u64;
-        
+        let mut updated_avg = ((self.current_avg_us as f64 * (1.0 - alpha)) + (clamped_avg as f64 * alpha)) as u64;
+
+        // Phase 1 Fix: Apply absolute bounds after EMA calculation
+        updated_avg = updated_avg.clamp(MIN_AVG_US, MAX_AVG_US);
+
+        if updated_avg != self.current_avg_us {
+            let old_avg = self.current_avg_us;
+            self.current_avg_us = updated_avg;
+
+            // Log significant changes for debugging
+            let delta = if updated_avg > old_avg {
+                updated_avg - old_avg
+            } else {
+                old_avg - updated_avg
+            };
+            if delta > old_avg / 2 {
+                debug!(
+                    "[Manager] EMA updated: {} us -> {} us (new measurement: {} us, tokens: {})",
+                    old_avg, updated_avg, new_avg, tokens
+                );
+            }
+        }
+
         self.global.slots[self.my_global_idx].avg_kernel_time.store(self.current_avg_us, Ordering::Relaxed);
         self.global.slots[self.my_global_idx].last_heartbeat.store(get_time_us(), Ordering::Relaxed);
     }

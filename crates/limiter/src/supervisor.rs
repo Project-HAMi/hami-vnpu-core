@@ -159,7 +159,11 @@ fn reclaim_stale_global_slot(global: &GlobalRegistry, local: &LocalContainerShme
     let slot = &global.slots[idx as usize];
     if slot.pid.load(Ordering::Acquire) == old_pid {
         slot.is_active.store(0, Ordering::Release);
-        warn!("[Supervisor] cleared stale global slot {} of dead manager {}", idx, old_pid);
+
+        // Phase 2: Increment epoch to fence the old manager
+        global.lock_epoch.fetch_add(1, Ordering::Release);
+
+        warn!("[Supervisor] cleared stale global slot {} of dead manager {} and incremented epoch", idx, old_pid);
     }
 }
 
