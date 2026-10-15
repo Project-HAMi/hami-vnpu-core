@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #[path = "../../../crates/limiter/src/config.rs"]
 pub mod config;
+#[path = "../../../crates/limiter/src/overdraft.rs"]
+pub mod overdraft;
 #[path = "../../../crates/limiter/src/shmem/mod.rs"]
 pub mod shmem;
 // None of these arithmetic tests calls the DCMI/reaper paths.

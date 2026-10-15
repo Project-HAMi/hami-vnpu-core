@@ -168,6 +168,14 @@ impl ContainerManager {
         // default value
         let compute_limit = f64::from(config.compute_limit);
         let memory_limit = config.memory_limit_mb;
+        // A takeover must terminate the predecessor's allowance before publication.
+        local.overdraft_pool.close();
+        local.overdraft_limit.store(
+            if sched_policy == SchedPolicy::Overdraft { config.overdraft.limit } else { 0 },
+            Ordering::Relaxed,
+        );
+        local.overdraft_timeout_us.store(config.overdraft.timeout_us, Ordering::Relaxed);
+        local.overdraft_poll_interval_us.store(config.overdraft.poll_interval_us, Ordering::Relaxed);
 
         info!(
             "[Manager] Registered as Global Manager #{} (PID: {}). Compute limit: {}%, Memory limit: {} MB, Policy: {}",
@@ -388,7 +396,9 @@ impl ContainerManager {
         }
     }
 
-    fn start_local_batch(&self, batch_id: u64, tokens: u64) {
+    fn start_local_batch(&self, batch_id: u64, tokens: u64) -> Option<u32> {
+        // One CAS word closes old admissions and binds the new allowance's tag.
+        let overdraft_round = self.local.overdraft_pool.begin_round();
         self.local.batch_id.store(batch_id, Ordering::Relaxed);
         self.local.tokens_remaining.store(tokens, Ordering::Relaxed);
         self.local.active_workers.store(0, Ordering::Relaxed);
@@ -396,6 +406,7 @@ impl ContainerManager {
 
         self.local.state.store(STATE_RUNNING, Ordering::Release);
         futex::wake_all(&self.local.state);
+        overdraft_round
     }
 
     fn enter_measuring_state(&self) {
@@ -412,7 +423,7 @@ impl ContainerManager {
         debug!("\n=======================================================");
         debug!("[Manager] >>> Start Batch ID: {}. initial Tokens: {}, base_tokens: {}, time_limit: {} us, budget: {} us", batch_id, tokens, base_tokens, plan.time_limit_us, plan.expected_run_us);
 
-        self.start_local_batch(batch_id, tokens);
+        let overdraft_round = self.start_local_batch(batch_id, tokens);
 
         let start_time = Instant::now();
         let timeout_duration = Duration::from_micros(plan.time_limit_us);
@@ -496,7 +507,14 @@ impl ContainerManager {
 
         let (duration, tokens_used) = self.aggregate_local_times(batch_id, tokens_consumed_for_stats);
         self.local.state.store(STATE_IDLE, Ordering::Release);
-        
+        if self.sched_policy == SchedPolicy::Overdraft {
+            if let Some(round) = overdraft_round {
+                self.local.overdraft_pool.open_idle(round);
+            }
+            // Wake workers that slept in MEASURING so they can start timed IDLE waits.
+            futex::wake_all(&self.local.state);
+        }
+
         if tokens_used > 0 {
             debug!("[Manager] <<< Batch {} ends. consume Token (for stats): {}, duration: {} us", batch_id, tokens_used, duration);
         }
