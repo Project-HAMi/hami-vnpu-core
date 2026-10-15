@@ -365,7 +365,9 @@ impl ContainerManager {
 
         // Time budget should reflect the scaled tokens actually handed out.
         let expected_run_us = tokens.saturating_mul(my_time);
-        let timeout_us = expected_run_us + (expected_run_us / 2) + 50_000;
+        let timeout_us = expected_run_us
+            .saturating_add(expected_run_us / 2)
+            .saturating_add(50_000);
 
         // Compute an off-duty window so the runtime/wait ratio depends on priority only.
         let rest_wait_us = if self.fixed_share_ratio {
@@ -546,7 +548,7 @@ impl ContainerManager {
                 let dur = slot.duration_us.load(Ordering::Relaxed);
                 
                 if dur > 0 {
-                    let end = start + dur;
+                    let end = start.saturating_add(dur);
 
                     if start < global_start { global_start = start; }
                     if end > global_end { global_end = end; }
