@@ -154,7 +154,7 @@ fn lost_reap_cas_preserves_replacement_owner_and_slot_memory() {
 }
 
 #[test]
-fn selected_device_scan_keeps_other_device_bytes_and_original_reap_rule() {
+fn selected_device_scan_reconciles_all_devices_and_reaps_all_counters() {
     let c = client(1000, 40);
     let shmem = c.inner.shmem;
     shmem.procs[0].hbm_used[1].store(70, Ordering::Release);
@@ -162,13 +162,15 @@ fn selected_device_scan_keeps_other_device_bytes_and_original_reap_rule() {
     shmem.procs[1].hbm_used[1].store(30, Ordering::Release);
     proc_mock::set(&[(other(1), Answer::Live)]);
     assert_eq!(100, c.recalculate_usage_for_device(1));
+    assert_eq!(160, shmem.memory_used.load(Ordering::Acquire));
     assert_eq!(40, shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
     assert_eq!(20, shmem.procs[1].hbm_used[0].load(Ordering::Acquire));
     proc_mock::set(&[(other(1), Answer::Zombie)]);
     assert_eq!(70, c.recalculate_usage_for_device(1));
     assert_eq!(0, shmem.procs[1].hbm_used[1].load(Ordering::Acquire));
-    // Existing main clears only the requested device's bytes on a successful reap.
-    assert_eq!(20, shmem.procs[1].hbm_used[0].load(Ordering::Acquire));
+    // The merged multi-device fix must clear every device counter on a successful reap.
+    assert_eq!(0, shmem.procs[1].hbm_used[0].load(Ordering::Acquire));
+    assert_eq!(110, shmem.memory_used.load(Ordering::Acquire));
     assert_eq!(0, shmem.procs[1].pid.load(Ordering::Acquire));
     assert_compute_unchanged(shmem);
 }
@@ -256,4 +258,29 @@ fn overflowing_live_slot_sum_stays_exhausted() {
     assert_eq!(u64::MAX, c.recalculate_usage());
     assert_eq!(RT_ERROR_MEMORY_ALLOCATION, c.check_memory_quota(1));
     assert_eq!(u64::MAX, c.inner.shmem.memory_used.load(Ordering::Acquire));
+}
+
+#[test]
+fn quota_reservation_counts_allocations_on_every_device() {
+    let c = client(100, 40);
+    c.inner.shmem.procs[0].hbm_used[1].store(50, Ordering::Release);
+    proc_mock::set(&[(me(), Answer::Unreadable)]);
+    assert_eq!(RT_ERROR_MEMORY_ALLOCATION, c.check_memory_quota(11));
+    assert_eq!(90, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(RT_ERROR_NONE, c.check_memory_quota(10));
+    assert_eq!(100, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    c.post_alloc_hbm(0, 10, RT_ERROR_MEMORY_ALLOCATION);
+    assert_eq!(90, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert!(proc_mock::calls().is_empty());
+}
+
+#[test]
+fn invalid_device_scan_keeps_slots_and_container_usage_unchanged() {
+    let c = client(100, 40);
+    proc_mock::set(&[(me(), Answer::Unreadable)]);
+    assert_eq!(0, c.recalculate_usage_for_device(shmem::NPU_DEVICE_MAX));
+    assert_eq!(40, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(40, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
+    assert_eq!(me(), c.inner.shmem.procs[0].pid.load(Ordering::Acquire));
+    assert!(proc_mock::calls().is_empty());
 }
