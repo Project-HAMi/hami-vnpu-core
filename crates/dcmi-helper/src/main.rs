@@ -1,0 +1,274 @@
+//! Executes DCMI in a fresh process, never in an inference process's fork child.
+//! This binary deliberately does not depend on the limiter or CANN runtime.
+
+#[path = "../../limiter/src/dcmi_protocol.rs"]
+mod protocol;
+
+use std::ffi::{CStr, CString};
+use std::io::{self, Write};
+use std::os::fd::FromRawFd;
+use std::os::unix::process::CommandExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+static STOP: AtomicBool = AtomicBool::new(false);
+extern "C" fn stop(_: i32) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessMemory {
+    pid: i32,
+    bytes: u64,
+}
+
+// Only async-signal-safe syscalls: the helper has its own process group, so a
+// parent-death signal terminates its driver-created descendants as well.
+extern "C" fn parent_gone(_: i32) {
+    unsafe {
+        libc::kill(-libc::getpgrp(), libc::SIGKILL);
+    }
+}
+
+fn prepare(parent: i32, query: bool) -> io::Result<()> {
+    unsafe {
+        if libc::getpgrp() != libc::getpid() {
+            return Err(io::Error::other(
+                "DCMI helper requires its own process group",
+            ));
+        }
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = if query {
+            parent_gone as *const () as usize
+        } else {
+            stop as *const () as usize
+        };
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0
+            || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut child_action: libc::sigaction = std::mem::zeroed();
+        child_action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut child_action.sa_mask);
+        if libc::sigaction(libc::SIGCHLD, &child_action, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // The spawning supervisor blocks signals; exec preserves that mask.
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        if libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::getppid() != parent {
+            if query {
+                parent_gone(0);
+            } else {
+                STOP.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe fn symbol<T: Copy>(handle: *mut libc::c_void, name: &CStr) -> io::Result<T> {
+    let address = unsafe { libc::dlsym(handle, name.as_ptr()) };
+    if address.is_null() {
+        return Err(io::Error::other(format!("missing DCMI symbol {name:?}")));
+    }
+    assert_eq!(std::mem::size_of::<T>(), std::mem::size_of_val(&address));
+    Ok(unsafe { std::mem::transmute_copy(&address) })
+}
+
+fn snapshot() -> io::Result<Vec<protocol::Record>> {
+    let driver =
+        std::env::var("ASCEND_DRIVER_HOME").unwrap_or_else(|_| "/usr/local/Ascend/driver".into());
+    let path = CString::new(format!("{driver}/lib64/driver/libdcmi.so"))?;
+    unsafe {
+        let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if handle.is_null() {
+            return Err(io::Error::other("cannot load libdcmi.so"));
+        }
+        // Keep the handle until _exit: do not run vendor library destructors.
+        let init: unsafe extern "C" fn() -> i32 = symbol(handle, c"dcmi_init")?;
+        let cards: unsafe extern "C" fn(*mut i32, *mut i32, i32) -> i32 =
+            symbol(handle, c"dcmi_get_card_list")?;
+        let memory: unsafe extern "C" fn(i32, i32, *mut ProcessMemory, *mut i32) -> i32 =
+            symbol(handle, c"dcmi_get_device_resource_info")?;
+        if init() != 0 {
+            return Err(io::Error::other("dcmi_init failed"));
+        }
+        let mut count = 0;
+        let mut ids = [0; protocol::MAX_DEVICES];
+        if cards(&mut count, ids.as_mut_ptr(), ids.len() as i32) != 0
+            || count < 0
+            || count as usize > ids.len()
+        {
+            return Err(io::Error::other("invalid DCMI card list"));
+        }
+        let mut records = Vec::new();
+        for (device, &card) in ids[..count as usize].iter().enumerate() {
+            let mut processes = [ProcessMemory { pid: 0, bytes: 0 }; protocol::MAX_PROCESSES];
+            let mut count = processes.len() as i32;
+            // Preserve the existing one-device-per-card query and index mapping.
+            if memory(card, 0, processes.as_mut_ptr(), &mut count) != 0 {
+                continue;
+            }
+            if count < 0 || count as usize > processes.len() {
+                return Err(io::Error::other("invalid DCMI process count"));
+            }
+            for process in &processes[..count as usize] {
+                if process.pid > 0 {
+                    records.push(protocol::Record {
+                        device,
+                        pid: process.pid,
+                        bytes: process.bytes,
+                    });
+                }
+            }
+        }
+        Ok(records)
+    }
+}
+
+fn run() -> io::Result<()> {
+    let parent = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|&pid| pid > 0)
+        .ok_or_else(|| io::Error::other("usage: vnpu-dcmi PARENT_PID"))?;
+    if std::env::var_os(protocol::HELPER_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return Err(io::Error::other("DCMI helper must be launched by libvnpu"));
+    }
+    let query = std::env::args().nth(2).as_deref() == Some("--query");
+    prepare(parent, query)?;
+    if !query {
+        return supervise();
+    }
+    // Driver printf output must not be confused with the snapshot protocol.
+    let output = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if output < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut output = unsafe { std::fs::File::from_raw_fd(output) };
+    if unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let records = snapshot()?;
+    let mut data = format!("{}\n", protocol::HEADER);
+    for record in records {
+        data.push_str(&format!(
+            "{} {} {}\n",
+            record.device, record.pid, record.bytes
+        ));
+    }
+    protocol::decode(data.as_bytes()).map_err(io::Error::other)?;
+    output.write_all(data.as_bytes())
+}
+
+/// Remain outside vendor code so timeout/parent death can always be handled.
+/// Reap orphaned driver grandchildren here, rather than relying on container PID 1.
+fn supervise() -> io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if STOP.load(Ordering::Relaxed) {
+        return Err(io::Error::other("query parent exited"));
+    }
+    io::stdout().write_all(protocol::READY.as_bytes())?;
+    io::stdout().flush()?;
+    let query = std::process::Command::new(std::env::current_exe()?)
+        .arg(std::process::id().to_string())
+        .arg("--query")
+        .process_group(0)
+        .spawn()?;
+    let query_pid = query.id() as i32;
+    let start = Instant::now();
+    let mut cleanup = false;
+    let mut success = false;
+    loop {
+        if !cleanup {
+            let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    query.id(),
+                    &mut status,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            let exited = rc == 0 && unsafe { status.si_pid() } != 0;
+            let cancelled =
+                STOP.load(Ordering::Relaxed) || start.elapsed() >= Duration::from_millis(1500);
+            if exited || cancelled || rc < 0 {
+                success = exited
+                    && !cancelled
+                    && unsafe { status.si_status() } == 0
+                    && status.si_code == libc::CLD_EXITED;
+                // The leader is not reaped yet, so this process-group ID cannot
+                // be recycled before the signal. Cleanup also runs after success
+                // in case a driver command left descendants behind.
+                unsafe {
+                    libc::kill(-query_pid, libc::SIGKILL);
+                }
+                cleanup = true;
+            }
+        }
+        if cleanup {
+            // A descendant can create a new session. Once its parent is killed,
+            // subreaper adoption makes it our child and it is terminated here too.
+            let path = format!("/proc/self/task/{}/children", std::process::id());
+            for pid in std::fs::read_to_string(path)?.split_whitespace() {
+                let pid: i32 = pid.parse().map_err(io::Error::other)?;
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            loop {
+                let mut status = 0;
+                let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                if pid > 0 {
+                    continue;
+                }
+                if pid == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    return if success {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other("DCMI worker failed or timed out"))
+                    };
+                }
+                return Err(error);
+            }
+        }
+        // If a driver task remains in uninterruptible I/O, keep its parent alive
+        // to reap it later. The interceptor has already bounded its own wait and
+        // will not start another helper until this one exits.
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn main() {
+    let code = match run() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("vnpu-dcmi: {error}");
+            1
+        }
+    };
+    // Do not enter CANN/driver atexit handlers, including when initialization failed.
+    unsafe {
+        libc::_exit(code);
+    }
+}
