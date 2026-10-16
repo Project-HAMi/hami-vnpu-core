@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 
-pub mod setup;
 pub mod futex;
+pub mod setup;
 
 // =========================================================================================
 // GLOBAL SHARED MEMORY LAYOUT
@@ -12,6 +12,9 @@ pub const MAX_MANAGERS: usize = 64;
 #[repr(C)]
 pub struct GlobalManagerSlot {
     pub pid: AtomicI32,
+    // Uses the former alignment padding; published with is_active under the
+    // registry transaction lock. Distinguishes a reused global slot.
+    pub generation: AtomicU32,
     pub avg_kernel_time: AtomicU64,
     pub last_heartbeat: AtomicU64,
     pub is_active: AtomicU32,
@@ -92,8 +95,17 @@ pub struct LocalContainerShmem {
 
     pub procs: [ProcessSlot; MAX_PROCESSES],
 
-    pub manager_pid: AtomicI32,        // elected manager's container PID; 0 = none
-    pub manager_heartbeat: AtomicU64,  // manager heartbeat (us); stale => eligible for takeover
+    pub manager_pid: AtomicI32, // elected manager's container PID; 0 = none
+    pub manager_generation: AtomicU32, // former padding; fences a replaced manager
+    pub manager_heartbeat: AtomicU64, // manager heartbeat (us); stale => eligible for takeover
     pub manager_global_idx: AtomicI32, // global slot the manager holds (for takeover reclaim)
-    pub initialized: AtomicU32,        // 1 once manager published limit/priority; workers wait on it
+    pub initialized: AtomicU32, // 1 once manager published limit/priority; workers wait on it
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<GlobalManagerSlot>() == 40);
+    assert!(std::mem::size_of::<GlobalRegistry>() == 2848);
+    assert!(std::mem::size_of::<LocalContainerShmem>() == 6224);
+    assert!(std::mem::offset_of!(LocalContainerShmem, procs) == 1080);
+    assert!(std::mem::offset_of!(LocalContainerShmem, manager_generation) == 6204);
+};

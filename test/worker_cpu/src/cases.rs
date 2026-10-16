@@ -289,3 +289,24 @@ fn unchanged_idle_state_really_blocks_in_linux_futex_until_woken() {
     assert_eq!(observed::WAIT_CALLS.load(Ordering::Acquire), 1);
     assert_eq!(calls(), vec![Call::Record(11,10)]);
 }
+
+
+fn untimed_completion(stream: u64, capture: u32) {
+    crate::externed_api::CAPTURE_STATUS.store(capture, Ordering::Release);
+    let c = client(1, true);
+    let mut lock = c.inner.lock.write().unwrap();
+    lock.last_user_stream = stream;
+    lock.start_time_us = get_time_us().saturating_sub(400_000);
+    c.measure_and_report_batch(&mut lock);
+    assert_eq!(c.inner.shmem.reports[0].duration_us.load(Ordering::Acquire), 0);
+    assert_eq!(c.inner.shmem.reports[0].batch_id.load(Ordering::Acquire), 42);
+    assert_eq!(c.inner.shmem.reported_count.load(Ordering::Acquire), 1);
+    assert!(calls().contains(&Call::DeviceSync));
+    assert!(!calls().iter().any(|c| matches!(c, Call::Elapsed(_, _))));
+}
+
+#[test]
+fn no_stream_drains_without_reporting_request_idle_time_as_execution() { untimed_completion(0, 0); }
+
+#[test]
+fn capture_drains_without_reporting_request_idle_time_as_execution() { untimed_completion(6, 1); }
