@@ -153,7 +153,7 @@ impl ContainerManager {
         // Write our priority to the global slot so other pods can calculate compute share
         global.slots[idx].priority.store(comp_priority as u64, Ordering::Release);
 
-        let memory_limit_bytes = memory_limit * MB_TO_BYTES;
+        let memory_limit_bytes = memory_limit.saturating_mul(MB_TO_BYTES);
 
         local.memory_limit.store(memory_limit_bytes, Ordering::Relaxed);
         if local.initialized.load(Ordering::Acquire) == 0 {
@@ -339,7 +339,9 @@ impl ContainerManager {
 
         // Time budget should reflect the scaled tokens actually handed out.
         let expected_run_us = tokens.saturating_mul(my_time);
-        let timeout_us = expected_run_us + (expected_run_us / 2) + 50_000;
+        let timeout_us = expected_run_us
+            .saturating_add(expected_run_us / 2)
+            .saturating_add(50_000);
 
         // Compute an off-duty window so the runtime/wait ratio depends on priority only.
         let rest_wait_us = if self.fixed_share_ratio {
@@ -520,7 +522,7 @@ impl ContainerManager {
                 let dur = slot.duration_us.load(Ordering::Relaxed);
                 
                 if dur > 0 {
-                    let end = start + dur;
+                    let end = start.saturating_add(dur);
 
                     if start < global_start { global_start = start; }
                     if end > global_end { global_end = end; }
