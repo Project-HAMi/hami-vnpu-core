@@ -3,29 +3,44 @@
 use std::ffi::CStr;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::dcmi_protocol::{self, HELPER_ENV, MAX_OUTPUT, Record};
 
+static LOAD_DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Called by the library constructor, before the application can change cwd.
+pub fn capture_load_directory() {
+    let _ = LOAD_DIRECTORY.set(std::env::current_dir().ok());
+}
+
+fn absolute_helper_path(path: PathBuf) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(LOAD_DIRECTORY.get()?.as_ref()?.join(path))
+    }
+}
+
 pub fn helper_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("NPU_DCMI_HELPER_PATH") {
-        return Some(path.into());
+        return absolute_helper_path(path.into());
     }
     unsafe {
         let mut info: libc::Dl_info = std::mem::zeroed();
         if libc::dladdr(helper_path as *const () as _, &mut info) == 0 || info.dli_fname.is_null() {
             return None;
         }
-        let library = PathBuf::from(
-            CStr::from_ptr(info.dli_fname)
-                .to_string_lossy()
-                .into_owned(),
-        );
-        library.parent().map(|dir| dir.join("vnpu-dcmi"))
+        let library = Path::new(std::ffi::OsStr::from_bytes(
+            CStr::from_ptr(info.dli_fname).to_bytes(),
+        ));
+        absolute_helper_path(library.parent()?.join("vnpu-dcmi"))
     }
 }
 

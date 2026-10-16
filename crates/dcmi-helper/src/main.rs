@@ -222,9 +222,11 @@ fn supervise() -> io::Result<()> {
         if cleanup {
             // A descendant can create a new session. Once its parent is killed,
             // subreaper adoption makes it our child and it is terminated here too.
-            let path = format!("/proc/self/task/{}/children", std::process::id());
-            for pid in std::fs::read_to_string(path)?.split_whitespace() {
-                let pid: i32 = pid.parse().map_err(io::Error::other)?;
+            // Discovery is best-effort, but waitpid must always run. In
+            // particular, CONFIG_PROC_CHILDREN is optional on Linux.
+            for pid in
+                child_pids(std::path::Path::new("/proc"), std::process::id()).unwrap_or_default()
+            {
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                 }
@@ -256,6 +258,71 @@ fn supervise() -> io::Result<()> {
         // to reap it later. The interceptor has already bounded its own wait and
         // will not start another helper until this one exits.
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn child_pids(proc_root: &std::path::Path, parent: u32) -> io::Result<Vec<i32>> {
+    if let Ok(children) =
+        std::fs::read_to_string(proc_root.join(format!("self/task/{parent}/children")))
+    {
+        return children
+            .split_whitespace()
+            .map(|pid| {
+                pid.parse::<i32>()
+                    .ok()
+                    .filter(|pid| *pid > 0)
+                    .ok_or_else(|| io::Error::other("invalid child PID"))
+            })
+            .collect();
+    }
+    let mut children = Vec::new();
+    for entry in std::fs::read_dir(proc_root)?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        // Tasks can exit between listing /proc and reading their stat file.
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // comm can contain spaces and parentheses; PPid follows the state field
+        // after the final ')', not a fixed whitespace position in the whole line.
+        let ppid = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(1)?.parse::<u32>().ok());
+        if ppid == Some(parent) {
+            children.push(pid);
+        }
+    }
+    Ok(children)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn proc_scan_finds_only_direct_children_even_with_parentheses_in_comm() {
+        let root = std::env::temp_dir().join(format!("vnpu-proc-test-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        for (pid, stat) in [
+            (101, "101 (driver (query) worker)) S 42 0 0"),
+            (102, "102 (unrelated) S 99 0 0"),
+            (103, "103 (exited task)"),
+        ] {
+            std::fs::create_dir(root.join(pid.to_string())).unwrap();
+            std::fs::write(root.join(format!("{pid}/stat")), stat).unwrap();
+        }
+        // A vanished stat file must not stop the rest of the scan.
+        std::fs::create_dir(root.join("104")).unwrap();
+        assert_eq!(super::child_pids(&root, 42).unwrap(), vec![101]);
+        let task = root.join("self/task/42");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(task.join("children"), "101 104 ").unwrap();
+        assert_eq!(super::child_pids(&root, 42).unwrap(), vec![101, 104]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

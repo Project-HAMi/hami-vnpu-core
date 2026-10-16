@@ -71,6 +71,14 @@ fn wait_child(child: &mut Child) {
 fn registry_child() {
     let path = PathBuf::from(std::env::var_os("VNPU_TEST_REGISTRY_DIR").unwrap());
     let mode = std::env::var("VNPU_TEST_REGISTRY_MODE").unwrap();
+    if mode == "invalid-paths" {
+        unsafe {
+            std::env::set_var("NPU_GLOBAL_SHM_PATH", path.join("registry"));
+            std::env::set_var("NPU_LOCAL_SHM_PATH", path.join("registry"));
+        }
+        crate::supervisor::run();
+        panic!("supervisor accepted overlapping mappings");
+    }
     let registry_path = path.join("registry");
     let lock = RegistryLock::open(registry_path.to_str().unwrap()).unwrap();
     std::fs::write(path.join(format!("{mode}-started")), b"started").unwrap();
@@ -91,6 +99,64 @@ fn registry_child() {
         }
     }
     std::fs::write(path.join("acquired"), b"acquired").unwrap();
+}
+
+#[test]
+fn shared_memory_paths_reject_aliases_before_creation() {
+    use crate::config::validate_shmem_paths;
+    let fixture = Fixture::new();
+    let root = &fixture.0;
+    std::os::unix::fs::symlink(root, root.join("alias")).unwrap();
+    std::os::unix::fs::symlink("new/registry", root.join("dangling")).unwrap();
+    std::fs::hard_link(root.join("registry"), root.join("hardlink")).unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    for (global, local) in [
+        ("new/registry", "new/registry"),
+        ("new/registry", "new/./registry"),
+        ("new/registry", "alias/new/registry"),
+        ("new/registry", "dangling"),
+        ("registry", "hardlink"),
+        ("registry", "alias/registry"),
+        ("registry", "sub/../registry"),
+    ] {
+        let error = validate_shmem_paths(
+            root.join(global).to_str().unwrap(),
+            root.join(local).to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    validate_shmem_paths(
+        root.join("new/global").to_str().unwrap(),
+        root.join("new/local").to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(!root.join("new").exists(), "validation created files");
+}
+
+#[test]
+fn supervisor_rejects_identical_paths_without_truncating_the_registry() {
+    let _fixtures = crate::SUBPROCESS_FIXTURES.lock().unwrap();
+    let fixture = Fixture::new();
+    std::fs::write(fixture.0.join("registry"), b"unchanged registry").unwrap();
+    let mut child = fixture.child("invalid-paths");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("supervisor did not reject invalid paths");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(78));
+    assert_eq!(
+        std::fs::read(fixture.0.join("registry")).unwrap(),
+        b"unchanged registry"
+    );
 }
 
 #[test]

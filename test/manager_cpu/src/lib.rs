@@ -9,6 +9,8 @@ pub mod dcmi_protocol;
 pub mod registry_lock;
 #[path = "../../../crates/limiter/src/shmem/mod.rs"]
 pub mod shmem;
+#[path = "../../../crates/limiter/src/supervisor.rs"]
+pub mod supervisor;
 // The manager tests do not run the periodic process reaper.
 pub mod worker {
     pub fn proc_alive(_: i32) -> bool {

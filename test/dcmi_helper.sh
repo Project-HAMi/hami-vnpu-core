@@ -10,6 +10,9 @@ mkdir -p "$fixture/lib64/driver"
 cat > "$fixture/runtime.c" <<'C'
 #include <stdint.h>
 #include <stdlib.h>
+int rtGetDevice(int *device) { *device = 0; return 0; }
+int rtStreamCreate(uint64_t *stream, int priority) { (void)priority; *stream = 1; return 0; }
+size_t rtEventCreate(uint64_t *event) { *event = 1; return 0; }
 __attribute__((constructor)) static void init(void) {
     if (getenv("VNPU_EXPECT_NO_RUNTIME")) _Exit(99);
 }
@@ -147,3 +150,136 @@ status=$?
 set -e
 test "$status" = 78
 echo 'PASS: isolated query, no eager CANN, protocol, helper bypass, descendant reaping, legacy registry rejection'
+
+# Simulate kernels without CONFIG_PROC_CHILDREN, and an unreadable fallback.
+# Interpose only procfs discovery, leaving waitpid and the query processes real.
+cat > "$fixture/proc-fault.c" <<'C'
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static int deny(const char *path) {
+    const char *mode = getenv("VNPU_PROC_FAULT");
+    if (!mode) return 0;
+    int children = !strncmp(path, "/proc/self/task/", 16) && strstr(path, "/children");
+    int directory = !strcmp(mode, "all") && !strcmp(path, "/proc");
+    if (!children && !directory) return 0;
+    const char *marker = getenv("VNPU_PROC_FAULT_HIT");
+    if (marker) {
+        int fd = syscall(SYS_openat, AT_FDCWD, marker, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (fd >= 0) { write(fd, directory ? "d" : "c", 1); close(fd); }
+    }
+    errno = children ? ENOENT : EACCES;
+    return 1;
+}
+#define WRAP_OPEN(name) \
+int name(const char *path, int flags, ...) { \
+    mode_t mode = 0; \
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) { \
+        va_list args; va_start(args, flags); mode = va_arg(args, mode_t); va_end(args); \
+    } \
+    if (deny(path)) return -1; \
+    int (*real)(const char *, int, ...) = dlsym(RTLD_NEXT, #name); \
+    return real(path, flags, mode); \
+}
+WRAP_OPEN(open)
+WRAP_OPEN(open64)
+DIR *opendir(const char *path) {
+    if (deny(path)) return NULL;
+    DIR *(*real)(const char *) = dlsym(RTLD_NEXT, "opendir");
+    return real(path);
+}
+C
+cc -shared -fPIC "$fixture/proc-fault.c" -ldl -o "$fixture/proc-fault.so"
+for fault in children all; do
+    rm -f "$fixture/fault-hit"
+    env LD_PRELOAD="$fixture/proc-fault.so:$artifacts/libvnpu.so" \
+        NPU_DCMI_HELPER_PROCESS=1 ASCEND_DRIVER_HOME="$fixture" \
+        VNPU_PROC_FAULT="$fault" VNPU_PROC_FAULT_HIT="$fixture/fault-hit" \
+        VNPU_QUERY_PIDS="$fixture/pids" \
+        timeout 5 "$fixture/launch" "$artifacts/vnpu-dcmi" > "$fixture/snapshot"
+    cmp "$fixture/expected" "$fixture/snapshot"
+    grep -q c "$fixture/fault-hit"
+    if test "$fault" = all; then grep -q d "$fixture/fault-hit"; fi
+    read -r query descendant < "$fixture/pids"
+    test ! -e "/proc/$query"
+    test ! -e "/proc/$descendant"
+done
+if env LD_PRELOAD="$fixture/proc-fault.so:$artifacts/libvnpu.so" \
+    NPU_DCMI_HELPER_PROCESS=1 ASCEND_DRIVER_HOME="$fixture" \
+    VNPU_PROC_FAULT=children VNPU_HANG_QUERY=1 VNPU_DETACH_CHILD=1 \
+    VNPU_QUERY_PIDS="$fixture/pids" \
+    timeout 5 "$fixture/launch" "$artifacts/vnpu-dcmi" > /dev/null; then
+    echo 'helper accepted a hung query without proc children' >&2
+    exit 1
+fi
+read -r query descendant < "$fixture/pids"
+test ! -e "/proc/$query"
+test ! -e "/proc/$descendant"
+
+# Worker validation must run before opening even an existing local mapping.
+for alias in same symlink hardlink missing; do
+    global="$fixture/path-global-$alias"
+    local="$global"
+    if test "$alias" != missing; then
+        printf 'unchanged registry' > "$global"
+        cp "$global" "$fixture/unchanged"
+    fi
+    if test "$alias" = symlink; then local="$fixture/path-symlink"; ln -s "$global" "$local"; fi
+    if test "$alias" = hardlink; then local="$fixture/path-hardlink"; ln "$global" "$local"; fi
+    set +e
+    env -u NPU_DCMI_HELPER_PROCESS LD_PRELOAD="$artifacts/libvnpu.so" \
+        NPU_GLOBAL_SHM_PATH="$global" NPU_LOCAL_SHM_PATH="$local" \
+        timeout 2 "$fixture/probe"
+    status=$?
+    set -e
+    test "$status" = 78
+    if test "$alias" = missing; then test ! -e "$global"; else cmp "$global" "$fixture/unchanged"; fi
+done
+
+# Use the actual interceptor and helper after chdir both before manager startup
+# and between successful periodic queries. No test-only helper-path export.
+cat > "$fixture/chdir-probe.c" <<'C'
+#include <dlfcn.h>
+#include <stdint.h>
+#include <unistd.h>
+static int wait_query(const char *path) {
+    for (int i = 0; i < 100; ++i) {
+        if (!access(path, F_OK)) return 0;
+        usleep(100000);
+    }
+    return 1;
+}
+int main(int argc, char **argv) {
+    if (argc != 2 || chdir("/")) return 2;
+    uint64_t (*info)(uint64_t, size_t *, size_t *) = dlsym(RTLD_DEFAULT, "rtMemGetInfoEx");
+    if (!info) return 3;
+    size_t free, total;
+    if (info(0, &free, &total) || wait_query(argv[1])) return 4;
+    if (unlink(argv[1]) || chdir("/tmp") || wait_query(argv[1])) return 5;
+    return 0;
+}
+C
+cc "$fixture/chdir-probe.c" -ldl -o "$fixture/chdir-probe"
+mkdir "$fixture/relative"
+cp "$artifacts/libvnpu.so" "$artifacts/vnpu-dcmi" "$fixture/relative/"
+for mode in adjacent override; do
+    extra=()
+    if test "$mode" = override; then extra=(NPU_DCMI_HELPER_PATH=./relative/vnpu-dcmi); fi
+    (
+        cd "$fixture"
+        env -u NPU_DCMI_HELPER_PROCESS -u NPU_DCMI_HELPER_PATH \
+            LD_LIBRARY_PATH="$fixture" LD_PRELOAD=./relative/libvnpu.so \
+            NPU_GLOBAL_SHM_PATH="$fixture/chdir-global-$mode" \
+            NPU_LOCAL_SHM_PATH="$fixture/chdir-local-$mode" NPU_MEM_QUOTA=0 \
+            ASCEND_DRIVER_HOME="$fixture" VNPU_QUERY_PIDS="$fixture/chdir-pids-$mode" \
+            "${extra[@]}" timeout 25 "$fixture/chdir-probe" "$fixture/chdir-pids-$mode"
+    )
+done
+echo 'PASS: procfs fallback/reaping, shared-memory aliases, relative preload/helper after chdir'

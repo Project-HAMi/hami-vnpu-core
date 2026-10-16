@@ -74,6 +74,8 @@ LD_PRELOAD=./target/debug/libvnpu.so python3 your_model.py
 
 The manager locates `vnpu-dcmi` next to the loaded interceptor. Set
 `NPU_DCMI_HELPER_PATH` to an absolute executable path when installing it elsewhere.
+Relative helper and library paths are resolved against the working directory at
+library load time, so later application `chdir` calls do not break queries.
 `ASCEND_DRIVER_HOME` selects the driver installation (default:
 `/usr/local/Ascend/driver`). The helper loads `lib64/driver/libdcmi.so` beneath it.
 The application's usual CANN library search path must make `libruntime.so`
@@ -85,6 +87,10 @@ Cancellation requests orderly helper cleanup. A helper is reaped before another 
 is an internal launch marker; do not set it on an inference application.
 
 ### Scheduler progress and upgrades
+
+`NPU_LOCAL_SHM_PATH` and `NPU_GLOBAL_SHM_PATH` must refer to different files,
+including when using symlinks or hard links. Invalid shared-memory paths terminate
+startup with exit code 78 before either mapping is opened.
 
 Normal scheduling ends a round after five milliseconds without new token
 consumption, including when the batch previously made progress. Running budgets

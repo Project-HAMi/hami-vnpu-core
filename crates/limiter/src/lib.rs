@@ -30,6 +30,7 @@ pub fn is_dcmi_helper() -> bool {
 
 #[ctor]
 fn init_logger() {
+    dcmi::capture_load_directory();
     let _ = env_logger::builder()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()

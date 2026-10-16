@@ -73,6 +73,9 @@ impl SchedulerClient {
         info!("[Worker PID:{}] Initialize SchedulerClient...", my_pid);
 
         let shmem_path = local_shmem_path();
+        if let Ok(global) = std::env::var(crate::config::ENV_GLOBAL_SHM_PATH) {
+            crate::config::require_distinct_shmem_paths(&global, &shmem_path);
+        }
         let deadline = Instant::now() + Duration::from_secs(SHMEM_WAIT_TIMEOUT_SECS);
         let shmem = loop {
             if let Some(s) = shmem::setup::try_open_shmem::<LocalContainerShmem>(shmem_path.as_str()) {

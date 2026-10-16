@@ -57,6 +57,7 @@ pub fn run() {
         return;
     }
 
+    crate::config::require_distinct_shmem_paths(&cfg.global_shm_path, &cfg.local_shm_path);
     let local = setup::create_shmem::<LocalContainerShmem>(&cfg.local_shm_path);
     let global = setup::open_global_registry(&cfg.global_shm_path);
     let registry = match RegistryLock::open(&cfg.global_shm_path) {
