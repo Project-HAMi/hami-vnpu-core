@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     void *acl = dlopen("libascendcl.so", RTLD_NOW | (!strcmp(argv[1], "local") ? RTLD_LOCAL : RTLD_GLOBAL));
     assert(acl);
-    mode = dlsym(acl, "fake_mode"); capture = dlsym(RTLD_DEFAULT, "fake_capture");
+    mode = dlsym(acl, "fake_mode"); capture = dlsym(acl, "fake_capture");
     launch = dlsym(RTLD_DEFAULT, "aclrtLaunchKernelWithHostArgs");
     assert(mode && capture && launch && (void *)launch != dlsym(acl, "aclrtLaunchKernelWithHostArgs"));
     int fd = open(getenv("NPU_LOCAL_SHM_PATH"), O_CREAT | O_RDWR | O_TRUNC, 0600);
