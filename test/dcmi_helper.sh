@@ -248,10 +248,21 @@ done
 cat > "$fixture/chdir-probe.c" <<'C'
 #include <dlfcn.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <unistd.h>
-static int wait_query(const char *path) {
+static int wait_snapshots(const char *path, int expected) {
     for (int i = 0; i < 100; ++i) {
-        if (!access(path, F_OK)) return 0;
+        FILE *log = fopen(path, "r");
+        int count = 0;
+        if (log) {
+            char line[1024];
+            while (fgets(line, sizeof(line), log)) {
+                if (strstr(line, "DCMI snapshot received: 1 records")) ++count;
+            }
+            fclose(log);
+        }
+        if (count >= expected) return 0;
         usleep(100000);
     }
     return 1;
@@ -261,8 +272,8 @@ int main(int argc, char **argv) {
     uint64_t (*info)(uint64_t, size_t *, size_t *) = dlsym(RTLD_DEFAULT, "rtMemGetInfoEx");
     if (!info) return 3;
     size_t free, total;
-    if (info(0, &free, &total) || wait_query(argv[1])) return 4;
-    if (unlink(argv[1]) || chdir("/tmp") || wait_query(argv[1])) return 5;
+    if (info(0, &free, &total) || wait_snapshots(argv[1], 1)) return 4;
+    if (chdir("/tmp") || wait_snapshots(argv[1], 2)) return 5;
     return 0;
 }
 C
@@ -278,8 +289,9 @@ for mode in adjacent override; do
             LD_LIBRARY_PATH="$fixture" LD_PRELOAD=./relative/libvnpu.so \
             NPU_GLOBAL_SHM_PATH="$fixture/chdir-global-$mode" \
             NPU_LOCAL_SHM_PATH="$fixture/chdir-local-$mode" NPU_MEM_QUOTA=0 \
-            ASCEND_DRIVER_HOME="$fixture" VNPU_QUERY_PIDS="$fixture/chdir-pids-$mode" \
-            "${extra[@]}" timeout 25 "$fixture/chdir-probe" "$fixture/chdir-pids-$mode"
+            ASCEND_DRIVER_HOME="$fixture" RUST_LOG=limiter::manager=debug \
+            "${extra[@]}" timeout 25 "$fixture/chdir-probe" "$fixture/chdir-log-$mode" \
+            2> "$fixture/chdir-log-$mode"
     )
 done
 echo 'PASS: procfs fallback/reaping, shared-memory aliases, relative preload/helper after chdir'
