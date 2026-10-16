@@ -18,7 +18,7 @@ fn client(tokens: u64, active: bool) -> SchedulerClient {
         lock: RwLock::new(InnerLock { internal_stream:10, start_event:11, end_event:12,
             tracking_event:13, batch_active:active, current_batch_id:if active {42} else {0},
             last_user_stream:6, start_time_us:if active {100} else {0} }),
-        hbm_handle_map:Mutex::new(HashMap::new()), is_stub:false,
+        hbm_handle_map:Mutex::new(HashMap::new()), is_stub:false, sched_policy:SchedPolicy::Dynamic,
     }) }
 }
 pub fn remaining(c: &SchedulerClient) -> u64 { c.inner.shmem.tokens_remaining.load(Ordering::Acquire) }
@@ -31,6 +31,30 @@ fn waiting_thread(c: SchedulerClient, stream: u64) -> (mpsc::Receiver<()>, threa
     let join=thread::spawn(move || { ready_tx.send(()).unwrap(); c.wait_for_token(stream); tx.send(()).unwrap(); });
     ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     (rx,join)
+}
+
+#[test]
+fn spatial_bypasses_all_admission_states_without_borrowing_locking_or_measurement() {
+    for state in [STATE_IDLE, STATE_RUNNING, STATE_MEASURING] {
+        let mut c = client(17, true);
+        Arc::get_mut(&mut c.inner).unwrap().sched_policy = SchedPolicy::Spatial;
+        c.inner.shmem.state.store(state, Ordering::Release);
+        c.inner.shmem.overdraft_limit.store(10, Ordering::Release);
+        let round = c.inner.shmem.overdraft_pool.begin_round().unwrap();
+        assert!(c.inner.shmem.overdraft_pool.open_idle(round));
+        let pool = c.inner.shmem.overdraft_pool.snapshot();
+        let guard = c.inner.lock.write().unwrap();
+        let (rx, thread) = waiting_thread(c.clone(), 99);
+        rx.recv_timeout(Duration::from_secs(2)).expect("spatial must bypass a held timing writer lock");
+        thread.join().unwrap();
+        assert_eq!(remaining(&c), 17);
+        assert_eq!(c.inner.shmem.overdraft_pool.snapshot(), pool);
+        assert_eq!(c.inner.shmem.active_workers.load(Ordering::Acquire), 1);
+        assert_eq!(c.inner.shmem.reported_count.load(Ordering::Acquire), 0);
+        assert_eq!(guard.last_user_stream, 6);
+        assert!(calls().is_empty(), "spatial must not invoke measurement events or synchronization");
+        drop(guard);
+    }
 }
 
 #[test]

@@ -107,3 +107,38 @@ pub extern "C" fn rtMemGetInfoEx(memInfoType: u64, free: *mut usize, total: *mut
     }
     return passthrough!("rtMemGetInfoEx", (u64, *mut usize,  *mut usize), memInfoType, free, total);
 }
+
+// ACL ABI from CANN 9.1 acl_rt.h; resource enums and aclError are C ints.
+#[unsafe(no_mangle)]
+pub extern "C" fn aclrtSetDevice(device: i32) -> i32 { crate::spatial::set_device(device) }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn aclrtSetCurrentContext(context: *mut std::ffi::c_void) -> i32 {
+    crate::spatial::set_context(context)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn aclrtResetDevice(device: i32) -> i32 { crate::spatial::reset_device(device, false) }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn aclrtResetDeviceForce(device: i32) -> i32 { crate::spatial::reset_device(device, true) }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn aclrtSetDeviceResLimit(device: i32, resource: i32, value: u32) -> i32 {
+    crate::spatial::set_device_resource(device, resource, value)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn aclrtResetDeviceResLimit(device: i32) -> i32 {
+    crate::spatial::reset_device_resources(device)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn aclrtSetStreamResLimit(stream: *mut std::ffi::c_void, resource: i32, value: u32) -> i32 {
+    crate::spatial::set_stream_resource(stream, resource, value)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn aclrtResetStreamResLimit(stream: *mut std::ffi::c_void) -> i32 {
+    crate::spatial::reset_stream_resources(stream)
+}
