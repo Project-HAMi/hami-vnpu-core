@@ -4,31 +4,31 @@ use limiter::externed_api::{RT_ERROR_NONE, RT_ERROR_MEMORY_ALLOCATION};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtAicpuKernelLaunchExWithArgs(kernelType: u32, opName: u64, blockDim: u32, argsInfo: u64, smDesc: u64, stm: u64, flags: u32) -> u64 {
-    npu_limiter().wait_for_token(stm);
+    crate::host_args::admit_legacy_launch(stm);
     return passthrough!("rtAicpuKernelLaunchExWithArgs", (u32, u64, u32, u64, u64, u64, u32), kernelType, opName, blockDim, argsInfo, smDesc, stm, flags);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtAicpuKernelLaunchWithFlag(launchNames: u64, blockDim: u32, argsInfo: u64, smDesc: u64, stm: u64, flags: u32) -> u64 {
-    npu_limiter().wait_for_token(stm);
+    crate::host_args::admit_legacy_launch(stm);
     return passthrough!("rtAicpuKernelLaunchWithFlag", (u64, u32, u64, u64, u64, u32), launchNames, blockDim, argsInfo, smDesc, stm, flags);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtKernelLaunchWithFlagV2(stubFunc: u64, blockDim: u32, argsInfo: u64, smDesc: u64, stm: u64, flags: u32, cfgInfo: u64) -> u64 {
-    npu_limiter().wait_for_token(stm);
+    crate::host_args::admit_legacy_launch(stm);
     return passthrough!("rtKernelLaunchWithFlagV2", (u64, u32, u64, u64, u64, u32, u64), stubFunc, blockDim, argsInfo, smDesc, stm, flags, cfgInfo);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtKernelLaunchWithHandleV2(handle: u64, tilingKey: u64, blockDim: u32, argsInfo: u64, smDesc: u64, stm: u64, cfgInfo: u64) -> u64 {
-    npu_limiter().wait_for_token(stm);
+    crate::host_args::admit_legacy_launch(stm);
     return passthrough!("rtKernelLaunchWithHandleV2", (u64, u64, u32, u64, u64, u64, u64), handle, tilingKey, blockDim, argsInfo, smDesc, stm, cfgInfo);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtModelExecute(mdl: u64, stm: u64, flag: u32) -> u64 {
-    npu_limiter().wait_for_token(stm);
+    crate::host_args::admit_legacy_launch(stm);
     return passthrough!("rtModelExecute", (u64, u64, u32), mdl, stm, flag);
 }
 
