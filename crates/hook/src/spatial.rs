@@ -128,10 +128,7 @@ fn current_device() -> i32 {
 fn allocation(physical: u32, percent: u32) -> u32 {
     if physical == 0 { fatal("initial physical resource count is zero"); }
     let target = u64::from(physical) * u64::from(percent);
-    let allocated = target.div_ceil(100);
-    let excess = allocated * 100 - target;
-    if 10 * excess > target { fatal("upward rounding exceeds 10 percent relative error"); }
-    allocated as u32
+    target.div_ceil(100) as u32
 }
 
 fn apply(map: &mut HashMap<i32, Budget>, device: i32, percent: u32) {

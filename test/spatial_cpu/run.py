@@ -67,24 +67,28 @@ def main():
             results.append(dict(name=name, passed=True, returncode=run.returncode))
             print("PASS " + name, flush=True)
 
-        for percent, cube, vector in [("100", 20, 40), ("10", 2, 4), ("30", 6, 12),
-                                       ("60", 12, 24), ("33", 7, 14), ("32", 7, 13),
-                                       ("35", 7, 14), ("66", 14, 27), ("99", 20, 40)]:
+        for percent, cube, vector in [("1", 1, 1), ("2", 1, 1), ("5", 1, 2),
+                                       ("6", 2, 3), ("10", 2, 4), ("12", 3, 5),
+                                       ("22", 5, 9), ("30", 6, 12), ("31", 7, 13),
+                                       ("32", 7, 13), ("33", 7, 14), ("35", 7, 14),
+                                       ("60", 12, 24), ("66", 14, 27), ("95", 19, 38),
+                                       ("96", 20, 39), ("99", 20, 40), ("100", 20, 40)]:
             budget = f"{cube} {vector}"
             case("ceil-" + percent, percent=percent, mode="basic",
                  expected=[budget] * 3 + [f"stream={vector}"] + [budget] * 2)
-        for percent in ["", "0", "101", "-1", "10x", "1", "12", "22", "31"]:
+        for percent in ["", "0", "101", "-1", "10x"]:
             case("refuse-" + (percent or "empty"), percent=percent, code=78)
-        case("default-one-percent-refused", percent=None, code=78,
-             error="upward rounding exceeds 10 percent")
+        case("default-one-percent-ceil", percent=None, expected=["1 1"])
         for name, settings in [
                 ("setter-failure", {"FAKE_FAIL_SET": "1"}),
                 ("getter-failure", {"FAKE_FAIL_GET": "1"}),
                 ("setter-ignored", {"FAKE_IGNORE_SET": "1"}),
                 ("readback-mismatch", {"FAKE_BAD_READBACK": "1"}),
-                ("zero-core-count", {"FAKE_CUBE": "0"}),
-                ("vector-only-rounding-refusal", {"FAKE_CUBE": "40", "FAKE_VECTOR": "20"})]:
-            case(name, percent="31" if "vector-only" in name else "33", settings=settings, code=78)
+                ("zero-cube-count", {"FAKE_CUBE": "0"}),
+                ("zero-vector-count", {"FAKE_VECTOR": "0"})]:
+            case(name, settings=settings, code=78)
+        case("independent-vector-ceil", percent="31",
+             settings={"FAKE_CUBE": "40", "FAKE_VECTOR": "20"}, expected=["13 7"])
         case("maximum-count-arithmetic", percent="100", settings={"FAKE_CUBE": "4294967295", "FAKE_VECTOR": "4294967295"},
              expected=["4294967295 4294967295"])
         for backend in ["missing-get", "missing-set"]:
