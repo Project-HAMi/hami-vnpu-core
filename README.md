@@ -23,17 +23,36 @@ advantages, tradeoffs and examples.
 
 ## Build
 
-Build on Linux with Rust 1.94 (the CI toolchain), a C compiler, and the Ascend
-driver/CANN development libraries installed. Initialize the CANN environment
-supplied with your installation. Hardware validation in this project has used
-Ascend 910B.
+The release CI and local builds share [one Dockerfile](dockerfiles/Dockerfile).
+Install Git, Make, Docker and Docker Buildx, then run from the repository root:
 
 ```sh
-cargo build --release --locked
+make build-in-docker
+cd dist && sha256sum -c SHA256SUMS
 ```
 
-Deploy `target/release/libvnpu.so`. Its architecture and runtime dependencies must
-match the workload container. For nonstandard SDK paths, see the
+This builds the complete release library against real CANN runtime/DCMI libraries
+and exports `dist/libvnpu.so`, `dist/build-info.json` and `dist/SHA256SUMS`.
+The Dockerfile uses the official `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11`
+image, pinned by digest, and Rust **1.94.0**. It downloads the official **HDK 25.5.1**
+package, verifies its SHA256 and extracts the real driver user libraries for
+linking; it does not install a kernel driver. The build environment is
+**CANN 8.5.2 on Ubuntu 22.04** and the output is **Linux ARM64**. Use a native ARM64
+builder, or configure ARM64 emulation on another architecture. No NPU is required
+to compile. Override the export directory with `make build-in-docker OUT_DIR=out`.
+
+Deploy `dist/libvnpu.so` into an ARM64 workload container with compatible CANN
+and host-driver libraries. The HDK driver user-library version describes the
+build environment; choose the host driver using the CANN/hardware compatibility
+requirements.
+A successful build does not establish the minimum supported CANN version or
+hardware support for every policy. See [testing and CI](docs/testing.md) for
+artifact provenance, verification and hardware-validation scope.
+
+To build directly on a Linux host with Rust 1.94.0, a C compiler and real Ascend
+CANN/DCMI development libraries, initialize the installed CANN environment and
+run `cargo build --release --workspace --locked`. The library is then at
+`target/release/libvnpu.so`. Nonstandard SDK paths are covered in the
 [configuration reference](docs/configuration.md).
 
 ## Run an application
@@ -81,7 +100,7 @@ process lifecycle requirements.
 | --- | --- |
 | [Scheduling policies](docs/scheduling-policies.md) | Four policies, advantages, tradeoffs and selection examples |
 | [Configuration reference](docs/configuration.md) | Environment variables, defaults, units, advanced tuning and migration |
-| [Testing and CI](docs/testing.md) | Reproduce the hardware-free checks and understand their coverage |
+| [Testing and CI](docs/testing.md) | Build release artifacts, reproduce CPU checks and understand their coverage |
 | [Spatial design](docs/spatial-policy.md) | Detailed implementation and historical validation evidence |
 
 ## Development checks
@@ -90,7 +109,8 @@ process lifecycle requirements.
 bash scripts/ci.sh
 ```
 
-Run on Linux; see [testing and CI](docs/testing.md) for dependencies. CI uses fake
-ACL/DCMI backends and source-linked CPU tests. These checks validate configuration,
-scheduling logic and hooks; validate NPU execution and workload performance
-separately in a compatible Ascend environment.
+Run on Linux; see [testing and CI](docs/testing.md) for dependencies. The CPU
+regression jobs use fake ACL/DCMI backends and source-linked tests for
+configuration, scheduling logic and hooks. The separate release job uses the real
+SDK and uploads the verified ARM64 library. Validate NPU execution and workload
+performance separately in a compatible Ascend environment.

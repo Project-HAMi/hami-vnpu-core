@@ -21,14 +21,31 @@ core 默认使用 `dynamic`，`NPU_COMPUTE_LIMIT` 默认值为 `1`，建议显�
 
 ## 构建
 
-在 Linux 上构建，需要 Rust 1.94（与 CI 一致）、C 编译器，以及昇腾驱动和 CANN
-开发库。先按安装包说明初始化 CANN 环境。本项目的硬件验证使用过 Ascend 910B。
+发布 CI 和本地构建共用[同一个 Dockerfile](dockerfiles/Dockerfile)。
+准备 Git、Make、Docker 和 Docker Buildx，在仓库根目录执行：
 
 ```sh
-cargo build --release --locked
+make build-in-docker
+cd dist && sha256sum -c SHA256SUMS
 ```
 
-部署产物为 `target/release/libvnpu.so`，架构与运行时依赖必须匹配业务容器。
+该流程使用真实的 CANN runtime/DCMI 库完整构建 release 版本，导出
+`dist/libvnpu.so`、`dist/build-info.json` 和 `dist/SHA256SUMS`。
+Dockerfile 使用官方 `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11`
+镜像并固定摘要，Rust 固定为 **1.94.0**；下载官方 **HDK 25.5.1** 包并验证 SHA256，
+只提取真实驱动用户态库用于链接，不安装内核驱动。
+构建环境为 **CANN 8.5.2、Ubuntu 22.04**，产物为 **Linux ARM64**；建议使用原生
+ARM64 构建器，在其他架构上需配置 ARM64 模拟。编译无需 NPU。
+如需修改产物目录，执行 `make build-in-docker OUT_DIR=out`。
+
+将 `dist/libvnpu.so` 部署到具有兼容 CANN 和宿主机驱动库的 ARM64 业务容器。
+HDK 驱动用户态库版本只说明构建环境，宿主机驱动应与业务 CANN 和硬件配套。
+编译成功不能直接确定最低兼容 CANN 版本，也不能代替各策略的真机验证。
+产物来源、检查内容和验证范围见[测试与 CI](docs/testing.md)。
+
+如需在已安装真实 CANN/DCMI 开发库的 Linux 主机上直接构建，准备 Rust 1.94.0
+和 C 编译器，按安装包说明初始化 CANN 环境后执行
+`cargo build --release --workspace --locked`，产物为 `target/release/libvnpu.so`。
 非标准 SDK 路径见[配置参考](docs/configuration.zh-CN.md)。
 
 ## 运行应用
@@ -71,7 +88,7 @@ registry 文件。切换配置或 SHM 布局前，先停止本组进程，再使
 | --- | --- |
 | [调度策略](docs/scheduling-policies.zh-CN.md) | 四种策略的利弊、选型与示例 |
 | [配置参考](docs/configuration.zh-CN.md) | 环境变量、默认值、单位、进阶调优与迁移 |
-| [测试与 CI](docs/testing.md) | 本地复现无硬件检查及其覆盖范围 |
+| [测试与 CI](docs/testing.md) | 发布产物构建、CPU 检查及其覆盖范围 |
 | [空分设计](docs/spatial-policy.md) | 实现细节与历史验证记录 |
 
 ## 开发检查
@@ -80,6 +97,7 @@ registry 文件。切换配置或 SHM 布局前，先停止本组进程，再使
 bash scripts/ci.sh
 ```
 
-在 Linux 上运行，依赖见[测试与 CI](docs/testing.md)。CI 使用假的 ACL/DCMI 后端和
-直接引用生产源码的 CPU 测试，检查配置、调度逻辑与 hook 行为。
-NPU 执行和业务性能需要在兼容的昇腾环境中另行验证。
+在 Linux 上运行，依赖见[测试与 CI](docs/testing.md)。CPU 回归任务使用假的 ACL/DCMI
+后端及直接引用生产源码的测试，检查配置、调度逻辑与 hook 行为。独立的发布构建任务
+使用真实 SDK，上传通过检查的 ARM64 库。NPU 执行和业务性能需要在兼容的昇腾环境中
+另行验证。
