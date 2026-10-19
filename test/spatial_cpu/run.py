@@ -31,12 +31,16 @@ def main():
             target = work / variant
             target.mkdir()
             subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
-                            *flags, str(source / "fake_acl.c"), "-o", str(target / "libfake_acl.so")], check=True)
+                            "-Wl,-soname,libfake_acl.so", *flags, str(source / "fake_acl.c"),
+                            "-o", str(target / "libfake_acl.so")], check=True)
             backends[variant] = target
         executable = work / "client"
+        # Select exactly one backend through each case's LD_LIBRARY_PATH below.
+        # An embedded old-style DT_RPATH can override it and silently load the
+        # full backend in missing-API cases on older Linux linker toolchains.
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(source / "client.c"),
                         "-L" + str(backends["full"]), "-lfake_acl", "-pthread",
-                        "-Wl,-rpath," + str(backends["full"]), "-o", str(executable)], check=True)
+                        "-o", str(executable)], check=True)
 
         def case(name, percent="33", mode="initial", expected=None, code=0,
                  policy="spatial", backend="full", settings=None, error=None):
@@ -91,8 +95,9 @@ def main():
              settings={"FAKE_CUBE": "40", "FAKE_VECTOR": "20"}, expected=["13 7"])
         case("maximum-count-arithmetic", percent="100", settings={"FAKE_CUBE": "4294967295", "FAKE_VECTOR": "4294967295"},
              expected=["4294967295 4294967295"])
-        for backend in ["missing-get", "missing-set"]:
-            case(backend, backend=backend, code=78)
+        for backend, symbol in [("missing-get", "aclrtGetDeviceResLimit"),
+                                ("missing-set", "aclrtSetDeviceResLimit")]:
+            case(backend, backend=backend, code=78, error=symbol)
         for policy in [None, "dynamic", "fixed", "overdraft"]:
             case("passthrough-" + str(policy), policy=policy, backend="missing-get", mode="passthrough",
                  expected=["20 40", "20 40", "100 40", "stream=100", "20 40", "20 40", "gets=0"])
@@ -107,7 +112,8 @@ def main():
                 ("stream-get-missing", "missing-stream-get", {}),
                 ("stream-get-failed", "full", {"FAKE_FAIL_STREAM_GET": "1"}),
                 ("stream-write-ignored", "full", {"FAKE_IGNORE_STREAM_SET": "1"})]:
-            case(name, mode="stream-set", backend=backend, settings=settings, code=78)
+            case(name, mode="stream-set", backend=backend, settings=settings, code=78,
+                 error="aclrtGetStreamResLimit" if name == "stream-get-missing" else None)
         case("stream-write-failed-keeps-native-error", mode="stream-set",
              settings={"FAKE_FAIL_STREAM_SET": "1"}, code=2)
         case("stream-current-device-failure", mode="stream-set", settings={"FAKE_FAIL_CURRENT": "1"}, code=78)
