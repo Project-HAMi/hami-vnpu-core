@@ -31,12 +31,16 @@ def main():
             target = work / variant
             target.mkdir()
             subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
-                            *flags, str(source / "fake_acl.c"), "-o", str(target / "libfake_acl.so")], check=True)
+                            "-Wl,-soname,libfake_acl.so", *flags, str(source / "fake_acl.c"),
+                            "-o", str(target / "libfake_acl.so")], check=True)
             backends[variant] = target
         executable = work / "client"
+        # Select exactly one backend through each case's LD_LIBRARY_PATH below.
+        # An embedded old-style DT_RPATH can override it and silently load the
+        # full backend in missing-API cases on older Linux linker toolchains.
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(source / "client.c"),
                         "-L" + str(backends["full"]), "-lfake_acl", "-pthread",
-                        "-Wl,-rpath," + str(backends["full"]), "-o", str(executable)], check=True)
+                        "-o", str(executable)], check=True)
 
         def case(name, percent="33", mode="initial", expected=None, code=0,
                  policy="spatial", backend="full", settings=None, error=None):
@@ -52,7 +56,11 @@ def main():
                 env["NPU_COMPUTE_LIMIT"] = str(percent)
             if policy is not None:
                 env["NPU_SCHED_POLICY"] = policy
-            env.update(settings or {})
+            for key, value in (settings or {}).items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
             run = subprocess.run([str(executable), mode], env=env, capture_output=True,
                                  text=True, timeout=20)
             assert run.returncode == code, (name, run.returncode, run.stdout, run.stderr)
@@ -62,7 +70,7 @@ def main():
                 assert "fatal" in run.stderr, (name, run.stderr)
             if error:
                 assert error in run.stderr, (name, run.stderr)
-            if policy == "spatial" and code == 0 and mode not in {"fork-after", "fork-locked"}:
+            if policy in {None, "spatial"} and code == 0 and mode not in {"fork-after", "fork-locked"}:
                 assert "rounding=ceil cooperative=1" in run.stderr, (name, run.stderr)
             results.append(dict(name=name, passed=True, returncode=run.returncode))
             print("PASS " + name, flush=True)
@@ -79,6 +87,11 @@ def main():
         for percent in ["", "0", "101", "-1", "10x"]:
             case("refuse-" + (percent or "empty"), percent=percent, code=78)
         case("default-one-percent-ceil", percent=None, expected=["1 1"])
+        case("default-policy-applies-spatial", policy=None, mode="basic",
+             expected=["7 14"] * 3 + ["stream=14"] + ["7 14"] * 2)
+        case("default-policy-and-compute", policy=None, percent=None, expected=["1 1"])
+        case("default-policy-missing-global-path", policy=None,
+             settings={"NPU_GLOBAL_SHM_PATH": None}, code=78, error="NPU_GLOBAL_SHM_PATH")
         for name, settings in [
                 ("setter-failure", {"FAKE_FAIL_SET": "1"}),
                 ("getter-failure", {"FAKE_FAIL_GET": "1"}),
@@ -91,9 +104,11 @@ def main():
              settings={"FAKE_CUBE": "40", "FAKE_VECTOR": "20"}, expected=["13 7"])
         case("maximum-count-arithmetic", percent="100", settings={"FAKE_CUBE": "4294967295", "FAKE_VECTOR": "4294967295"},
              expected=["4294967295 4294967295"])
-        for backend in ["missing-get", "missing-set"]:
-            case(backend, backend=backend, code=78)
-        for policy in [None, "dynamic", "fixed", "overdraft"]:
+        for backend, symbol in [("missing-get", "aclrtGetDeviceResLimit"),
+                                ("missing-set", "aclrtSetDeviceResLimit")]:
+            case(backend, backend=backend, code=78, error=symbol)
+            case("default-policy-" + backend, policy=None, backend=backend, code=78, error=symbol)
+        for policy in ["dynamic", "fixed", "overdraft"]:
             case("passthrough-" + str(policy), policy=policy, backend="missing-get", mode="passthrough",
                  expected=["20 40", "20 40", "100 40", "stream=100", "20 40", "20 40", "gets=0"])
         case("context-initialization", mode="context", expected=["7 14"])
@@ -107,7 +122,8 @@ def main():
                 ("stream-get-missing", "missing-stream-get", {}),
                 ("stream-get-failed", "full", {"FAKE_FAIL_STREAM_GET": "1"}),
                 ("stream-write-ignored", "full", {"FAKE_IGNORE_STREAM_SET": "1"})]:
-            case(name, mode="stream-set", backend=backend, settings=settings, code=78)
+            case(name, mode="stream-set", backend=backend, settings=settings, code=78,
+                 error="aclrtGetStreamResLimit" if name == "stream-get-missing" else None)
         case("stream-write-failed-keeps-native-error", mode="stream-set",
              settings={"FAKE_FAIL_STREAM_SET": "1"}, code=2)
         case("stream-current-device-failure", mode="stream-set", settings={"FAKE_FAIL_CURRENT": "1"}, code=78)

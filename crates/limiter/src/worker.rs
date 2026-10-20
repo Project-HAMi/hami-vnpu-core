@@ -1,17 +1,19 @@
+use std::collections::HashMap;
+use std::fmt;
+use std::fs;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration};
 use std::thread;
-use std::fmt;
-use std::collections::HashMap;
-use std::fs;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use log::{info, debug, warn};
+use log::{debug, info, warn};
 
-use crate::shmem::{self, LocalContainerShmem, futex, MAX_WORKERS, STATE_IDLE, STATE_RUNNING, STATE_MEASURING};
-use crate::config::{local_shmem_path, SchedPolicy, VIRTUAL_OVERHEAD_MB};
-use crate::externed_api::*;
 use crate::check_rts;
+use crate::config::{SchedPolicy, VIRTUAL_OVERHEAD_MB, local_shmem_path};
+use crate::externed_api::*;
+use crate::shmem::{
+    self, LocalContainerShmem, MAX_WORKERS, STATE_IDLE, STATE_MEASURING, STATE_RUNNING, futex,
+};
 
 /// Max time a worker waits for the manager to create + initialize shmem before
 /// giving up. On timeout SchedulerClient::new panics and npu_limiter() falls back
@@ -21,9 +23,11 @@ const SHMEM_WAIT_TIMEOUT_SECS: u64 = 10;
 /// Atomically subtract `v` from `a`, saturating at 0 (never wraps to ~2^64 on an
 /// accounting slip). Returns true if it hit the floor, so the caller can heal.
 fn atomic_saturating_sub(a: &std::sync::atomic::AtomicU64, v: u64) -> bool {
-    a.fetch_update(Ordering::SeqCst, Ordering::Acquire, |cur| Some(cur.saturating_sub(v)))
-        .map(|prev| prev < v)
-        .unwrap_or(false)
+    a.fetch_update(Ordering::SeqCst, Ordering::Acquire, |cur| {
+        Some(cur.saturating_sub(v))
+    })
+    .map(|prev| prev < v)
+    .unwrap_or(false)
 }
 
 #[derive(Debug, Default)]
@@ -32,7 +36,7 @@ struct InnerLock {
     start_event: u64,
     end_event: u64,
     tracking_event: u64,
-    
+
     batch_active: bool,
     current_batch_id: u64,
     last_user_stream: u64, // To track where to record the tracking_event
@@ -67,6 +71,12 @@ impl fmt::Debug for SchedulerClientInner {
     }
 }
 
+impl Default for SchedulerClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SchedulerClient {
     /// Initialized ONCE per NPUDeviceList (per process/device)
     pub fn new() -> Self {
@@ -77,10 +87,11 @@ impl SchedulerClient {
         let shmem_path = local_shmem_path();
         let deadline = Instant::now() + Duration::from_secs(SHMEM_WAIT_TIMEOUT_SECS);
         let shmem = loop {
-            if let Some(s) = shmem::setup::try_open_shmem::<LocalContainerShmem>(shmem_path.as_str()) {
-                if s.initialized.load(Ordering::Acquire) == 1 {
-                    break s;
-                }
+            if let Some(s) =
+                shmem::setup::try_open_shmem::<LocalContainerShmem>(shmem_path.as_str())
+                && s.initialized.load(Ordering::Acquire) == 1
+            {
+                break s;
             }
             if Instant::now() >= deadline {
                 panic!(
@@ -93,15 +104,23 @@ impl SchedulerClient {
 
         // Register THIS Client in a free worker report slot
         let my_slot_idx = Self::register_worker_slot(shmem, my_pid);
-        debug!("[Scheduler] Client Registered at worker slot {}", my_slot_idx);
+        debug!(
+            "[Scheduler] Client Registered at worker slot {}",
+            my_slot_idx
+        );
 
         // Register THIS Process in a free process slot
         let my_proc_idx = Self::register_proc_slot(shmem, my_pid);
-        info!("[Worker PID:{}] Registered at proc slot {}", my_pid, my_proc_idx);
+        info!(
+            "[Worker PID:{}] Registered at proc slot {}",
+            my_pid, my_proc_idx
+        );
 
         // Initialize internal NPU resources used for timing.
         let mut dev: i32 = 0;
-        unsafe { rtGetDevice(&mut dev); }
+        unsafe {
+            rtGetDevice(&mut dev);
+        }
         let device_id = dev.max(0) as usize;
 
         let inner_lock = if sched_policy.is_time_sliced() {
@@ -141,13 +160,21 @@ impl SchedulerClient {
         for (i, slot) in shmem.reports.iter().enumerate() {
             let slot_pid = slot.pid.load(Ordering::Relaxed);
             if slot_pid == 0 {
-                if slot.occupied.compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                if slot
+                    .occupied
+                    .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+                {
                     slot.pid.store(pid, Ordering::Relaxed);
                     return i;
                 }
             } else if !proc_alive(slot_pid) {
                 // Try to atomically swap our PID in — only one thread wins
-                if slot.pid.compare_exchange(slot_pid, pid, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                if slot
+                    .pid
+                    .compare_exchange(slot_pid, pid, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+                {
                     slot.batch_id.store(0, Ordering::Relaxed);
                     slot.cpu_start_us.store(0, Ordering::Relaxed);
                     slot.duration_us.store(0, Ordering::Relaxed);
@@ -157,7 +184,10 @@ impl SchedulerClient {
             }
         }
 
-        panic!("[Scheduler] Registry full ({} workers). Increase MAX_WORKERS.", MAX_WORKERS);
+        panic!(
+            "[Scheduler] Registry full ({} workers). Increase MAX_WORKERS.",
+            MAX_WORKERS
+        );
     }
 
     fn register_proc_slot(shmem: &'static LocalContainerShmem, pid: i32) -> usize {
@@ -207,10 +237,10 @@ impl SchedulerClient {
         let mut end_event: u64 = 0;
         let mut tracking_event: u64 = 0;
 
-        check_rts!(rtStreamCreate(&mut internal_stream, 0));
-        check_rts!(rtEventCreate(&mut start_event));
-        check_rts!(rtEventCreate(&mut end_event));
-        check_rts!(rtEventCreate(&mut tracking_event));
+        check_rts!(unsafe { rtStreamCreate(&mut internal_stream, 0) });
+        check_rts!(unsafe { rtEventCreate(&mut start_event) });
+        check_rts!(unsafe { rtEventCreate(&mut end_event) });
+        check_rts!(unsafe { rtEventCreate(&mut tracking_event) });
 
         InnerLock {
             internal_stream,
@@ -236,9 +266,10 @@ impl SchedulerClient {
         let current = remaining.load(Ordering::Acquire);
         // On contention, return to the caller to recheck state/batch rather
         // than retrying against a potentially replenished round's balance.
-        current != 0 && remaining.compare_exchange(
-            current, current - 1, Ordering::AcqRel, Ordering::Acquire,
-        ).is_ok()
+        current != 0
+            && remaining
+                .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
     }
 
     /// Same stream, already active batch: share the process timing state while
@@ -299,7 +330,7 @@ impl SchedulerClient {
                 // ---------------------------------------------------------
                 STATE_RUNNING => {
                     let tokens = self.inner.shmem.tokens_remaining.load(Ordering::Relaxed);
-                    
+
                     if tokens == 0 {
                         // Release lock while yielding to allow other threads to enter
                         drop(lock); // UNLOCK
@@ -310,26 +341,38 @@ impl SchedulerClient {
 
                     if self.try_consume_one_token() {
                         // SUCCESS!
-                        
+
                         // First Token of Batch
                         if !lock.batch_active {
-                            debug!("[Worker PID:{} Slot:{}] get Batch {} first Token!, start record time...", std::process::id(), self.inner.my_slot_idx, global_batch);
+                            debug!(
+                                "[Worker PID:{} Slot:{}] get Batch {} first Token!, start record time...",
+                                std::process::id(),
+                                self.inner.my_slot_idx,
+                                global_batch
+                            );
 
                             lock.current_batch_id = global_batch;
                             lock.batch_active = true;
-                            
+
                             // Notify Manager
-                            self.inner.shmem.active_workers.fetch_add(1, Ordering::Release);
+                            self.inner
+                                .shmem
+                                .active_workers
+                                .fetch_add(1, Ordering::Release);
 
                             // CPU Start Time
                             let now_us = get_time_us();
-                            self.inner.shmem.reports[self.inner.my_slot_idx].cpu_start_us.store(now_us, Ordering::Relaxed);
+                            self.inner.shmem.reports[self.inner.my_slot_idx]
+                                .cpu_start_us
+                                .store(now_us, Ordering::Relaxed);
                             lock.start_time_us = now_us;
 
                             // GPU Start Event (Internal Stream)
-                            check_rts!(rtEventRecord(lock.start_event, lock.internal_stream));
+                            check_rts!(unsafe {
+                                rtEventRecord(lock.start_event, lock.internal_stream)
+                            });
                         }
-                        
+
                         return; // -> Kernel Launch
                     }
                 }
@@ -339,10 +382,15 @@ impl SchedulerClient {
                 // ---------------------------------------------------------
                 STATE_MEASURING => {
                     if lock.batch_active && global_batch == lock.current_batch_id {
-                        debug!("[Worker PID:{} Slot:{}] start measuring Batch {} ...", std::process::id(), self.inner.my_slot_idx, global_batch);
+                        debug!(
+                            "[Worker PID:{} Slot:{}] start measuring Batch {} ...",
+                            std::process::id(),
+                            self.inner.my_slot_idx,
+                            global_batch
+                        );
                         self.measure_and_report_batch(&mut lock);
                     }
-                    
+
                     // Wait for state change
                     drop(lock); // UNLOCK
                     if self.inner.shmem.state.load(Ordering::Acquire) == STATE_MEASURING {
@@ -365,8 +413,14 @@ impl SchedulerClient {
                     drop(lock); // UNLOCK
                     if shared.state.load(Ordering::Acquire) == STATE_IDLE {
                         if limit > 0 {
-                            futex::wait_timeout(&shared.state, STATE_IDLE,
-                                shared.overdraft_poll_interval_us.load(Ordering::Relaxed).max(1));
+                            futex::wait_timeout(
+                                &shared.state,
+                                STATE_IDLE,
+                                shared
+                                    .overdraft_poll_interval_us
+                                    .load(Ordering::Relaxed)
+                                    .max(1),
+                            );
                         } else {
                             futex::wait(&shared.state, STATE_IDLE);
                         }
@@ -382,7 +436,11 @@ impl SchedulerClient {
     fn try_idle_overdraft(&self, timed_out: bool) -> bool {
         let shared = self.inner.shmem;
         shared.overdraft_pool.try_acquire_idle(
-            &shared.state, &shared.batch_id, STATE_IDLE, &shared.overdraft_limit, timed_out,
+            &shared.state,
+            &shared.batch_id,
+            STATE_IDLE,
+            &shared.overdraft_limit,
+            timed_out,
         )
     }
 
@@ -393,13 +451,15 @@ impl SchedulerClient {
         if lock.last_user_stream != 0 {
             let mut status: u32 = 0;
             let mut model: u64 = 0;
-            let _ = check_rts!(rtStreamGetCaptureInfo(lock.last_user_stream, &mut status, &mut model));
+            let _ = check_rts!(unsafe {
+                rtStreamGetCaptureInfo(lock.last_user_stream, &mut status, &mut model)
+            });
             if status != 0 {
                 debug!(
                     "[Limiter] stream 0x{:x} is capturing; using device sync timing.",
                     lock.last_user_stream
                 );
-                check_rts!(rtDeviceSynchronize());
+                check_rts!(unsafe { rtDeviceSynchronize() });
                 if lock.start_time_us != 0 {
                     duration_us = get_time_us().saturating_sub(lock.start_time_us);
                 }
@@ -410,7 +470,7 @@ impl SchedulerClient {
         // If there is no user stream, fall back to device sync + wall-clock.
         if !used_wall_clock && lock.last_user_stream == 0 {
             debug!("[Limiter] no last user stream; using device sync timing.");
-            check_rts!(rtDeviceSynchronize());
+            check_rts!(unsafe { rtDeviceSynchronize() });
             if lock.start_time_us != 0 {
                 duration_us = get_time_us().saturating_sub(lock.start_time_us);
             }
@@ -418,21 +478,25 @@ impl SchedulerClient {
         }
 
         if !used_wall_clock {
-            check_rts!(rtEventRecord(lock.tracking_event, lock.last_user_stream));
-            check_rts!(rtStreamWaitEvent(lock.internal_stream, lock.tracking_event));
-            check_rts!(rtEventRecord(lock.end_event, lock.internal_stream));
-            check_rts!(rtStreamSynchronize(lock.internal_stream));
+            check_rts!(unsafe { rtEventRecord(lock.tracking_event, lock.last_user_stream) });
+            check_rts!(unsafe { rtStreamWaitEvent(lock.internal_stream, lock.tracking_event) });
+            check_rts!(unsafe { rtEventRecord(lock.end_event, lock.internal_stream) });
+            check_rts!(unsafe { rtStreamSynchronize(lock.internal_stream) });
             let mut ms: f32 = 0.0;
-            check_rts!(rtEventElapsedTime(&mut ms, lock.start_event, lock.end_event));
+            check_rts!(unsafe { rtEventElapsedTime(&mut ms, lock.start_event, lock.end_event) });
             duration_us = (ms * 1000.0) as u64;
         }
 
         // Report to Shared Memory
         let slot = &self.inner.shmem.reports[self.inner.my_slot_idx];
         slot.duration_us.store(duration_us, Ordering::Relaxed);
-        slot.batch_id.store(lock.current_batch_id, Ordering::Release);
+        slot.batch_id
+            .store(lock.current_batch_id, Ordering::Release);
 
-        self.inner.shmem.reported_count.fetch_add(1, Ordering::Release);
+        self.inner
+            .shmem
+            .reported_count
+            .fetch_add(1, Ordering::Release);
 
         lock.batch_active = false;
         lock.start_time_us = 0;
@@ -449,7 +513,9 @@ impl SchedulerClient {
         let limit = shmem.memory_limit.load(Ordering::Relaxed);
 
         // if no limit
-        if limit == 0 { return 0; }
+        if limit == 0 {
+            return 0;
+        }
 
         // Clean up dead processes and get accurate usage before checking
         let _ = self.recalculate_usage();
@@ -502,7 +568,10 @@ impl SchedulerClient {
             slot.hbm_used[dev].fetch_add(size, Ordering::Release);
         } else {
             if atomic_saturating_sub(&self.inner.shmem.memory_used, size) {
-                warn!("[Worker PID:{}] memory_used underflow on alloc-rollback; re-deriving from live slots", std::process::id());
+                warn!(
+                    "[Worker PID:{}] memory_used underflow on alloc-rollback; re-deriving from live slots",
+                    std::process::id()
+                );
                 let _ = self.recalculate_usage();
             }
         }
@@ -521,7 +590,10 @@ impl SchedulerClient {
                 let slot_underflow = atomic_saturating_sub(&slot.hbm_used[dev], size);
                 let global_underflow = atomic_saturating_sub(&self.inner.shmem.memory_used, size);
                 if slot_underflow || global_underflow {
-                    warn!("[Worker PID:{}] memory_used underflow on free; re-deriving from live slots", std::process::id());
+                    warn!(
+                        "[Worker PID:{}] memory_used underflow on free; re-deriving from live slots",
+                        std::process::id()
+                    );
                     let _ = self.recalculate_usage();
                 }
                 debug!(
@@ -529,7 +601,10 @@ impl SchedulerClient {
                     handle, size
                 );
             } else {
-                warn!("[Limiter] Free Success but Handle 0x{:x} was untracked!", handle);
+                warn!(
+                    "[Limiter] Free Success but Handle 0x{:x} was untracked!",
+                    handle
+                );
             }
         } else {
             warn!(
@@ -563,10 +638,16 @@ impl SchedulerClient {
 
         for slot in &shmem.procs {
             let pid = slot.pid.load(Ordering::Acquire);
-            if pid == 0 { continue; }
+            if pid == 0 {
+                continue;
+            }
             if pid != current_pid && !proc_alive(pid) {
                 // CAS the PID to 0 — only the winner cleans up
-                if slot.pid.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                if slot
+                    .pid
+                    .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
                     // The process slot owns one counter per NPU device. Clear all of them
                     // before publishing the slot as inactive, otherwise a later scan will
                     // skip the slot and strand usage from the other devices forever.
@@ -600,24 +681,21 @@ impl SchedulerClient {
         device_total
     }
 
-    pub fn get_hbm_info(&self, free: *mut usize, total: *mut usize) {
+    /// Write the quota-adjusted free and total HBM sizes to the output pointers.
+    ///
+    /// # Safety
+    /// `free` and `total` must be aligned, writable pointers to `usize` values
+    /// for the duration of this call, with no concurrent access to those values.
+    pub unsafe fn get_hbm_info(&self, free: *mut usize, total: *mut usize) {
         let shmem = self.inner.shmem;
 
         let quota = shmem.memory_limit.load(Ordering::Relaxed) as usize;
         let used = self.recalculate_usage_for_device(self.current_device()) as usize;
-        let overhead_bytes = (VIRTUAL_OVERHEAD_MB * 1024 * 1024) as usize;
+        let overhead_bytes = VIRTUAL_OVERHEAD_MB * 1024 * 1024;
 
-        let logical_free = if quota > used {
-            quota - used
-        } else {
-            0
-        };
+        let logical_free = quota.saturating_sub(used);
 
-        let reported_free = if logical_free > overhead_bytes {
-            logical_free - overhead_bytes
-        } else {
-            0
-        };
+        let reported_free = logical_free.saturating_sub(overhead_bytes);
 
         unsafe {
             *total = quota;
@@ -637,7 +715,8 @@ impl SchedulerClient {
     /// All HBM limit checks and compute tracking will be disabled.
     pub fn stub() -> Self {
         // Leak a zeroed shmem on the heap so we have a static reference.
-        let shmem: &'static LocalContainerShmem = Box::leak(Box::new(unsafe { std::mem::zeroed() }));
+        let shmem: &'static LocalContainerShmem =
+            Box::leak(Box::new(unsafe { std::mem::zeroed() }));
         Self {
             inner: Arc::new(SchedulerClientInner {
                 shmem,
@@ -686,7 +765,10 @@ pub(crate) fn proc_alive(pid: i32) -> bool {
 
 // Helper
 fn get_time_us() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
 }
 
 impl Drop for SchedulerClientInner {

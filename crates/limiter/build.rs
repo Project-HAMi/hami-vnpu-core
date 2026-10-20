@@ -3,8 +3,8 @@
 fn main() {
     let toolkit = std::env::var("ASCEND_TOOLKIT_HOME")
         .unwrap_or_else(|_| "/usr/local/Ascend/ascend-toolkit/latest".into());
-    let driver = std::env::var("ASCEND_DRIVER_HOME")
-        .unwrap_or_else(|_| "/usr/local/Ascend/driver".into());
+    let driver =
+        std::env::var("ASCEND_DRIVER_HOME").unwrap_or_else(|_| "/usr/local/Ascend/driver".into());
     println!("cargo:rustc-link-search=native={toolkit}/lib64");
     println!("cargo:rustc-link-search=native={driver}/lib64/driver");
     println!("cargo:rustc-link-lib=dcmi");

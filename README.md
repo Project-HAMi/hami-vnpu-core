@@ -1,120 +1,131 @@
-# HAMi-vnpu-core —— Hook library for Ascend NPU
-## Introduction
-HAMi-vnpu-core is the in-container resource controller for Ascend NPU, written in Rust language.
+# HAMi-vnpu-core
 
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-## Features
+HAMi-vnpu-core is an in-container resource controller for Ascend NPUs. Its Rust
+library, `libvnpu.so`, intercepts runtime calls to account for shared HBM usage and
+apply one of four compute scheduling policies. A manager is elected inside the
+participating processes; no separate daemon is required.
 
-HAMi-vnpu-core has the following features:
-1. Virtualize device meory
-2. Limit NPU compute through time scheduling or cooperative Cube/Vector budgets
+## Choose a scheduling policy
 
-## Components
-- **libvnpu.so (Interceptor + Manager)**: A dynamic library (`.so`) that intercepts NPU RTS API calls from AI frameworks. A lightweight **supervisor thread** starts lazily on the first use of an intercepted RTS path. Processes sharing a Pod's local SHM and PID namespace elect a **Manager** for shared HBM accounting and, with time-based policies, compute scheduling. Another participating process can take over after the manager exits or its heartbeat expires. No separate daemon needs to be started.
+| Policy | How it controls compute | When to consider it |
+| --- | --- | --- |
+| `dynamic` | Relative shares with idle-capacity borrowing | Shared workloads where utilization matters more than a strict ceiling |
+| `fixed` | A configured run/rest ratio | Workloads that need a target time share |
+| `overdraft` | Dynamic scheduling plus bounded admission borrowing while IDLE | Workloads that benefit from reducing admission stalls |
+| `spatial` | Cooperative per-process Cube/Vector budgets | Operators that honor CANN resource limits and benefit from concurrent execution |
 
-Compute-manager time scheduling applies to `dynamic`, `fixed`, and `overdraft`. With `spatial`, workers apply per-process core budgets while retaining shared HBM accounting and memory housekeeping; the manager does not schedule their compute turns.
-
-
-## Prerequisites
-- **NPU**: Ascend 910B.
-- **Shared Region**: A host directory for coordination between pods (e.g., `/tmp/hami-shared-region`).
-- **Toolchain**: Docker & Rust installed.
-
-Please follow the instructions on the official Rust website to install rust:
-**[https://rust-lang.org/tools/install/](https://rust-lang.org/tools/install/)**
+The core defaults to `spatial` with `NPU_COMPUTE_LIMIT=1`. Set the compute limit
+explicitly for your workload. Select `dynamic`, `fixed`, or `overdraft` explicitly
+to use time-based scheduling.
+The same number has different meanings across policies; it is not a universal
+throughput percentage. See the [policy guide](docs/scheduling-policies.md) for
+advantages, tradeoffs and examples.
 
 ## Build
-Use `cargo` to build inside a environment with CANN installed.
-```bash
-cd hami-vnpu-core
-cargo build
-# build in release mode: cargo build --release
+
+The release CI and local builds share [one Dockerfile](dockerfiles/Dockerfile).
+Install Git, Make, Docker and Docker Buildx, then run from the repository root:
+
+```sh
+make build-in-docker
+cd dist && sha256sum -c SHA256SUMS
 ```
 
-Artifacts Location:
-- target/debug/**libvnpu.so**: The one and only artifact. It intercepts NPU calls AND hosts the manager (via an internal supervisor thread), so this is all you build and deploy.
+This builds the complete release library against real CANN runtime/DCMI libraries
+and exports `dist/libvnpu.so`, `dist/build-info.json` and `dist/SHA256SUMS`.
+The Dockerfile uses the official `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11`
+image, pinned by digest, and Rust **1.94.0**. It downloads the official **HDK 25.5.1**
+package, verifies its SHA256 and extracts the real driver user libraries for
+linking; it does not install a kernel driver. The build environment is
+**CANN 8.5.2 on Ubuntu 22.04** and supports **Linux AMD64 and ARM64**. The Make
+target selects the host architecture by default. Select a target and separate
+output directories explicitly when building both:
 
-## Deployment
-### Host Environment preparation
-Before launching any containers, the **Global Shared Memory (SHM) Region** must be initialized on the host to allow inter-Pod coordination.
-Create the Shared Directory:
-```
-sudo mkdir -p /tmp/hami-shared-region
-sudo chmod 777 /tmp/hami-shared-region
-```
-### Container Deployment
-#### Step 1. Start Container
-- When starting the container, you must map the following:
-SHM Volume: Map the host's shared region (e.g.`/tmp/hami-shared-region`) to a container path (e.g., `/hami-shared-region`).
-- Map `libvnpu.so` into the container.
-- `--privileged` is required for Ascend NPUs to be shared between containers when start docker containers.
-
-#### Step 2. Set Environment Variables:
-- **NPU_GLOBAL_SHM_PATH** (required): Define a unique filename within the **shared region**.
-> Note: You do NOT need to create this file manually; the manager (embedded in `libvnpu.so`) handles file creation and initialization. However, the path must be identical across all Pods to allow coordination.
-
-- **NPU_MEMORY_LIMIT_MB**: Total memory limit for the Pod, in MB (1 MB = 1024 * 1024 bytes). The default is `0`, which disables the memory limit.
-
-- **NPU_COMPUTE_LIMIT**: Integer from `1` to `100`, default `1`. Its interpretation depends on `NPU_SCHED_POLICY`.
-
-- **NPU_SCHED_POLICY**: `dynamic` (default), `fixed`, `overdraft`, or `spatial`. With `dynamic`, the compute limit is a relative scheduling share and idle capacity can be borrowed; it is not a strict percentage ceiling. With `fixed`, the compute limit is the target percentage used to control the run/rest ratio. Actual limiting accuracy depends on the scheduling mechanism. `overdraft` retains Dynamic scheduling and adds the bounded IDLE borrowing described below. `spatial` configures cooperative Cube/Vector core budgets and bypasses time scheduling.
-
-The current library no longer accepts `NPU_MEM_QUOTA`, `NPU_PRIORITY`, or `NPU_FIXED_SHARE_RATIO`; setting them reports a migration error. Use the new variables above instead. The `fixed` policy corresponds to the previous fixed-share setting of `true`, while `dynamic` corresponds to `false`. Upgrade an older deployed library before using the new variables; older binaries do not recognize them.
-
-```bash
-export NPU_GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
-export NPU_MEMORY_LIMIT_MB=10240 # 10 GiB HBM
-export NPU_COMPUTE_LIMIT=20 # target 20% run/rest ratio with fixed policy
-export NPU_SCHED_POLICY=fixed
+```sh
+make build-in-docker PLATFORM=linux/amd64 OUT_DIR=dist/amd64
+make build-in-docker PLATFORM=linux/arm64 OUT_DIR=dist/arm64
 ```
 
-#### Optional Overdraft Policy
+Use a native builder for each target, or configure Docker Buildx emulation for
+the other architecture. No NPU is required to compile.
 
-`NPU_SCHED_POLICY=overdraft` builds on the normal Dynamic rotation and adds a bounded shared borrowing pool when a Pod is in `IDLE`. The policy itself enables borrowing. The removed `NPU_OVERDRAFT_ENABLED` variable is rejected with a migration error directing users to `NPU_SCHED_POLICY=overdraft`. This implements the bounded-pool direction discussed in [issue #29](https://github.com/Project-HAMi/hami-vnpu-core/issues/29). Historical ResNet results in that issue are not measurements of this implementation.
+Deploy `libvnpu.so` into a matching-architecture workload container with
+compatible CANN and host-driver libraries. The HDK driver user-library version describes the
+build environment; choose the host driver using the CANN/hardware compatibility
+requirements.
+A successful build does not establish the minimum supported CANN version or
+hardware support for every policy. See [testing and CI](docs/testing.md) for
+artifact provenance, verification and hardware-validation scope.
 
-The strategy uses internal defaults: a shared pool of `10` admission tickets, a `5000`-microsecond cumulative blocking threshold for one kernel-admission call, and a `1000`-microsecond futex polling interval. These parameters are not exposed as environment variables. Enable the strategy only through `NPU_SCHED_POLICY=overdraft`. Borrowing is permitted only while in `IDLE`; the timer does not restart on entry to `IDLE`.
+To build directly on a Linux host with Rust 1.94.0, a C compiler and real Ascend
+CANN/DCMI development libraries, initialize the installed CANN environment and
+run `cargo build --release --workspace --locked`. The library is then at
+`target/release/libvnpu.so`. Nonstandard SDK paths are covered in the
+[configuration reference](docs/configuration.md).
 
-Blocking time accumulates from entry to each kernel-admission wait, including waits on the RWLock and in `RUNNING` or `MEASURING`; changing state does not reset it. A timed-out worker can fill an empty, open pool, including after it is exhausted again in the same scheduling round. Every borrowed admission consumes one ticket, including the worker that triggers a fill. The pool holds at most `10` tickets; this is not a cumulative per-round admission limit. The `5000`-microsecond threshold applies to each waiting call, not a global refill interval: several workers that have already timed out may trigger successive fills as the pool empties. Closing the pool prevents refills until the manager opens a new round. Borrowed work is allowed only in `IDLE` and does not contribute to normal `active_workers` accounting or normal completion events. Multiple Pods may therefore execute borrowed work concurrently; the policy does not guarantee a strict compute percentage or complete fairness. Tickets count admissions, not kernel runtime or outstanding kernel execution.
+## Run an application
 
-The added shared-memory fields are appended after the existing layout so monitoring tools retain the old field offsets. This does not make old process mappings compatible with the extended layout. Before upgrading, stop all old processes in the same Pod and use a fresh `NPU_LOCAL_SHM_PATH` file (for example `/tmp/vnpu_local_shmem_overdraft_v2`). All participating processes in that Pod must use the new mapping; do not mix old and new mappings.
+First prepare an NPU-enabled Linux container with the Ascend devices and runtime
+libraries available. Mount a writable host directory at `/hami-shared-region` in
+each participating container on the node, and mount the built library at
+`/usr/local/lib/libvnpu.so`.
 
-The pool uses a non-wrapping 32-bit round tag. After approximately 4.29 billion rounds on one local shared-memory file, borrowing stays disabled while normal scheduling continues. Stop the participating processes and use a fresh local shared-memory file to restore borrowing.
+Inside the workload container:
 
-Example configuration (after preparing the shared directory and the fresh local shared-memory path):
-
-```bash
-export NPU_GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
+```sh
+# Shared file for workloads coordinating on physical card 7; use a different file for another card.
+export NPU_GLOBAL_SHM_PATH=/hami-shared-region/7_global_registry
+# Local accounting file: share it only with this group's processes and PID namespace.
+export NPU_LOCAL_SHM_PATH=/tmp/vnpu-local
 export NPU_MEMORY_LIMIT_MB=10240
-export NPU_COMPUTE_LIMIT=20
-export NPU_SCHED_POLICY=overdraft
+export NPU_COMPUTE_LIMIT=30
+export NPU_SCHED_POLICY=spatial # Default policy; shown explicitly for clarity.
+LD_PRELOAD=/usr/local/lib/libvnpu.so python3 your_model.py
 ```
 
-#### Optional Spatial Policy
+The card number identifies the physical coordination domain; the application
+still selects its container-local logical device, commonly `0`.
+`NPU_GLOBAL_SHM_PATH` remains required for manager configuration, including
+the default spatial policy.
 
-Use `NPU_SCHED_POLICY=spatial` with an explicit `NPU_COMPUTE_LIMIT` to select cooperative CANN core budgets. No additional environment variables are needed. The library sets the budget through intercepted `aclrtSetDevice` or `aclrtSetCurrentContext` calls, before resource-aware operators perform tiling. This policy bypasses normal admission tickets, IDLE borrowing, and global time rotation. The local manager still maintains the Pod's shared HBM accounting and process cleanup.
+This sets a shared HBM quota of 10 GiB and, for `spatial`, per-process core budgets
+of `ceil(physical cores × 30 / 100)`. On a 20-Cube/40-Vector device, that is 6 Cube
+and 12 Vector cores. These budgets do not reserve exclusive physical cores.
 
-Cube and Vector budgets are calculated independently as `ceil(physical_core_count * NPU_COMPUTE_LIMIT / 100)`. Every valid percentage in `1..=100` is rounded upward; no rounding-error threshold is applied. On a 20-Cube/40-Vector device, `31` gives 7 Cube and 13 Vector cores, `33` gives 7 Cube and 14 Vector cores, and the default compute setting of `1` gives 1 Cube and 1 Vector core. Configure the percentage explicitly for the intended workload.
+Use the same policy, resource settings, library version, local file and PID
+namespace for all processes participating in one local group. Independent groups must
+use different local backing files. The library creates the SHM files; do not
+precreate empty registry files. Before changing configuration or SHM layout,
+stop the group's processes and use a fresh local file. Do not truncate or remove
+files still mapped by running processes.
 
-These are per-process, per-device budgets for cooperating operators, not exclusive physical partitions. Three processes configured with `33` each have a summed budget of 21 Cube / 42 Vector cores on 20 / 40 hardware; the runtime shares the hardware. Multiple processes in one Pod each receive the configured core budget, while HBM accounting remains shared for the Pod. This policy does not enforce Pod-wide aggregate compute usage, utilization percentages, throughput ratios, or priority ordering.
+For `spatial`, select the device or context before operator initialization and
+tiling. Use spawned NPU workers after parent device initialization. See the
+[policy guide](docs/scheduling-policies.md) for operator compatibility and
+process lifecycle requirements.
 
-An operator must honor CANN device/stream resource limits for this mechanism to affect its work. Some custom operators obtain the full hardware count directly. In earlier testing, a Triton RoPE implementation used the hardware Vector count without querying the configured budget. This implementation does not rewrite kernels or reduce arbitrary launch dimensions, which could break their work partitioning. Resource-budget readback and inference throughput alone do not prove that every operator is constrained. Direct lower-level runtime resource resets bypassing the intercepted ACL APIs are not covered. Graph execution and cross-device stream use have not been qualified. NPU use in a fork child after the parent enters device initialization is refused; use spawned worker processes and select their device before operator initialization.
+## Documentation
 
-Requested spatial limits fail with exit status `78` if the required CANN APIs are unavailable, the physical resource count is zero, a budget cannot be applied, or its readback differs. After a valid device has been initialized, later application-issued setter failures retain the original CANN error return; invalid or uninitialized device requests can instead fail during budget initialization and terminate the process. Resource reset APIs reapply the configured budgets, and device resets retain the original core counts for the next initialization. When multiple devices have been initialized in one process, setting or resetting the limits of a non-default stream is refused because its device ownership cannot be verified through the supported ACL API. Use a CANN runtime supporting the intercepted device and stream resource APIs. All processes sharing a local SHM file must use the same policy, resource configuration, and PID namespace. Stop the Pod's old processes and use a fresh local SHM file when switching policies.
+| Guide | Contents |
+| --- | --- |
+| [Scheduling policies](docs/scheduling-policies.md) | Four policies, advantages, tradeoffs and selection examples |
+| [Configuration reference](docs/configuration.md) | Environment variables, defaults, units, advanced tuning and migration |
+| [Testing and CI](docs/testing.md) | Build release artifacts, reproduce CPU checks and understand their coverage |
+| [Spatial design](docs/spatial-policy.md) | Detailed implementation and historical validation evidence |
 
-`aclrtCreateContext` alone is not intercepted. Applications using it directly must explicitly select the device or the newly created context through the intercepted APIs before initializing or tiling operators. Applying a budget at a later runtime submission cannot change work already tiled with the full hardware count.
+## Development checks
 
-Historical compute-focused BF16 GEMM validation on a 20-Cube/40-Vector Ascend 910B3 measured 60% at **1.94–1.99 times** the throughput of 30% when run separately, and approximately **2 times** when both run concurrently. Separate device traces confirmed 6/12 Cube blocks and less than 0.004% own-process kernel gaps. Removing the rounding-error gate leaves these 30% and 60% budgets unchanged. The results describe the tested MatMuls; generic operator coverage and native-relative overhead require their own measurements. See [spatial design and benchmark results](docs/spatial-policy.md).
-
-```bash
-export NPU_GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
-export NPU_LOCAL_SHM_PATH="/hami-shared-region/pod-spatial"
-export NPU_MEMORY_LIMIT_MB=20480
-export NPU_COMPUTE_LIMIT=33
-export NPU_SCHED_POLICY=spatial
+```sh
+cargo fmt --all -- --check
+bash scripts/ci.sh
 ```
 
-#### Step 3. Launching the AI App:
-Just launch the AI application with the `LD_PRELOAD` environment variable pointing to the `libvnpu.so` library. The manager starts automatically inside the library (there is no separate daemon to launch), and the app's NPU calls are routed through it.
-```
-LD_PRELOAD=./target/debug/libvnpu.so python3 your_model.py
-```
+Use Rust 1.94.0 with `rustfmt` and `clippy`; run the CPU script on Linux. See
+[testing and CI](docs/testing.md) for dependencies. CI checks formatting and
+runs Clippy with warnings denied across the root workspace and all its targets.
+The CPU regression jobs use fake ACL/DCMI backends and source-linked tests for
+configuration, scheduling logic and hooks. Separate release jobs use the real
+SDK and upload verified AMD64 and ARM64 libraries. Validate NPU execution and
+workload performance separately in a compatible Ascend environment.

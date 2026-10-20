@@ -1,0 +1,4 @@
+.git
+**/target
+**/__pycache__
+dist
