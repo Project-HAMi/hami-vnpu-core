@@ -108,15 +108,15 @@ pub fn try_open_shmem<T>(path: &str) -> Option<&'static T> {
 /// The creator sizes and initializes a same-directory temporary file before publishing
 /// it with a hard link; concurrent openers never observe a partial final path.
 pub fn open_global_registry(path: &str) -> &'static GlobalRegistry {
-    if let Some(parent) = Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-                panic!(
-                    "cannot create global registry directory {}: {e}",
-                    parent.display()
-                )
-            });
-        }
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+            panic!(
+                "cannot create global registry directory {}: {e}",
+                parent.display()
+            )
+        });
     }
 
     let size = std::mem::size_of::<GlobalRegistry>();

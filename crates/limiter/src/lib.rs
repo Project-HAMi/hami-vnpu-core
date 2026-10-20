@@ -19,7 +19,7 @@ fn init_logger() {
 #[macro_export]
 macro_rules! check_rts {
     ($call:expr) => {{
-        let ret = unsafe { $call } as u32; // Cast the result to `u32`.
+        let ret = $call as u32; // Unsafe calls must be acknowledged at the call site.
         if ret != 0 {
             println!(
                 "RTS error: {}, from file '{}', line {} - function: `{}`",

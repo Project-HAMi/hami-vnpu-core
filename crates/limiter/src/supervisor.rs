@@ -112,21 +112,21 @@ fn try_become_manager(local: &LocalContainerShmem, my_pid: i32) -> Option<i32> {
     if owner == my_pid {
         return Some(0);
     }
-    if owner != 0 && !manager_alive(local, owner) {
-        if local
+    if owner != 0
+        && !manager_alive(local, owner)
+        && local
             .manager_pid
             .compare_exchange(owner, my_pid, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
-        {
-            local
-                .manager_heartbeat
-                .store(get_time_us(), Ordering::Release);
-            warn!(
-                "[Supervisor PID:{}] took over from dead/stale manager {}",
-                my_pid, owner
-            );
-            return Some(owner);
-        }
+    {
+        local
+            .manager_heartbeat
+            .store(get_time_us(), Ordering::Release);
+        warn!(
+            "[Supervisor PID:{}] took over from dead/stale manager {}",
+            my_pid, owner
+        );
+        return Some(owner);
     }
     None
 }

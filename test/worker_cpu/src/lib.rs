@@ -2,7 +2,7 @@
 mod wait_observer;
 extern crate self as limiter;
 #[macro_export]
-macro_rules! check_rts { ($call:expr) => {{ (unsafe { $call }) as u32 }}; }
+macro_rules! check_rts { ($call:expr) => {{ ($call) as u32 }}; }
 macro_rules! passthrough {
     ($name:literal, ($($kind:ty),*), $($arg:expr),*) => {
         crate::native($name, &[$($arg as u64),*])

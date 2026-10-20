@@ -105,13 +105,13 @@ fn memory_query_preserves_reconciliation_and_128mib_overhead() {
     c.inner.shmem.memory_used.store(1, Ordering::Release); // Existing reconciliation must still run.
     proc_mock::set(&[(me(), Answer::Unreadable), (other(1), Answer::Live)]);
     let (mut free, mut total) = (usize::MAX, usize::MAX);
-    c.get_hbm_info(&mut free, &mut total);
+    unsafe { c.get_hbm_info(&mut free, &mut total) };
     assert_eq!(512 * MIB as usize, total);
     assert_eq!(156 * MIB as usize, free);
     assert_eq!(228 * MIB, c.inner.shmem.memory_used.load(Ordering::Acquire));
     assert_eq!(vec![other(1)], proc_mock::calls());
     c.inner.shmem.procs[0].hbm_used[0].store(470 * MIB, Ordering::Release);
-    c.get_hbm_info(&mut free, &mut total);
+    unsafe { c.get_hbm_info(&mut free, &mut total) };
     assert_eq!(512 * MIB as usize, total);
     assert_eq!(0, free); // 14MiB logical free still reports zero after 128MiB overhead.
     assert_compute_unchanged(c.inner.shmem);

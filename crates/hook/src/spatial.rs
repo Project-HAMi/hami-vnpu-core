@@ -231,7 +231,9 @@ pub fn set_device(device: i32) -> i32 {
     rc
 }
 
-pub fn set_context(context: *mut c_void) -> i32 {
+/// # Safety
+/// `context` must be a valid live CANN context handle.
+pub unsafe fn set_context(context: *mut c_void) -> i32 {
     let real: unsafe extern "C" fn(*mut c_void) -> i32 =
         unsafe { symbol(c"aclrtSetCurrentContext") };
     if internal() || !enabled() {
@@ -263,10 +265,10 @@ pub fn reset_device(device: i32, force: bool) -> i32 {
     let _internal = InternalGuard::enter();
     let mut map = devices(policy);
     let rc = unsafe { real(device) };
-    if rc == 0 {
-        if let Some(budget) = map.get_mut(&device) {
-            budget.applied = false;
-        }
+    if rc == 0
+        && let Some(budget) = map.get_mut(&device)
+    {
+        budget.applied = false;
     }
     rc
 }
@@ -319,7 +321,10 @@ fn stream_device(map: &HashMap<i32, Budget>, stream: *mut c_void) -> i32 {
     device
 }
 
-pub fn set_stream_resource(stream: *mut c_void, resource: i32, value: u32) -> i32 {
+/// # Safety
+/// `stream` must be a valid live stream for the current context, or null for the
+/// default stream as permitted by CANN.
+pub unsafe fn set_stream_resource(stream: *mut c_void, resource: i32, value: u32) -> i32 {
     let real: StreamSet = unsafe { symbol(c"aclrtSetStreamResLimit") };
     if internal() || !enabled() || !(CUBE..=VECTOR).contains(&resource) {
         return unsafe { real(stream, resource, value) };
@@ -341,7 +346,10 @@ pub fn set_stream_resource(stream: *mut c_void, resource: i32, value: u32) -> i3
     rc
 }
 
-pub fn reset_stream_resources(stream: *mut c_void) -> i32 {
+/// # Safety
+/// `stream` must be a valid live stream for the current context, or null for the
+/// default stream as permitted by CANN.
+pub unsafe fn reset_stream_resources(stream: *mut c_void) -> i32 {
     let real: unsafe extern "C" fn(*mut c_void) -> i32 =
         unsafe { symbol(c"aclrtResetStreamResLimit") };
     if internal() || !enabled() {

@@ -360,8 +360,8 @@ impl ContainerManager {
                     .is_active
                     .load(Ordering::Relaxed)
                     == 1;
-            if !owner_active {
-                if self
+            if !owner_active
+                && self
                     .global
                     .lock_owner
                     .compare_exchange(
@@ -371,10 +371,9 @@ impl ContainerManager {
                         Ordering::Relaxed,
                     )
                     .is_ok()
-                {
-                    self.update_heartbeat();
-                    return;
-                }
+            {
+                self.update_heartbeat();
+                return;
             }
 
             let last_heartbeat = self.global.lock_timestamp.load(Ordering::Relaxed);
@@ -720,11 +719,7 @@ impl ContainerManager {
         if participants == 0 {
             return (0, 0);
         }
-        let total_duration = if global_end > global_start {
-            global_end - global_start
-        } else {
-            0
-        };
+        let total_duration = global_end.saturating_sub(global_start);
         // Use the actual tokens consumed (post-scale) so averages are per real token.
         let tokens_used = tokens_for_stats;
 

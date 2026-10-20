@@ -3,10 +3,7 @@ use std::sync::LazyLock;
 static REAL_SIGACTION: LazyLock<
     extern "C" fn(libc::c_int, *const libc::sigaction, *mut libc::sigaction) -> libc::c_int,
 > = LazyLock::new(|| unsafe {
-    let ptr = libc::dlsym(
-        libc::RTLD_NEXT,
-        b"sigaction\0".as_ptr() as *const libc::c_char,
-    );
+    let ptr = libc::dlsym(libc::RTLD_NEXT, c"sigaction".as_ptr());
     if ptr.is_null() {
         panic!("Cannot find original sigaction function!");
     }

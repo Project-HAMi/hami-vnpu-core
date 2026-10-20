@@ -2,7 +2,7 @@
 include!(concat!(env!("OUT_DIR"), "/source.rs"));
 pub mod shmem { include!(concat!(env!("OUT_DIR"), "/shared.rs")); }
 #[macro_export]
-macro_rules! check_rts { ($call:expr) => {{ (unsafe { $call }) as u32 }}; }
+macro_rules! check_rts { ($call:expr) => {{ ($call) as u32 }}; }
 pub mod externed_api {
     pub const RT_ERROR_NONE: u64 = 0;
     pub const RT_ERROR_MEMORY_ALLOCATION: u64 = 207001;

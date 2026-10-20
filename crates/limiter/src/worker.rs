@@ -71,6 +71,12 @@ impl fmt::Debug for SchedulerClientInner {
     }
 }
 
+impl Default for SchedulerClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SchedulerClient {
     /// Initialized ONCE per NPUDeviceList (per process/device)
     pub fn new() -> Self {
@@ -83,10 +89,9 @@ impl SchedulerClient {
         let shmem = loop {
             if let Some(s) =
                 shmem::setup::try_open_shmem::<LocalContainerShmem>(shmem_path.as_str())
+                && s.initialized.load(Ordering::Acquire) == 1
             {
-                if s.initialized.load(Ordering::Acquire) == 1 {
-                    break s;
-                }
+                break s;
             }
             if Instant::now() >= deadline {
                 panic!(
@@ -232,10 +237,10 @@ impl SchedulerClient {
         let mut end_event: u64 = 0;
         let mut tracking_event: u64 = 0;
 
-        check_rts!(rtStreamCreate(&mut internal_stream, 0));
-        check_rts!(rtEventCreate(&mut start_event));
-        check_rts!(rtEventCreate(&mut end_event));
-        check_rts!(rtEventCreate(&mut tracking_event));
+        check_rts!(unsafe { rtStreamCreate(&mut internal_stream, 0) });
+        check_rts!(unsafe { rtEventCreate(&mut start_event) });
+        check_rts!(unsafe { rtEventCreate(&mut end_event) });
+        check_rts!(unsafe { rtEventCreate(&mut tracking_event) });
 
         InnerLock {
             internal_stream,
@@ -363,7 +368,9 @@ impl SchedulerClient {
                             lock.start_time_us = now_us;
 
                             // GPU Start Event (Internal Stream)
-                            check_rts!(rtEventRecord(lock.start_event, lock.internal_stream));
+                            check_rts!(unsafe {
+                                rtEventRecord(lock.start_event, lock.internal_stream)
+                            });
                         }
 
                         return; // -> Kernel Launch
@@ -444,17 +451,15 @@ impl SchedulerClient {
         if lock.last_user_stream != 0 {
             let mut status: u32 = 0;
             let mut model: u64 = 0;
-            let _ = check_rts!(rtStreamGetCaptureInfo(
-                lock.last_user_stream,
-                &mut status,
-                &mut model
-            ));
+            let _ = check_rts!(unsafe {
+                rtStreamGetCaptureInfo(lock.last_user_stream, &mut status, &mut model)
+            });
             if status != 0 {
                 debug!(
                     "[Limiter] stream 0x{:x} is capturing; using device sync timing.",
                     lock.last_user_stream
                 );
-                check_rts!(rtDeviceSynchronize());
+                check_rts!(unsafe { rtDeviceSynchronize() });
                 if lock.start_time_us != 0 {
                     duration_us = get_time_us().saturating_sub(lock.start_time_us);
                 }
@@ -465,7 +470,7 @@ impl SchedulerClient {
         // If there is no user stream, fall back to device sync + wall-clock.
         if !used_wall_clock && lock.last_user_stream == 0 {
             debug!("[Limiter] no last user stream; using device sync timing.");
-            check_rts!(rtDeviceSynchronize());
+            check_rts!(unsafe { rtDeviceSynchronize() });
             if lock.start_time_us != 0 {
                 duration_us = get_time_us().saturating_sub(lock.start_time_us);
             }
@@ -473,16 +478,12 @@ impl SchedulerClient {
         }
 
         if !used_wall_clock {
-            check_rts!(rtEventRecord(lock.tracking_event, lock.last_user_stream));
-            check_rts!(rtStreamWaitEvent(lock.internal_stream, lock.tracking_event));
-            check_rts!(rtEventRecord(lock.end_event, lock.internal_stream));
-            check_rts!(rtStreamSynchronize(lock.internal_stream));
+            check_rts!(unsafe { rtEventRecord(lock.tracking_event, lock.last_user_stream) });
+            check_rts!(unsafe { rtStreamWaitEvent(lock.internal_stream, lock.tracking_event) });
+            check_rts!(unsafe { rtEventRecord(lock.end_event, lock.internal_stream) });
+            check_rts!(unsafe { rtStreamSynchronize(lock.internal_stream) });
             let mut ms: f32 = 0.0;
-            check_rts!(rtEventElapsedTime(
-                &mut ms,
-                lock.start_event,
-                lock.end_event
-            ));
+            check_rts!(unsafe { rtEventElapsedTime(&mut ms, lock.start_event, lock.end_event) });
             duration_us = (ms * 1000.0) as u64;
         }
 
@@ -680,20 +681,21 @@ impl SchedulerClient {
         device_total
     }
 
-    pub fn get_hbm_info(&self, free: *mut usize, total: *mut usize) {
+    /// Write the quota-adjusted free and total HBM sizes to the output pointers.
+    ///
+    /// # Safety
+    /// `free` and `total` must be aligned, writable pointers to `usize` values
+    /// for the duration of this call, with no concurrent access to those values.
+    pub unsafe fn get_hbm_info(&self, free: *mut usize, total: *mut usize) {
         let shmem = self.inner.shmem;
 
         let quota = shmem.memory_limit.load(Ordering::Relaxed) as usize;
         let used = self.recalculate_usage_for_device(self.current_device()) as usize;
-        let overhead_bytes = (VIRTUAL_OVERHEAD_MB * 1024 * 1024) as usize;
+        let overhead_bytes = VIRTUAL_OVERHEAD_MB * 1024 * 1024;
 
-        let logical_free = if quota > used { quota - used } else { 0 };
+        let logical_free = quota.saturating_sub(used);
 
-        let reported_free = if logical_free > overhead_bytes {
-            logical_free - overhead_bytes
-        } else {
-            0
-        };
+        let reported_free = logical_free.saturating_sub(overhead_bytes);
 
         unsafe {
             *total = quota;

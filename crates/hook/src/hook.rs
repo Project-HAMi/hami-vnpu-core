@@ -13,7 +13,7 @@ pub extern "C" fn rtAicpuKernelLaunchExWithArgs(
     flags: u32,
 ) -> u64 {
     npu_limiter().wait_for_token(stm);
-    return passthrough!(
+    passthrough!(
         "rtAicpuKernelLaunchExWithArgs",
         (u32, u64, u32, u64, u64, u64, u32),
         kernelType,
@@ -23,7 +23,7 @@ pub extern "C" fn rtAicpuKernelLaunchExWithArgs(
         smDesc,
         stm,
         flags
-    );
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -36,7 +36,7 @@ pub extern "C" fn rtAicpuKernelLaunchWithFlag(
     flags: u32,
 ) -> u64 {
     npu_limiter().wait_for_token(stm);
-    return passthrough!(
+    passthrough!(
         "rtAicpuKernelLaunchWithFlag",
         (u64, u32, u64, u64, u64, u32),
         launchNames,
@@ -45,7 +45,7 @@ pub extern "C" fn rtAicpuKernelLaunchWithFlag(
         smDesc,
         stm,
         flags
-    );
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -59,7 +59,7 @@ pub extern "C" fn rtKernelLaunchWithFlagV2(
     cfgInfo: u64,
 ) -> u64 {
     npu_limiter().wait_for_token(stm);
-    return passthrough!(
+    passthrough!(
         "rtKernelLaunchWithFlagV2",
         (u64, u32, u64, u64, u64, u32, u64),
         stubFunc,
@@ -69,7 +69,7 @@ pub extern "C" fn rtKernelLaunchWithFlagV2(
         stm,
         flags,
         cfgInfo
-    );
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -83,7 +83,7 @@ pub extern "C" fn rtKernelLaunchWithHandleV2(
     cfgInfo: u64,
 ) -> u64 {
     npu_limiter().wait_for_token(stm);
-    return passthrough!(
+    passthrough!(
         "rtKernelLaunchWithHandleV2",
         (u64, u64, u32, u64, u64, u64, u64),
         handle,
@@ -93,13 +93,13 @@ pub extern "C" fn rtKernelLaunchWithHandleV2(
         smDesc,
         stm,
         cfgInfo
-    );
+    )
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtModelExecute(mdl: u64, stm: u64, flag: u32) -> u64 {
     npu_limiter().wait_for_token(stm);
-    return passthrough!("rtModelExecute", (u64, u64, u32), mdl, stm, flag);
+    passthrough!("rtModelExecute", (u64, u64, u32), mdl, stm, flag)
 }
 
 #[unsafe(no_mangle)]
@@ -123,7 +123,7 @@ pub extern "C" fn rtMalloc(devPtr: u64, size: u64, t: u32, moduleId: u16) -> u64
         }
     }
 
-    return passthrough!("rtMalloc", (u64, u64, u32, u16), devPtr, size, t, moduleId);
+    passthrough!("rtMalloc", (u64, u64, u32, u16), devPtr, size, t, moduleId)
 }
 
 #[unsafe(no_mangle)]
@@ -154,14 +154,14 @@ pub extern "C" fn rtMallocPhysical(handle: u64, size: u64, prop: u64, flags: u64
         }
     }
 
-    return passthrough!(
+    passthrough!(
         "rtMallocPhysical",
         (u64, u64, u64, u64),
         handle,
         size,
         prop,
         flags
-    );
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -172,7 +172,7 @@ pub extern "C" fn rtFreePhysical(handle: u64) -> u64 {
         client.post_free_hbm(handle, ret);
     }
 
-    return ret;
+    ret
 }
 
 #[unsafe(no_mangle)]
@@ -183,23 +183,29 @@ pub extern "C" fn rtFree(ptr: u64) -> u64 {
         client.post_free_hbm(ptr, ret);
     }
 
-    return ret;
+    ret
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rtMemGetInfoEx(memInfoType: u64, free: *mut usize, total: *mut usize) -> u64 {
+/// # Safety
+/// `free` and `total` must satisfy the CANN API's writable output-pointer contract.
+pub unsafe extern "C" fn rtMemGetInfoEx(
+    memInfoType: u64,
+    free: *mut usize,
+    total: *mut usize,
+) -> u64 {
     let client = npu_limiter();
     if client.is_hbm_limited() {
-        client.get_hbm_info(free, total);
+        unsafe { client.get_hbm_info(free, total) };
         return 0;
     }
-    return passthrough!(
+    passthrough!(
         "rtMemGetInfoEx",
         (u64, *mut usize, *mut usize),
         memInfoType,
         free,
         total
-    );
+    )
 }
 
 // ACL ABI from CANN 9.1 acl_rt.h; resource enums and aclError are C ints.
@@ -209,8 +215,10 @@ pub extern "C" fn aclrtSetDevice(device: i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn aclrtSetCurrentContext(context: *mut std::ffi::c_void) -> i32 {
-    crate::spatial::set_context(context)
+/// # Safety
+/// `context` must be a valid live CANN context handle.
+pub unsafe extern "C" fn aclrtSetCurrentContext(context: *mut std::ffi::c_void) -> i32 {
+    unsafe { crate::spatial::set_context(context) }
 }
 
 #[unsafe(no_mangle)]
@@ -234,15 +242,21 @@ pub extern "C" fn aclrtResetDeviceResLimit(device: i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn aclrtSetStreamResLimit(
+/// # Safety
+/// `stream` must be a valid live stream for the current context, or null for the
+/// default stream as permitted by CANN.
+pub unsafe extern "C" fn aclrtSetStreamResLimit(
     stream: *mut std::ffi::c_void,
     resource: i32,
     value: u32,
 ) -> i32 {
-    crate::spatial::set_stream_resource(stream, resource, value)
+    unsafe { crate::spatial::set_stream_resource(stream, resource, value) }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn aclrtResetStreamResLimit(stream: *mut std::ffi::c_void) -> i32 {
-    crate::spatial::reset_stream_resources(stream)
+/// # Safety
+/// `stream` must be a valid live stream for the current context, or null for the
+/// default stream as permitted by CANN.
+pub unsafe extern "C" fn aclrtResetStreamResLimit(stream: *mut std::ffi::c_void) -> i32 {
+    unsafe { crate::spatial::reset_stream_resources(stream) }
 }
