@@ -7,10 +7,12 @@ HAMi-vnpu-core is the in-container resource controller for Ascend NPU, written i
 
 HAMi-vnpu-core has the following features:
 1. Virtualize device meory
-2. Limit npu utilization by time shard
+2. Limit NPU compute through time scheduling or cooperative Cube/Vector budgets
 
 ## Components
-- **libvnpu.so (Interceptor + Manager)**: A dynamic library (`.so`) that intercepts NPU RTS API calls from AI frameworks to enforce constraints. On load it also spawns a lightweight **supervisor thread**. The supervisors of all processes in a Pod elect a single **Manager** that enforces the **Total Memory Quota** and **Compute Utilization** for that Pod. If the process hosting the manager exits or crashes, another process in the Pod automatically takes over. No separate daemon needs to be started.
+- **libvnpu.so (Interceptor + Manager)**: A dynamic library (`.so`) that intercepts NPU RTS API calls from AI frameworks. A lightweight **supervisor thread** starts lazily on the first use of an intercepted RTS path. Processes sharing a Pod's local SHM and PID namespace elect a **Manager** for shared HBM accounting and, with time-based policies, compute scheduling. Another participating process can take over after the manager exits or its heartbeat expires. No separate daemon needs to be started.
+
+Compute-manager time scheduling applies to `dynamic`, `fixed`, and `overdraft`. With `spatial`, workers apply per-process core budgets while retaining shared HBM accounting and memory housekeeping; the manager does not schedule their compute turns.
 
 
 ## Prerequisites
@@ -55,7 +57,7 @@ SHM Volume: Map the host's shared region (e.g.`/tmp/hami-shared-region`) to a co
 
 - **NPU_COMPUTE_LIMIT**: Integer from `1` to `100`, default `1`. Its interpretation depends on `NPU_SCHED_POLICY`.
 
-- **NPU_SCHED_POLICY**: `dynamic` (default), `fixed`, or `overdraft`. With `dynamic`, the compute limit is a relative scheduling share and idle capacity can be borrowed; it is not a strict percentage ceiling. With `fixed`, the compute limit is the target percentage used to control the run/rest ratio. Actual limiting accuracy depends on the scheduling mechanism. `overdraft` retains Dynamic scheduling and adds the bounded IDLE borrowing described below.
+- **NPU_SCHED_POLICY**: `dynamic` (default), `fixed`, `overdraft`, or `spatial`. With `dynamic`, the compute limit is a relative scheduling share and idle capacity can be borrowed; it is not a strict percentage ceiling. With `fixed`, the compute limit is the target percentage used to control the run/rest ratio. Actual limiting accuracy depends on the scheduling mechanism. `overdraft` retains Dynamic scheduling and adds the bounded IDLE borrowing described below. `spatial` configures cooperative Cube/Vector core budgets and bypasses time scheduling.
 
 The current library no longer accepts `NPU_MEM_QUOTA`, `NPU_PRIORITY`, or `NPU_FIXED_SHARE_RATIO`; setting them reports a migration error. Use the new variables above instead. The `fixed` policy corresponds to the previous fixed-share setting of `true`, while `dynamic` corresponds to `false`. Upgrade an older deployed library before using the new variables; older binaries do not recognize them.
 
@@ -85,6 +87,30 @@ export NPU_GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
 export NPU_MEMORY_LIMIT_MB=10240
 export NPU_COMPUTE_LIMIT=20
 export NPU_SCHED_POLICY=overdraft
+```
+
+#### Optional Spatial Policy
+
+Use `NPU_SCHED_POLICY=spatial` with an explicit `NPU_COMPUTE_LIMIT` to select cooperative CANN core budgets. No additional environment variables are needed. The library sets the budget through intercepted `aclrtSetDevice` or `aclrtSetCurrentContext` calls, before resource-aware operators perform tiling. This policy bypasses normal admission tickets, IDLE borrowing, and global time rotation. The local manager still maintains the Pod's shared HBM accounting and process cleanup.
+
+Cube and Vector budgets are calculated independently as `ceil(physical_core_count * NPU_COMPUTE_LIMIT / 100)`. Every valid percentage in `1..=100` is rounded upward; no rounding-error threshold is applied. On a 20-Cube/40-Vector device, `31` gives 7 Cube and 13 Vector cores, `33` gives 7 Cube and 14 Vector cores, and the default compute setting of `1` gives 1 Cube and 1 Vector core. Configure the percentage explicitly for the intended workload.
+
+These are per-process, per-device budgets for cooperating operators, not exclusive physical partitions. Three processes configured with `33` each have a summed budget of 21 Cube / 42 Vector cores on 20 / 40 hardware; the runtime shares the hardware. Multiple processes in one Pod each receive the configured core budget, while HBM accounting remains shared for the Pod. This policy does not enforce Pod-wide aggregate compute usage, utilization percentages, throughput ratios, or priority ordering.
+
+An operator must honor CANN device/stream resource limits for this mechanism to affect its work. Some custom operators obtain the full hardware count directly. In earlier testing, a Triton RoPE implementation used the hardware Vector count without querying the configured budget. This implementation does not rewrite kernels or reduce arbitrary launch dimensions, which could break their work partitioning. Resource-budget readback and inference throughput alone do not prove that every operator is constrained. Direct lower-level runtime resource resets bypassing the intercepted ACL APIs are not covered. Graph execution and cross-device stream use have not been qualified. NPU use in a fork child after the parent enters device initialization is refused; use spawned worker processes and select their device before operator initialization.
+
+Requested spatial limits fail with exit status `78` if the required CANN APIs are unavailable, the physical resource count is zero, a budget cannot be applied, or its readback differs. After a valid device has been initialized, later application-issued setter failures retain the original CANN error return; invalid or uninitialized device requests can instead fail during budget initialization and terminate the process. Resource reset APIs reapply the configured budgets, and device resets retain the original core counts for the next initialization. When multiple devices have been initialized in one process, setting or resetting the limits of a non-default stream is refused because its device ownership cannot be verified through the supported ACL API. Use a CANN runtime supporting the intercepted device and stream resource APIs. All processes sharing a local SHM file must use the same policy, resource configuration, and PID namespace. Stop the Pod's old processes and use a fresh local SHM file when switching policies.
+
+`aclrtCreateContext` alone is not intercepted. Applications using it directly must explicitly select the device or the newly created context through the intercepted APIs before initializing or tiling operators. Applying a budget at a later runtime submission cannot change work already tiled with the full hardware count.
+
+Historical compute-focused BF16 GEMM validation on a 20-Cube/40-Vector Ascend 910B3 measured 60% at **1.94–1.99 times** the throughput of 30% when run separately, and approximately **2 times** when both run concurrently. Separate device traces confirmed 6/12 Cube blocks and less than 0.004% own-process kernel gaps. Removing the rounding-error gate leaves these 30% and 60% budgets unchanged. The results describe the tested MatMuls; generic operator coverage and native-relative overhead require their own measurements. See [spatial design and benchmark results](docs/spatial-policy.md).
+
+```bash
+export NPU_GLOBAL_SHM_PATH="/hami-shared-region/global_registry"
+export NPU_LOCAL_SHM_PATH="/hami-shared-region/pod-spatial"
+export NPU_MEMORY_LIMIT_MB=20480
+export NPU_COMPUTE_LIMIT=33
+export NPU_SCHED_POLICY=spatial
 ```
 
 #### Step 3. Launching the AI App:

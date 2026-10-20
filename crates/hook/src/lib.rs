@@ -46,9 +46,16 @@ static LIMITER: process::ProcessLocal<SchedulerClient> = process::ProcessLocal::
 pub fn npu_limiter() -> &'static SchedulerClient {
     let pid = std::process::id();
     ensure_supervisor(pid as i32);
+    // ACL selection applies limits before tiling. Also check runtime-only users
+    // and reset/device changes before an intercepted allocation or submission.
+    spatial::ensure_current_device();
     LIMITER.get_or_init(pid, || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(SchedulerClient::new))
             .unwrap_or_else(|e| {
+                if spatial::enabled() {
+                    eprintln!("[hami-vnpu-core] spatial worker initialization failed (PID {pid}): {e:?}");
+                    unsafe { libc::_exit(78) };
+                }
                 log::warn!("SchedulerClient init failed (PID {}), using stub: {:?}", pid, e);
                 SchedulerClient::stub()
             })
@@ -74,4 +81,5 @@ macro_rules! passthrough {
 
 mod hook;
 mod process;
+pub mod spatial;
 mod signal_compat;

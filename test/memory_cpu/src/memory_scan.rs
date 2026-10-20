@@ -35,6 +35,19 @@ fn me() -> i32 { std::process::id() as i32 }
 fn other(offset: i32) -> i32 { me().checked_add(100_000 + offset).unwrap() }
 
 #[test]
+fn spatial_compute_bypass_preserves_memory_quota_reservation_and_rejection() {
+    let mut c = client(1000, 600);
+    Arc::get_mut(&mut c.inner).unwrap().sched_policy = SchedPolicy::Spatial;
+    c.wait_for_token(99);
+    assert!(c.is_hbm_limited());
+    assert_eq!(c.check_memory_quota(401), RT_ERROR_MEMORY_ALLOCATION);
+    assert_eq!(c.inner.shmem.memory_used.load(Ordering::Acquire), 600);
+    assert_eq!(c.check_memory_quota(400), 0);
+    assert_eq!(c.inner.shmem.memory_used.load(Ordering::Acquire), 1000);
+    assert_compute_unchanged(c.inner.shmem);
+}
+
+#[test]
 fn self_proc_error_is_not_queried_or_misreaped() {
     let c = client(100, 40);
     proc_mock::set(&[(me(), Answer::Unreadable)]);

@@ -146,7 +146,8 @@ pub struct ContainerManager {
     global: &'static GlobalRegistry,
     local: &'static LocalContainerShmem,
     my_pid: i32,
-    my_global_idx: usize,
+    // Spatial managers only maintain Pod memory state and never own a compute slot.
+    my_global_idx: Option<usize>,
     current_avg_us: u64,
     compute_limit: f64,
     token_scale: f64,
@@ -157,13 +158,17 @@ pub struct ContainerManager {
 
 impl ContainerManager {
     pub fn new(global: &'static GlobalRegistry, local: &'static LocalContainerShmem, pid: i32, config: ManagerConfig) -> Option<Self> {
-        let idx = Self::register_global_slot(global, pid)?;
+        let sched_policy = config.sched_policy;
+        let idx = if sched_policy.is_time_sliced() {
+            Some(Self::register_global_slot(global, pid)?)
+        } else {
+            None
+        };
 
         // TODO: Refactor
         let token_scale = std::env::var("NPU_TOKEN_SCALE").unwrap_or_else(|_| "100.0".to_string()).parse::<f64>().unwrap_or(1.0).max(0.1);
         // Faster EMA by default.
         let ema_alpha = std::env::var("NPU_AVG_ALPHA").unwrap_or_else(|_| "0.7".to_string()).parse::<f64>().unwrap_or(0.7).clamp(0.05, 0.95);
-        let sched_policy = config.sched_policy;
 
         // default value
         let compute_limit = f64::from(config.compute_limit);
@@ -178,12 +183,19 @@ impl ContainerManager {
         local.overdraft_poll_interval_us.store(config.overdraft.poll_interval_us, Ordering::Relaxed);
 
         info!(
-            "[Manager] Registered as Global Manager #{} (PID: {}). Compute limit: {}%, Memory limit: {} MB, Policy: {}",
+            "[Manager] Global compute slot: {:?} (PID: {}). Compute limit: {}%, Memory limit: {} MB, Policy: {}",
             idx, pid, compute_limit, memory_limit, sched_policy.as_str()
         );
 
-        // Publish the configured scheduling share for diagnostics
-        global.slots[idx].compute_limit.store(compute_limit as u64, Ordering::Release);
+        if let Some(idx) = idx {
+            // Publish the configured scheduling share for diagnostics.
+            global.slots[idx].compute_limit.store(compute_limit as u64, Ordering::Release);
+        } else {
+            local.tokens_remaining.store(0, Ordering::Relaxed);
+            local.active_workers.store(0, Ordering::Relaxed);
+            local.reported_count.store(0, Ordering::Relaxed);
+            local.state.store(STATE_IDLE, Ordering::Release);
+        }
 
         let memory_limit_bytes = memory_limit.saturating_mul(MB_TO_BYTES);
 
@@ -192,7 +204,7 @@ impl ContainerManager {
             local.memory_used.store(0, Ordering::Relaxed);
         }
         local.compute_limit.store(compute_limit as u64, Ordering::Relaxed);
-        local.manager_global_idx.store(idx as i32, Ordering::Release);
+        local.manager_global_idx.store(idx.map_or(-1, |idx| idx as i32), Ordering::Release);
         local.initialized.store(1, Ordering::Release);
 
         Some(Self {
@@ -244,6 +256,15 @@ impl ContainerManager {
             }
         });
 
+        if !self.sched_policy.is_time_sliced() {
+            // Keep shared memory and process housekeeping alive without joining
+            // the compute queue or changing another Pod's global turn.
+            loop {
+                self.update_heartbeat();
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+
         self.join_global_queue();
 
         loop {
@@ -264,21 +285,23 @@ impl ContainerManager {
     }
 
     fn join_global_queue(&self) {
+        let Some(my_idx) = self.my_global_idx else { return; };
         let tail = self.global.queue_tail.fetch_add(1, Ordering::SeqCst) as usize;
         let slot_idx = tail % MAX_MANAGERS;
-        self.global.queue[slot_idx].store(self.my_global_idx as u32, Ordering::Release);
+        self.global.queue[slot_idx].store(my_idx as u32, Ordering::Release);
     }
 
     fn wait_for_global_turn(&self) {
+        let Some(my_idx) = self.my_global_idx else { return; };
         loop {
             let owner_idx = self.global.lock_owner.load(Ordering::Acquire);
-            if owner_idx == self.my_global_idx as u32 { return; }
+            if owner_idx == my_idx as u32 { return; }
 
             // If the recorded owner is invalid or already marked inactive, claim immediately.
             let owner_active = (owner_idx as usize) < MAX_MANAGERS
                 && self.global.slots[owner_idx as usize].is_active.load(Ordering::Relaxed) == 1;
             if !owner_active {
-                if self.global.lock_owner.compare_exchange(owner_idx, self.my_global_idx as u32, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                if self.global.lock_owner.compare_exchange(owner_idx, my_idx as u32, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
                     self.update_heartbeat();
                     return;
                 }
@@ -292,20 +315,21 @@ impl ContainerManager {
                 if (owner_idx as usize) < MAX_MANAGERS {
                     self.global.slots[owner_idx as usize].is_active.store(0, Ordering::Relaxed);
                 }
-                if self.global.lock_owner.compare_exchange(owner_idx, self.my_global_idx as u32, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                if self.global.lock_owner.compare_exchange(owner_idx, my_idx as u32, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
                     self.update_heartbeat();
                     return; 
                 }
             }
 
             let current_sig = self.global.signal_counter.load(Ordering::Relaxed);
-            if self.global.lock_owner.load(Ordering::Relaxed) == self.my_global_idx as u32 { return; }
+            if self.global.lock_owner.load(Ordering::Relaxed) == my_idx as u32 { return; }
 
             futex::wait_timeout(&self.global.signal_counter, current_sig, GLOBAL_WAIT_POLL_US);
         }
     }
 
     fn pass_baton(&self) {
+        let Some(my_idx) = self.my_global_idx else { return; };
         // Re-enqueue ourselves before handing off to guarantee the next slot is initialized.
         self.join_global_queue();
 
@@ -313,7 +337,7 @@ impl ContainerManager {
         let mut next_head = self.global.queue_head.load(Ordering::Relaxed) as usize + 1;
 
         // Default to self; the scan may also select our own re-enqueued slot.
-        let mut next_manager_idx = self.my_global_idx as u32; 
+        let mut next_manager_idx = my_idx as u32;
         for _ in 0..MAX_MANAGERS {
             let slot_idx = next_head % MAX_MANAGERS;
             let candidate = self.global.queue[slot_idx].load(Ordering::Acquire);
@@ -583,6 +607,7 @@ impl ContainerManager {
     }
 
     fn update_local_stats(&mut self, duration_us: u64, tokens: u64) {
+        let Some(my_idx) = self.my_global_idx else { return; };
         if tokens == 0 { return; }
         let new_avg = duration_us / tokens;
         // Clamp swings but allow faster adaptation.
@@ -592,8 +617,8 @@ impl ContainerManager {
         let alpha = self.ema_alpha;
         self.current_avg_us = ((self.current_avg_us as f64 * (1.0 - alpha)) + (clamped_avg as f64 * alpha)) as u64;
         
-        self.global.slots[self.my_global_idx].avg_kernel_time.store(self.current_avg_us, Ordering::Relaxed);
-        self.global.slots[self.my_global_idx].last_heartbeat.store(get_time_us(), Ordering::Relaxed);
+        self.global.slots[my_idx].avg_kernel_time.store(self.current_avg_us, Ordering::Relaxed);
+        self.global.slots[my_idx].last_heartbeat.store(get_time_us(), Ordering::Relaxed);
     }
 
     fn schedule_rest_wait(&mut self, rest_wait_us: u64) {
@@ -610,8 +635,10 @@ impl ContainerManager {
     
     fn update_heartbeat(&self) {
         let now = get_time_us();
-        self.global.lock_timestamp.store(now, Ordering::Relaxed);
-        self.global.slots[self.my_global_idx].last_heartbeat.store(now, Ordering::Relaxed);
+        if let Some(my_idx) = self.my_global_idx {
+            self.global.lock_timestamp.store(now, Ordering::Relaxed);
+            self.global.slots[my_idx].last_heartbeat.store(now, Ordering::Relaxed);
+        }
         // Local heartbeat so a same-pod supervisor can detect this manager dying.
         self.local.manager_heartbeat.store(now, Ordering::Relaxed);
     }
@@ -620,7 +647,9 @@ impl ContainerManager {
 impl Drop for ContainerManager {
     fn drop(&mut self) {
         // Mark this manager inactive so others will skip its slot and can steal the lock.
-        self.global.slots[self.my_global_idx].is_active.store(0, Ordering::Relaxed);
+        if let Some(my_idx) = self.my_global_idx {
+            self.global.slots[my_idx].is_active.store(0, Ordering::Relaxed);
+        }
 
         // Release local manager ownership so a same-pod supervisor can take over.
         // Best-effort: run() is an infinite loop and kill -9 skips Drop, so real recovery
@@ -630,9 +659,11 @@ impl Drop for ContainerManager {
         );
         self.local.manager_global_idx.store(-1, Ordering::Release);
 
-        // Nudge waiters so they re-check ownership promptly (even if we held the lock).
-        self.global.signal_counter.fetch_add(1, Ordering::Release);
-        futex::wake_all(&self.global.signal_counter);
+        if self.my_global_idx.is_some() {
+            // Nudge global waiters only if this manager participated in rotation.
+            self.global.signal_counter.fetch_add(1, Ordering::Release);
+            futex::wake_all(&self.global.signal_counter);
+        }
     }
 }
 

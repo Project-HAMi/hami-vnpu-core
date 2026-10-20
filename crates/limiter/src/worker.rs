@@ -9,7 +9,7 @@ use std::fs;
 use log::{info, debug, warn};
 
 use crate::shmem::{self, LocalContainerShmem, futex, MAX_WORKERS, STATE_IDLE, STATE_RUNNING, STATE_MEASURING};
-use crate::config::{local_shmem_path, VIRTUAL_OVERHEAD_MB};
+use crate::config::{local_shmem_path, SchedPolicy, VIRTUAL_OVERHEAD_MB};
 use crate::externed_api::*;
 use crate::check_rts;
 
@@ -26,7 +26,7 @@ fn atomic_saturating_sub(a: &std::sync::atomic::AtomicU64, v: u64) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct InnerLock {
     internal_stream: u64,
     start_event: u64,
@@ -54,6 +54,7 @@ struct SchedulerClientInner {
     /// True for the no-op stub (no shmem / no manager). All limit checks are
     /// short-circuited so the worker never blocks on the state futex.
     is_stub: bool,
+    sched_policy: SchedPolicy,
 }
 
 impl fmt::Debug for SchedulerClientInner {
@@ -70,6 +71,7 @@ impl SchedulerClient {
     /// Initialized ONCE per NPUDeviceList (per process/device)
     pub fn new() -> Self {
         let my_pid = std::process::id() as i32;
+        let sched_policy = SchedPolicy::from_env().unwrap_or_else(|error| panic!("{error}"));
         info!("[Worker PID:{}] Initialize SchedulerClient...", my_pid);
 
         let shmem_path = local_shmem_path();
@@ -102,7 +104,13 @@ impl SchedulerClient {
         unsafe { rtGetDevice(&mut dev); }
         let device_id = dev.max(0) as usize;
 
-        let inner_lock = Self::create_inner_lock();
+        let inner_lock = if sched_policy.is_time_sliced() {
+            Self::create_inner_lock()
+        } else {
+            // Spatial admission is enforced before tiling by ACL resource hooks;
+            // memory accounting needs a client, not GPU measurement resources.
+            InnerLock::default()
+        };
 
         Self {
             inner: Arc::new(SchedulerClientInner {
@@ -113,6 +121,7 @@ impl SchedulerClient {
                 lock: RwLock::new(inner_lock),
                 hbm_handle_map: Mutex::new(HashMap::new()),
                 is_stub: false,
+                sched_policy,
             }),
         }
     }
@@ -253,7 +262,7 @@ impl SchedulerClient {
 
     /// The Main Entry Point
     pub fn wait_for_token(&self, user_stream: u64) {
-        if self.inner.is_stub {
+        if self.inner.is_stub || !self.inner.sched_policy.is_time_sliced() {
             return;
         }
 
@@ -647,6 +656,7 @@ impl SchedulerClient {
                 }),
                 hbm_handle_map: Mutex::new(HashMap::new()),
                 is_stub: true,
+                sched_policy: SchedPolicy::Dynamic,
             }),
         }
     }
