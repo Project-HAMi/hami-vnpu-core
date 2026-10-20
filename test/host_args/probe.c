@@ -37,9 +37,10 @@ int main(int argc, char **argv) {
     mode = dlsym(acl, "fake_mode"); capture = dlsym(acl, "fake_capture");
     launch = dlsym(RTLD_DEFAULT, "aclrtLaunchKernelWithHostArgs");
     assert(mode && capture && launch && (void *)launch != dlsym(acl, "aclrtLaunchKernelWithHostArgs"));
+    // Current production layout: legacy prefix (6224 bytes) plus overdraft fields.
     int fd = open(getenv("NPU_LOCAL_SHM_PATH"), O_CREAT | O_RDWR | O_TRUNC, 0600);
-    assert(fd >= 0 && !ftruncate(fd, 6224));
-    unsigned char *shm = mmap(NULL, 6224, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    assert(fd >= 0 && !ftruncate(fd, 6256));
+    unsigned char *shm = mmap(NULL, 6256, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     assert(shm != MAP_FAILED); close(fd);
     tokens = (_Atomic uint64_t *)(shm + 40);
     atomic_store((_Atomic uint32_t *)(shm + 6220), 1); // initialized

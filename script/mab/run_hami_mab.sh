@@ -2,13 +2,13 @@
 
 # 1. Validation
 if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 <ID> <PRIORITY>"
+    echo "Usage: $0 <ID> <COMPUTE_LIMIT>"
     echo "Example: $0 1 20"
     exit 1
 fi
 
 ID=$1
-PRIORITY=$2
+COMPUTE_LIMIT=$2
 CONTAINER_NAME="mab_hami${ID}"        
 LOG_PREFIX="inst${ID}"
 
@@ -54,7 +54,8 @@ docker run --rm -it --privileged -u root \
     --name "$CONTAINER_NAME" \
     -e NPU_GLOBAL_SHM_PATH=$GLOBAL_SHM_PATH \
     -e NPU_LOCAL_SHM_NAME=vnpu_local_session_${ID} \
-    -e NPU_PRIORITY=$PRIORITY \
+    -e NPU_COMPUTE_LIMIT=$COMPUTE_LIMIT \
+    -e NPU_SCHED_POLICY=dynamic \
     -e ASCEND_RT_VISIBLE_DEVICES=1 \
     -e NPU_TOKEN_SCALE=200.0 \
     -e HOME=/ \
@@ -63,8 +64,8 @@ docker run --rm -it --privileged -u root \
         cd $CONTAINER_PROJECT_DIR
         # Enable limiter debug logs (worker debug! included)
         # export RUST_LOG=debug
-        # export NPU_FIXED_SHARE_RATIO=1
+        # export NPU_SCHED_POLICY=fixed
         # Manager is now built into libvnpu.so and starts automatically via LD_PRELOAD.
         echo '[Container] Starting Interactive Test...'
-        LD_PRELOAD=${LIBRARY_PATH} python3 -u ${CONTAINER_PROJECT_DIR}/hami-vnpu-core/script/mab/interactive_test.py --prio=${PRIORITY}
+        LD_PRELOAD=${LIBRARY_PATH} python3 -u ${CONTAINER_PROJECT_DIR}/hami-vnpu-core/script/mab/interactive_test.py --prio=${COMPUTE_LIMIT}
     "
