@@ -34,7 +34,9 @@ fn ensure_supervisor(me: i32) {
         });
         if !matches!(spawned, Ok(Ok(_))) {
             let _ = SUPERVISOR_PID.compare_exchange(me, cur, Ordering::AcqRel, Ordering::Relaxed);
-            log::warn!("[hook] failed to spawn vnpu-supervisor thread; will retry on next NPU call");
+            log::warn!(
+                "[hook] failed to spawn vnpu-supervisor thread; will retry on next NPU call"
+            );
         }
     }
 }
@@ -50,15 +52,22 @@ pub fn npu_limiter() -> &'static SchedulerClient {
     // and reset/device changes before an intercepted allocation or submission.
     spatial::ensure_current_device();
     LIMITER.get_or_init(pid, || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(SchedulerClient::new))
-            .unwrap_or_else(|e| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(SchedulerClient::new)).unwrap_or_else(
+            |e| {
                 if spatial::enabled() {
-                    eprintln!("[hami-vnpu-core] spatial worker initialization failed (PID {pid}): {e:?}");
+                    eprintln!(
+                        "[hami-vnpu-core] spatial worker initialization failed (PID {pid}): {e:?}"
+                    );
                     unsafe { libc::_exit(78) };
                 }
-                log::warn!("SchedulerClient init failed (PID {}), using stub: {:?}", pid, e);
+                log::warn!(
+                    "SchedulerClient init failed (PID {}), using stub: {:?}",
+                    pid,
+                    e
+                );
                 SchedulerClient::stub()
-            })
+            },
+        )
     })
 }
 
@@ -81,5 +90,5 @@ macro_rules! passthrough {
 
 mod hook;
 mod process;
-pub mod spatial;
 mod signal_compat;
+pub mod spatial;

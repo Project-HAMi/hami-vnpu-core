@@ -17,7 +17,7 @@ use log::{info, warn};
 use crate::config::ManagerConfig;
 use crate::manager::ContainerManager;
 use crate::shmem::setup;
-use crate::shmem::{futex, GlobalRegistry, LocalContainerShmem, MAX_MANAGERS, STATE_IDLE};
+use crate::shmem::{GlobalRegistry, LocalContainerShmem, MAX_MANAGERS, STATE_IDLE, futex};
 use crate::worker::proc_alive;
 
 /// A manager is declared dead if its PID is gone OR its heartbeat is older than this.
@@ -65,7 +65,8 @@ pub fn run() {
 
         if let Some(old_pid) = try_become_manager(local, my_pid) {
             info!("[Supervisor PID:{}] won manager election", my_pid);
-            let g = *global.get_or_insert_with(|| setup::open_global_registry(&cfg.global_shm_path));
+            let g =
+                *global.get_or_insert_with(|| setup::open_global_registry(&cfg.global_shm_path));
 
             reclaim_stale_global_slot(g, local, old_pid);
             local.overdraft_pool.close();
@@ -74,12 +75,16 @@ pub fn run() {
 
             match ContainerManager::new(g, local, my_pid, cfg.clone()) {
                 Some(mut mgr) => mgr.run(),
-                None => warn!("[Supervisor PID:{}] global registry full; cannot manage.", my_pid),
+                None => warn!(
+                    "[Supervisor PID:{}] global registry full; cannot manage.",
+                    my_pid
+                ),
             }
 
-            let _ = local
-                .manager_pid
-                .compare_exchange(my_pid, 0, Ordering::AcqRel, Ordering::Relaxed);
+            let _ =
+                local
+                    .manager_pid
+                    .compare_exchange(my_pid, 0, Ordering::AcqRel, Ordering::Relaxed);
         } else {
             watch(local);
         }
@@ -97,7 +102,9 @@ fn try_become_manager(local: &LocalContainerShmem, my_pid: i32) -> Option<i32> {
         .compare_exchange(0, my_pid, Ordering::AcqRel, Ordering::Relaxed)
         .is_ok()
     {
-        local.manager_heartbeat.store(get_time_us(), Ordering::Release);
+        local
+            .manager_heartbeat
+            .store(get_time_us(), Ordering::Release);
         return Some(0);
     }
 
@@ -111,8 +118,13 @@ fn try_become_manager(local: &LocalContainerShmem, my_pid: i32) -> Option<i32> {
             .compare_exchange(owner, my_pid, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            local.manager_heartbeat.store(get_time_us(), Ordering::Release);
-            warn!("[Supervisor PID:{}] took over from dead/stale manager {}", my_pid, owner);
+            local
+                .manager_heartbeat
+                .store(get_time_us(), Ordering::Release);
+            warn!(
+                "[Supervisor PID:{}] took over from dead/stale manager {}",
+                my_pid, owner
+            );
             return Some(owner);
         }
     }
@@ -160,7 +172,10 @@ fn reclaim_stale_global_slot(global: &GlobalRegistry, local: &LocalContainerShme
     let slot = &global.slots[idx as usize];
     if slot.pid.load(Ordering::Acquire) == old_pid {
         slot.is_active.store(0, Ordering::Release);
-        warn!("[Supervisor] cleared stale global slot {} of dead manager {}", idx, old_pid);
+        warn!(
+            "[Supervisor] cleared stale global slot {} of dead manager {}",
+            idx, old_pid
+        );
     }
 }
 
@@ -175,5 +190,8 @@ fn block_all_signals() {
 }
 
 fn get_time_us() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
 }

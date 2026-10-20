@@ -30,7 +30,9 @@ const OVERDRAFT_DEFAULTS: OverdraftConfig = OverdraftConfig {
 };
 
 const _: () = {
-    assert!(OVERDRAFT_DEFAULTS.limit > 0 && OVERDRAFT_DEFAULTS.limit <= crate::overdraft::MAX_LIMIT);
+    assert!(
+        OVERDRAFT_DEFAULTS.limit > 0 && OVERDRAFT_DEFAULTS.limit <= crate::overdraft::MAX_LIMIT
+    );
     assert!(OVERDRAFT_DEFAULTS.timeout_us > 0 && OVERDRAFT_DEFAULTS.poll_interval_us > 0);
 };
 
@@ -80,7 +82,9 @@ impl SchedPolicy {
         match std::env::var(ENV_SCHED_POLICY) {
             Ok(value) => value.parse(),
             Err(std::env::VarError::NotPresent) => Ok(DEFAULT_SCHED_POLICY),
-            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{ENV_SCHED_POLICY} must contain valid Unicode")),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(format!("{ENV_SCHED_POLICY} must contain valid Unicode"))
+            }
         }
     }
 }
@@ -94,7 +98,9 @@ impl std::str::FromStr for SchedPolicy {
             "fixed" => Ok(Self::Fixed),
             "overdraft" => Ok(Self::Overdraft),
             "spatial" => Ok(Self::Spatial),
-            _ => Err(format!("{ENV_SCHED_POLICY} must be dynamic, fixed, overdraft, or spatial")),
+            _ => Err(format!(
+                "{ENV_SCHED_POLICY} must be dynamic, fixed, overdraft, or spatial"
+            )),
         }
     }
 }
@@ -121,12 +127,16 @@ impl ManagerConfig {
         Self::from_lookup(|name| match std::env::var(name) {
             Ok(value) => Ok(Some(value)),
             Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must contain valid Unicode")),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(format!("{name} must contain valid Unicode"))
+            }
         })
     }
 
     // Injectable lookup keeps configuration tests independent of process-global env.
-    fn from_lookup(mut get: impl FnMut(&str) -> Result<Option<String>, String>) -> Result<Self, String> {
+    fn from_lookup(
+        mut get: impl FnMut(&str) -> Result<Option<String>, String>,
+    ) -> Result<Self, String> {
         for (old, new) in [
             ("NPU_MEM_QUOTA", ENV_MEMORY_LIMIT_MB),
             ("NPU_PRIORITY", ENV_COMPUTE_LIMIT),
@@ -134,28 +144,37 @@ impl ManagerConfig {
             ("NPU_OVERDRAFT_ENABLED", ENV_SCHED_POLICY),
         ] {
             if get(old)?.is_some() {
-                return Err(format!("{old} has been replaced by {new}; remove the old variable"));
+                return Err(format!(
+                    "{old} has been replaced by {new}; remove the old variable"
+                ));
             }
         }
         let global_shm_path = get(ENV_GLOBAL_SHM_PATH)?
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| format!("Missing environment variable: {ENV_GLOBAL_SHM_PATH}"))?;
-        let local_shm_path = get(ENV_LOCAL_SHM_PATH)?
-            .unwrap_or_else(|| DEFAULT_LOCAL_SHMEM_PATH.to_string());
+        let local_shm_path =
+            get(ENV_LOCAL_SHM_PATH)?.unwrap_or_else(|| DEFAULT_LOCAL_SHMEM_PATH.to_string());
         if local_shm_path.trim().is_empty() {
             return Err(format!("{ENV_LOCAL_SHM_PATH} must not be empty"));
         }
         let memory_limit_mb = match get(ENV_MEMORY_LIMIT_MB)? {
-            Some(value) => value.trim().parse::<u64>()
+            Some(value) => value
+                .trim()
+                .parse::<u64>()
                 .map_err(|_| format!("{ENV_MEMORY_LIMIT_MB} must be a non-negative integer"))?,
             None => DEFAULT_MEMORY_LIMIT_MB,
         };
         if memory_limit_mb > u64::MAX / (1024 * 1024) {
-            return Err(format!("{ENV_MEMORY_LIMIT_MB} is too large to convert to bytes"));
+            return Err(format!(
+                "{ENV_MEMORY_LIMIT_MB} is too large to convert to bytes"
+            ));
         }
         let compute_limit = match get(ENV_COMPUTE_LIMIT)? {
-            Some(value) => value.trim().parse::<u32>()
-                .ok().filter(|value| (1..=100).contains(value))
+            Some(value) => value
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|value| (1..=100).contains(value))
                 .ok_or_else(|| format!("{ENV_COMPUTE_LIMIT} must be an integer in [1,100]"))?,
             None => DEFAULT_COMPUTE_LIMIT,
         };
@@ -164,15 +183,30 @@ impl ManagerConfig {
             Some(value) => value.parse::<SchedPolicy>()?,
         };
         let overdraft = OVERDRAFT_DEFAULTS;
-        Ok(Self { global_shm_path, local_shm_path, compute_limit, memory_limit_mb, sched_policy, overdraft })
+        Ok(Self {
+            global_shm_path,
+            local_shm_path,
+            compute_limit,
+            memory_limit_mb,
+            sched_policy,
+            overdraft,
+        })
     }
 }
 
 /// Validate explicit resource settings before a worker can enter the stub path.
 pub fn validate_requested_limits() -> Result<(), String> {
-    let requested = [ENV_MEMORY_LIMIT_MB, ENV_COMPUTE_LIMIT, ENV_SCHED_POLICY,
-        "NPU_MEM_QUOTA", "NPU_PRIORITY", "NPU_FIXED_SHARE_RATIO", "NPU_OVERDRAFT_ENABLED"]
-        .iter().any(|name| std::env::var_os(name).is_some());
+    let requested = [
+        ENV_MEMORY_LIMIT_MB,
+        ENV_COMPUTE_LIMIT,
+        ENV_SCHED_POLICY,
+        "NPU_MEM_QUOTA",
+        "NPU_PRIORITY",
+        "NPU_FIXED_SHARE_RATIO",
+        "NPU_OVERDRAFT_ENABLED",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some());
     if requested {
         ManagerConfig::from_env().map(|_| ())
     } else {
@@ -181,8 +215,7 @@ pub fn validate_requested_limits() -> Result<(), String> {
 }
 
 pub fn local_shmem_path() -> String {
-    std::env::var(ENV_LOCAL_SHM_PATH)
-        .unwrap_or_else(|_| DEFAULT_LOCAL_SHMEM_PATH.to_string())
+    std::env::var(ENV_LOCAL_SHM_PATH).unwrap_or_else(|_| DEFAULT_LOCAL_SHMEM_PATH.to_string())
 }
 
 #[cfg(test)]
@@ -190,13 +223,22 @@ mod tests {
     use super::*;
 
     fn config(values: &[(&str, &str)]) -> Result<ManagerConfig, String> {
-        ManagerConfig::from_lookup(|name| Ok(values.iter().find(|(key, _)| *key == name)
-            .map(|(_, value)| value.to_string())))
+        ManagerConfig::from_lookup(|name| {
+            Ok(values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string()))
+        })
     }
 
     #[test]
     fn policy_names_round_trip_through_the_enum() {
-        for policy in [SchedPolicy::Dynamic, SchedPolicy::Fixed, SchedPolicy::Overdraft, SchedPolicy::Spatial] {
+        for policy in [
+            SchedPolicy::Dynamic,
+            SchedPolicy::Fixed,
+            SchedPolicy::Overdraft,
+            SchedPolicy::Spatial,
+        ] {
             assert_eq!(policy.as_str().parse::<SchedPolicy>().unwrap(), policy);
             assert_eq!(policy.to_string(), policy.as_str());
         }
@@ -205,7 +247,11 @@ mod tests {
         assert!(SchedPolicy::Fixed.is_fixed());
         assert!(!SchedPolicy::Spatial.is_fixed());
         assert!(!SchedPolicy::Spatial.is_time_sliced());
-        for policy in [SchedPolicy::Dynamic, SchedPolicy::Fixed, SchedPolicy::Overdraft] {
+        for policy in [
+            SchedPolicy::Dynamic,
+            SchedPolicy::Fixed,
+            SchedPolicy::Overdraft,
+        ] {
             assert!(policy.is_time_sliced());
         }
     }
@@ -221,9 +267,14 @@ mod tests {
 
     #[test]
     fn new_variables_select_fixed_percent_and_memory_limit() {
-        let cfg = config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"),
-            (ENV_LOCAL_SHM_PATH, "/tmp/pod"), (ENV_MEMORY_LIMIT_MB, "10240"),
-            (ENV_COMPUTE_LIMIT, "30"), (ENV_SCHED_POLICY, "fixed")]).unwrap();
+        let cfg = config(&[
+            (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+            (ENV_LOCAL_SHM_PATH, "/tmp/pod"),
+            (ENV_MEMORY_LIMIT_MB, "10240"),
+            (ENV_COMPUTE_LIMIT, "30"),
+            (ENV_SCHED_POLICY, "fixed"),
+        ])
+        .unwrap();
         assert_eq!(cfg.memory_limit_mb, 10240);
         assert_eq!(cfg.compute_limit, 30);
         assert_eq!(cfg.local_shm_path, "/tmp/pod");
@@ -234,14 +285,26 @@ mod tests {
     #[test]
     fn percentage_bounds_are_inclusive() {
         for value in ["1", "100"] {
-            assert!(config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_COMPUTE_LIMIT, value)]).is_ok());
+            assert!(
+                config(&[
+                    (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+                    (ENV_COMPUTE_LIMIT, value)
+                ])
+                .is_ok()
+            );
         }
     }
 
     #[test]
     fn invalid_percentages_do_not_silently_fall_back() {
-        for value in ["", "0", "101", "-1", "0.5", "30.5", "NaN", "inf", "30%", "abc"] {
-            let error = config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_COMPUTE_LIMIT, value)]).unwrap_err();
+        for value in [
+            "", "0", "101", "-1", "0.5", "30.5", "NaN", "inf", "30%", "abc",
+        ] {
+            let error = config(&[
+                (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+                (ENV_COMPUTE_LIMIT, value),
+            ])
+            .unwrap_err();
             assert!(error.contains(ENV_COMPUTE_LIMIT), "{value}: {error}");
         }
     }
@@ -249,31 +312,67 @@ mod tests {
     #[test]
     fn invalid_memory_limits_do_not_disable_the_limit() {
         for value in ["", "-1", "1.5", "10240MB", "18446744073709551615"] {
-            let error = config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_MEMORY_LIMIT_MB, value)]).unwrap_err();
+            let error = config(&[
+                (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+                (ENV_MEMORY_LIMIT_MB, value),
+            ])
+            .unwrap_err();
             assert!(error.contains(ENV_MEMORY_LIMIT_MB), "{value}: {error}");
         }
     }
 
     #[test]
     fn zero_memory_means_unlimited() {
-        assert_eq!(config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_MEMORY_LIMIT_MB, "0")]).unwrap().memory_limit_mb, 0);
+        assert_eq!(
+            config(&[
+                (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+                (ENV_MEMORY_LIMIT_MB, "0")
+            ])
+            .unwrap()
+            .memory_limit_mb,
+            0
+        );
     }
 
     #[test]
     fn policy_is_explicit_instead_of_boolean() {
         for value in ["", "true", "false", "0", "1", "unknown"] {
-            let error = config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_SCHED_POLICY, value)]).unwrap_err();
+            let error = config(&[
+                (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+                (ENV_SCHED_POLICY, value),
+            ])
+            .unwrap_err();
             assert!(error.contains(ENV_SCHED_POLICY));
         }
-        assert_eq!(config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_SCHED_POLICY, "dynamic")]).unwrap().sched_policy, SchedPolicy::Dynamic);
-        assert_eq!(config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_SCHED_POLICY, "spatial"),
-            (ENV_COMPUTE_LIMIT, "33"), (ENV_MEMORY_LIMIT_MB, "20480")]).unwrap().sched_policy, SchedPolicy::Spatial);
+        assert_eq!(
+            config(&[
+                (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+                (ENV_SCHED_POLICY, "dynamic")
+            ])
+            .unwrap()
+            .sched_policy,
+            SchedPolicy::Dynamic
+        );
+        assert_eq!(
+            config(&[
+                (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+                (ENV_SCHED_POLICY, "spatial"),
+                (ENV_COMPUTE_LIMIT, "33"),
+                (ENV_MEMORY_LIMIT_MB, "20480")
+            ])
+            .unwrap()
+            .sched_policy,
+            SchedPolicy::Spatial
+        );
     }
 
     #[test]
     fn old_names_report_their_replacement() {
-        for (old, new) in [("NPU_MEM_QUOTA", ENV_MEMORY_LIMIT_MB),
-            ("NPU_PRIORITY", ENV_COMPUTE_LIMIT), ("NPU_FIXED_SHARE_RATIO", ENV_SCHED_POLICY)] {
+        for (old, new) in [
+            ("NPU_MEM_QUOTA", ENV_MEMORY_LIMIT_MB),
+            ("NPU_PRIORITY", ENV_COMPUTE_LIMIT),
+            ("NPU_FIXED_SHARE_RATIO", ENV_SCHED_POLICY),
+        ] {
             let error = config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (old, "1")]).unwrap_err();
             assert!(error.contains(old) && error.contains(new));
         }
@@ -283,36 +382,64 @@ mod tests {
     fn shared_memory_paths_cannot_be_empty() {
         assert!(config(&[]).is_err());
         assert!(config(&[(ENV_GLOBAL_SHM_PATH, " ")]).is_err());
-        assert!(config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), (ENV_LOCAL_SHM_PATH, "")]).is_err());
+        assert!(
+            config(&[
+                (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+                (ENV_LOCAL_SHM_PATH, "")
+            ])
+            .is_err()
+        );
     }
 
     #[test]
     fn non_unicode_configuration_is_an_error() {
         let error = ManagerConfig::from_lookup(|name| {
-            if name == ENV_MEMORY_LIMIT_MB { Err("invalid Unicode".into()) }
-            else if name == ENV_GLOBAL_SHM_PATH { Ok(Some("/tmp/global".into())) }
-            else { Ok(None) }
-        }).unwrap_err();
+            if name == ENV_MEMORY_LIMIT_MB {
+                Err("invalid Unicode".into())
+            } else if name == ENV_GLOBAL_SHM_PATH {
+                Ok(Some("/tmp/global".into()))
+            } else {
+                Ok(None)
+            }
+        })
+        .unwrap_err();
         assert!(error.contains("invalid Unicode"));
     }
     #[test]
     fn overdraft_uses_internal_defaults_without_more_environment_settings() {
         let cfg = ManagerConfig::from_lookup(|name| {
-            assert!([ENV_GLOBAL_SHM_PATH, ENV_LOCAL_SHM_PATH, ENV_MEMORY_LIMIT_MB,
-                ENV_COMPUTE_LIMIT, ENV_SCHED_POLICY, "NPU_MEM_QUOTA", "NPU_PRIORITY",
-                "NPU_FIXED_SHARE_RATIO", "NPU_OVERDRAFT_ENABLED"].contains(&name),
-                "unexpected environment setting: {name}");
+            assert!(
+                [
+                    ENV_GLOBAL_SHM_PATH,
+                    ENV_LOCAL_SHM_PATH,
+                    ENV_MEMORY_LIMIT_MB,
+                    ENV_COMPUTE_LIMIT,
+                    ENV_SCHED_POLICY,
+                    "NPU_MEM_QUOTA",
+                    "NPU_PRIORITY",
+                    "NPU_FIXED_SHARE_RATIO",
+                    "NPU_OVERDRAFT_ENABLED"
+                ]
+                .contains(&name),
+                "unexpected environment setting: {name}"
+            );
             Ok(match name {
                 ENV_GLOBAL_SHM_PATH => Some("/tmp/global".into()),
                 ENV_SCHED_POLICY => Some("overdraft".into()),
                 _ => None,
             })
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(cfg.sched_policy, SchedPolicy::Overdraft);
         assert_eq!(cfg.overdraft.limit, 10);
         assert_eq!(cfg.overdraft.timeout_us, 5000);
         assert_eq!(cfg.overdraft.poll_interval_us, 1000);
-        assert!(config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global"), ("NPU_OVERDRAFT_ENABLED", "true")]).is_err());
+        assert!(
+            config(&[
+                (ENV_GLOBAL_SHM_PATH, "/tmp/global"),
+                ("NPU_OVERDRAFT_ENABLED", "true")
+            ])
+            .is_err()
+        );
     }
-
 }
