@@ -4,7 +4,7 @@
 
 通过 `NPU_SCHED_POLICY` 选择 `dynamic`、`fixed`、`overdraft` 或 `spatial`。四种策略都保留共享 HBM 计量，区别在于如何控制算力。`NPU_COMPUTE_LIMIT` 必须是 `1` 到 `100` 的整数，具体含义由策略决定。
 
-core 库默认采用 `dynamic`，`NPU_COMPUTE_LIMIT` 默认是 `1`。部署时建议显式配置两项。core 直接从每个参与控制的应用进程环境中读取这些设置。
+core 库默认采用 `spatial`，`NPU_COMPUTE_LIMIT` 默认仍是 `1`。请按负载显式设置算力值，需要时分调度时显式选择相应策略。core 直接从每个参与控制的应用进程环境中读取这些设置。此前依赖 Dynamic 默认值的部署，升级时应显式设置 `NPU_SCHED_POLICY=dynamic` 以保留原有行为。所有策略的 manager 配置仍要求设置 `NPU_GLOBAL_SHM_PATH`。
 
 ## 四种策略对比
 

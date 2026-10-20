@@ -4,7 +4,7 @@
 
 Set `NPU_SCHED_POLICY` to `dynamic`, `fixed`, `overdraft`, or `spatial`. All four policies retain shared HBM accounting; they differ in how they control compute. `NPU_COMPUTE_LIMIT` must be an integer from `1` to `100`, but its meaning depends on the policy.
 
-The core library defaults to `dynamic` and `NPU_COMPUTE_LIMIT=1`. Set both explicitly for predictable deployment behavior. The core reads these settings directly from each participating application's environment.
+The core library defaults to `spatial` and `NPU_COMPUTE_LIMIT=1`. Set the compute limit explicitly for your workload, and select a time-based policy explicitly when required. The core reads these settings directly from each participating application's environment. Deployments upgrading from the previous Dynamic default should set `NPU_SCHED_POLICY=dynamic` to preserve that behavior. `NPU_GLOBAL_SHM_PATH` remains required for manager configuration under every policy.
 
 ## Compare the four policies
 

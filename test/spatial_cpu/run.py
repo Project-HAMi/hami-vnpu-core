@@ -56,7 +56,11 @@ def main():
                 env["NPU_COMPUTE_LIMIT"] = str(percent)
             if policy is not None:
                 env["NPU_SCHED_POLICY"] = policy
-            env.update(settings or {})
+            for key, value in (settings or {}).items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
             run = subprocess.run([str(executable), mode], env=env, capture_output=True,
                                  text=True, timeout=20)
             assert run.returncode == code, (name, run.returncode, run.stdout, run.stderr)
@@ -66,7 +70,7 @@ def main():
                 assert "fatal" in run.stderr, (name, run.stderr)
             if error:
                 assert error in run.stderr, (name, run.stderr)
-            if policy == "spatial" and code == 0 and mode not in {"fork-after", "fork-locked"}:
+            if policy in {None, "spatial"} and code == 0 and mode not in {"fork-after", "fork-locked"}:
                 assert "rounding=ceil cooperative=1" in run.stderr, (name, run.stderr)
             results.append(dict(name=name, passed=True, returncode=run.returncode))
             print("PASS " + name, flush=True)
@@ -83,6 +87,11 @@ def main():
         for percent in ["", "0", "101", "-1", "10x"]:
             case("refuse-" + (percent or "empty"), percent=percent, code=78)
         case("default-one-percent-ceil", percent=None, expected=["1 1"])
+        case("default-policy-applies-spatial", policy=None, mode="basic",
+             expected=["7 14"] * 3 + ["stream=14"] + ["7 14"] * 2)
+        case("default-policy-and-compute", policy=None, percent=None, expected=["1 1"])
+        case("default-policy-missing-global-path", policy=None,
+             settings={"NPU_GLOBAL_SHM_PATH": None}, code=78, error="NPU_GLOBAL_SHM_PATH")
         for name, settings in [
                 ("setter-failure", {"FAKE_FAIL_SET": "1"}),
                 ("getter-failure", {"FAKE_FAIL_GET": "1"}),
@@ -98,7 +107,8 @@ def main():
         for backend, symbol in [("missing-get", "aclrtGetDeviceResLimit"),
                                 ("missing-set", "aclrtSetDeviceResLimit")]:
             case(backend, backend=backend, code=78, error=symbol)
-        for policy in [None, "dynamic", "fixed", "overdraft"]:
+            case("default-policy-" + backend, policy=None, backend=backend, code=78, error=symbol)
+        for policy in ["dynamic", "fixed", "overdraft"]:
             case("passthrough-" + str(policy), policy=policy, backend="missing-get", mode="passthrough",
                  expected=["20 40", "20 40", "100 40", "stream=100", "20 40", "20 40", "gets=0"])
         case("context-initialization", mode="context", expected=["7 14"])

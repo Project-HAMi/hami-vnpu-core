@@ -12,7 +12,7 @@
 | `NPU_LOCAL_SHM_PATH` | `/tmp/vnpu_local_shmem` | 由应用进程组成的一个记账/调度组的非空文件路径。组内参与进程须访问同一个底层文件；独立组使用不同文件。 |
 | `NPU_MEMORY_LIMIT_MB` | `0` | 非负整数。虽然名称为 `_MB`，实际单位为 MiB，`1` 对应 `1,048,576` 字节。`0` 关闭 HBM 配额。转换为 `u64` 字节数时会溢出的值被拒绝。 |
 | `NPU_COMPUTE_LIMIT` | `1` | `1`～`100` 的整数。`dynamic`/`overdraft` 中为相对份额，`fixed` 中为运行/休息目标百分比，`spatial` 中为每进程的 Cube/Vector 协作预算百分比。请按工作负载显式设置。 |
-| `NPU_SCHED_POLICY` | `dynamic` | 仅接受 `dynamic`、`fixed`、`overdraft`、`spatial`。去除首尾空白，core 的策略名区分大小写。详见[策略利弊](scheduling-policies.zh-CN.md)。 |
+| `NPU_SCHED_POLICY` | `spatial` | 仅接受 `dynamic`、`fixed`、`overdraft`、`spatial`。去除首尾空白，core 的策略名区分大小写。详见[策略利弊](scheduling-policies.zh-CN.md)。 |
 
 一个本地 SHM 组只有一个显存配额和一个算力配置，不接受逐设备配置列表。HBM 记账汇总组内进程及各设备计数。`spatial` 算力预算分别作用于每个进程/设备；增加 worker 进程不会在进程之间平分该预算。
 
@@ -66,6 +66,10 @@ LD_PRELOAD=/opt/hami/libvnpu.so python3 your_model.py
 库还会链接 CANN `runtime`。请面向目标 Linux 架构构建，并在部署中提供兼容的 runtime/driver 依赖。设置两个构建目录变量不会自动安装这些依赖，也不会设置应用的运行时库搜索路径。
 
 ## 旧变量迁移
+
+默认调度策略已改为 `spatial`，`NPU_COMPUTE_LIMIT` 默认值仍为 `1`。此前通过不设置
+策略来使用 Dynamic 的部署，应显式设置 `NPU_SCHED_POLICY=dynamic` 以保留原有行为。
+所有策略都仍须配置 `NPU_GLOBAL_SHM_PATH`。
 
 必须完全删除旧变量；即使设为空字符串，或同时存在新变量，当前解析器仍会拒绝其存在。
 

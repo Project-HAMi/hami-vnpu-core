@@ -16,7 +16,9 @@ participating processes; no separate daemon is required.
 | `overdraft` | Dynamic scheduling plus bounded admission borrowing while IDLE | Workloads that benefit from reducing admission stalls |
 | `spatial` | Cooperative per-process Cube/Vector budgets | Operators that honor CANN resource limits and benefit from concurrent execution |
 
-The core defaults to `dynamic` with `NPU_COMPUTE_LIMIT=1`. Set both explicitly.
+The core defaults to `spatial` with `NPU_COMPUTE_LIMIT=1`. Set the compute limit
+explicitly for your workload. Select `dynamic`, `fixed`, or `overdraft` explicitly
+to use time-based scheduling.
 The same number has different meanings across policies; it is not a universal
 throughput percentage. See the [policy guide](docs/scheduling-policies.md) for
 advantages, tradeoffs and examples.
@@ -37,12 +39,20 @@ The Dockerfile uses the official `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3
 image, pinned by digest, and Rust **1.94.0**. It downloads the official **HDK 25.5.1**
 package, verifies its SHA256 and extracts the real driver user libraries for
 linking; it does not install a kernel driver. The build environment is
-**CANN 8.5.2 on Ubuntu 22.04** and the output is **Linux ARM64**. Use a native ARM64
-builder, or configure ARM64 emulation on another architecture. No NPU is required
-to compile. Override the export directory with `make build-in-docker OUT_DIR=out`.
+**CANN 8.5.2 on Ubuntu 22.04** and supports **Linux AMD64 and ARM64**. The Make
+target selects the host architecture by default. Select a target and separate
+output directories explicitly when building both:
 
-Deploy `dist/libvnpu.so` into an ARM64 workload container with compatible CANN
-and host-driver libraries. The HDK driver user-library version describes the
+```sh
+make build-in-docker PLATFORM=linux/amd64 OUT_DIR=dist/amd64
+make build-in-docker PLATFORM=linux/arm64 OUT_DIR=dist/arm64
+```
+
+Use a native builder for each target, or configure Docker Buildx emulation for
+the other architecture. No NPU is required to compile.
+
+Deploy `libvnpu.so` into a matching-architecture workload container with
+compatible CANN and host-driver libraries. The HDK driver user-library version describes the
 build environment; choose the host driver using the CANN/hardware compatibility
 requirements.
 A successful build does not establish the minimum supported CANN version or
@@ -71,12 +81,14 @@ export NPU_GLOBAL_SHM_PATH=/hami-shared-region/7_global_registry
 export NPU_LOCAL_SHM_PATH=/tmp/vnpu-local
 export NPU_MEMORY_LIMIT_MB=10240
 export NPU_COMPUTE_LIMIT=30
-export NPU_SCHED_POLICY=spatial
+export NPU_SCHED_POLICY=spatial # Default policy; shown explicitly for clarity.
 LD_PRELOAD=/usr/local/lib/libvnpu.so python3 your_model.py
 ```
 
 The card number identifies the physical coordination domain; the application
 still selects its container-local logical device, commonly `0`.
+`NPU_GLOBAL_SHM_PATH` remains required for manager configuration, including
+the default spatial policy.
 
 This sets a shared HBM quota of 10 GiB and, for `spatial`, per-process core budgets
 of `ceil(physical cores × 30 / 100)`. On a 20-Cube/40-Vector device, that is 6 Cube
@@ -111,6 +123,6 @@ bash scripts/ci.sh
 
 Run on Linux; see [testing and CI](docs/testing.md) for dependencies. The CPU
 regression jobs use fake ACL/DCMI backends and source-linked tests for
-configuration, scheduling logic and hooks. The separate release job uses the real
-SDK and uploads the verified ARM64 library. Validate NPU execution and workload
-performance separately in a compatible Ascend environment.
+configuration, scheduling logic and hooks. Separate release jobs use the real
+SDK and upload verified AMD64 and ARM64 libraries. Validate NPU execution and
+workload performance separately in a compatible Ascend environment.

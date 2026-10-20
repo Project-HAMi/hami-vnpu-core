@@ -15,7 +15,8 @@ HAMi-vnpu-core 是运行在容器内的昇腾 NPU 资源控制库。Rust 编写�
 | `overdraft` | 在 dynamic 基础上，允许 IDLE 状态下有界的准入借用 | 希望减少准入等待的负载 |
 | `spatial` | 配置每个进程的 Cube/Vector 协作式资源预算 | 遵守 CANN 资源限制、适合并行执行的算子 |
 
-core 默认使用 `dynamic`，`NPU_COMPUTE_LIMIT` 默认值为 `1`，建议显式设置两者。
+core 默认使用 `spatial`，`NPU_COMPUTE_LIMIT` 默认值仍为 `1`，请按负载显式设置算力值。
+需要时分调度时，显式选择 `dynamic`、`fixed` 或 `overdraft`。
 不同策略对数值的解释不同，不能统一理解为吞吐百分比。
 详见[策略指南](docs/scheduling-policies.zh-CN.md)中的利弊、选型建议和示例。
 
@@ -34,11 +35,17 @@ cd dist && sha256sum -c SHA256SUMS
 Dockerfile 使用官方 `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11`
 镜像并固定摘要，Rust 固定为 **1.94.0**；下载官方 **HDK 25.5.1** 包并验证 SHA256，
 只提取真实驱动用户态库用于链接，不安装内核驱动。
-构建环境为 **CANN 8.5.2、Ubuntu 22.04**，产物为 **Linux ARM64**；建议使用原生
-ARM64 构建器，在其他架构上需配置 ARM64 模拟。编译无需 NPU。
-如需修改产物目录，执行 `make build-in-docker OUT_DIR=out`。
+构建环境为 **CANN 8.5.2、Ubuntu 22.04**，支持 **Linux AMD64 和 ARM64**，Make
+默认选择当前主机架构。构建两种架构时，显式选择目标并使用不同的产物目录：
 
-将 `dist/libvnpu.so` 部署到具有兼容 CANN 和宿主机驱动库的 ARM64 业务容器。
+```sh
+make build-in-docker PLATFORM=linux/amd64 OUT_DIR=dist/amd64
+make build-in-docker PLATFORM=linux/arm64 OUT_DIR=dist/arm64
+```
+
+建议使用目标架构的原生构建器，跨架构构建需配置 Docker Buildx 模拟。编译无需 NPU。
+
+将 `libvnpu.so` 部署到架构匹配、具有兼容 CANN 和宿主机驱动库的业务容器。
 HDK 驱动用户态库版本只说明构建环境，宿主机驱动应与业务 CANN 和硬件配套。
 编译成功不能直接确定最低兼容 CANN 版本，也不能代替各策略的真机验证。
 产物来源、检查内容和验证范围见[测试与 CI](docs/testing.md)。
@@ -63,11 +70,12 @@ export NPU_GLOBAL_SHM_PATH=/hami-shared-region/7_global_registry
 export NPU_LOCAL_SHM_PATH=/tmp/vnpu-local
 export NPU_MEMORY_LIMIT_MB=10240
 export NPU_COMPUTE_LIMIT=30
-export NPU_SCHED_POLICY=spatial
+export NPU_SCHED_POLICY=spatial # 默认策略，此处显式写出。
 LD_PRELOAD=/usr/local/lib/libvnpu.so python3 your_model.py
 ```
 
 文件名中的卡号表示物理设备协调范围；业务仍选择容器内的逻辑设备，通常为 `0`。
+包括默认空分策略在内，manager 配置仍要求设置 `NPU_GLOBAL_SHM_PATH`。
 
 该配置设置共享的 10 GiB HBM 配额。`spatial` 为每个进程设置
 `ceil(物理核心数 × 30 / 100)` 的预算：在 20 Cube / 40 Vector 的设备上为
@@ -99,5 +107,5 @@ bash scripts/ci.sh
 
 在 Linux 上运行，依赖见[测试与 CI](docs/testing.md)。CPU 回归任务使用假的 ACL/DCMI
 后端及直接引用生产源码的测试，检查配置、调度逻辑与 hook 行为。独立的发布构建任务
-使用真实 SDK，上传通过检查的 ARM64 库。NPU 执行和业务性能需要在兼容的昇腾环境中
-另行验证。
+使用真实 SDK，分别上传通过检查的 AMD64 和 ARM64 库。NPU 执行和业务性能需要
+在兼容的昇腾环境中另行验证。

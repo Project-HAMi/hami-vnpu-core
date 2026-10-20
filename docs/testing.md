@@ -4,8 +4,8 @@
 
 ### Build the release library
 
-The [release job](../.github/workflows/ci.yml) builds the complete Rust workspace
-with real CANN runtime and DCMI libraries. It uses the same
+The [release jobs](../.github/workflows/ci.yml) build the complete Rust workspace
+with real CANN runtime and DCMI libraries. They use the same
 [Dockerfile](../dockerfiles/Dockerfile) and [Make target](../Makefile) as local
 builds, following the container-build approach used by
 [HAMi-core](https://github.com/Project-HAMi/HAMi-core/blob/main/.github/workflows/build-src.yml).
@@ -17,27 +17,41 @@ make build-in-docker
 cd dist && sha256sum -c SHA256SUMS
 ```
 
-Use a native Linux ARM64 builder for this image. Docker Buildx can also use ARM64
-emulation if configured on the host. The build requires network access to pull
-the SDK image and install the toolchain; it does not require an NPU, a driver
-kernel module, cluster credentials or repository secrets.
+The official image supports Linux AMD64 and ARM64. The Make target selects the
+host architecture by default. To select a target explicitly and keep both
+architectures' output separate:
+
+```sh
+make build-in-docker PLATFORM=linux/amd64 OUT_DIR=dist/amd64
+make build-in-docker PLATFORM=linux/arm64 OUT_DIR=dist/arm64
+```
+
+Use a native builder for each target, or configure Docker Buildx emulation for
+the other architecture. The build requires network access to pull the SDK image
+and install the toolchain; it does not require an NPU, a driver kernel module,
+cluster credentials or repository secrets.
 
 | Build input | Pinned value |
 | --- | --- |
 | Official SDK image | `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11` |
 | Image digest | `sha256:093e4003c81ef9795a0c1019f6df46e0823ef38ba15ab68c5ed2b236b4a1d64b` |
 | CANN | `8.5.2` |
-| SDK image system and target architecture | Ubuntu 22.04, Linux ARM64 |
+| SDK image system and target architectures | Ubuntu 22.04, Linux AMD64 and ARM64 |
 | Official HDK driver user libraries | `25.5.1` |
-| HDK package SHA256 | `1573563e63cb893cf3049ae31259eb8d6c31ec859be82c3c4a9c5846eea372b5` |
+| HDK AMD64 package SHA256 | `f64012342cdf72d44f527efdef1304af41aedc73b202bf0d91243d21765555f7` |
+| HDK ARM64 package SHA256 | `1573563e63cb893cf3049ae31259eb8d6c31ec859be82c3c4a9c5846eea372b5` |
 | Rust | `1.94.0` |
 | Rust dependencies | Repository `Cargo.lock`, enforced with `--locked` |
 
-The image digest identifies the exact SDK image even if its tag changes. The
+The image digest identifies the multi-architecture SDK image index even if its
+tag changes; Docker selects the requested architecture's image. The
 [official CANN image source](https://github.com/Ascend/cann-container-image/blob/main/cann/8.5.2-910b-ubuntu22.04-py3.11/Dockerfile)
 documents its contents. The build downloads the
-[official HDK 25.5.1 ARM64 package](https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/Ascend%20HDK/Ascend%20HDK%2025.5.1/Ascend-hdk-910b-npu-driver_25.5.1_linux-aarch64.run),
-checks the package hash, and extracts only its user libraries with `--noexec`.
+official HDK 25.5.1 package matching the target architecture:
+[AMD64 (`x86-64`)](https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/Ascend%20HDK/Ascend%20HDK%2025.5.1/Ascend-hdk-910b-npu-driver_25.5.1_linux-x86-64.run)
+or [ARM64 (`aarch64`)](https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/Ascend%20HDK/Ascend%20HDK%2025.5.1/Ascend-hdk-910b-npu-driver_25.5.1_linux-aarch64.run).
+It checks the architecture-specific package hash pinned in the Dockerfile and
+extracts only its user libraries with `--noexec`.
 It does not install a kernel driver. HDK 25.5.x is listed in the
 [official CANN 8.5.2 compatibility table](https://www.hiascend.com/document/detail/zh/canncommercial/900/releasenote/release-notes.md).
 
@@ -53,20 +67,26 @@ The exported directory contains:
 
 | File | Purpose |
 | --- | --- |
-| `dist/libvnpu.so` | Release ARM64 shared library for deployment into a compatible workload container. |
+| `dist/libvnpu.so` | Release shared library for the selected architecture, for deployment into a compatible workload container. |
 | `dist/build-info.json` | Source commit, Rust/Cargo versions, pinned SDK image, CANN version metadata, SDK library hashes, ELF dependencies, hook exports and SDK API availability. |
 | `dist/SHA256SUMS` | Checksums for the library and build metadata. |
 
 Before export, [release verification](../scripts/ci/verify-release.py) checks the
 ELF architecture and shared-object type, required hook and SDK exports, and
-`ldd -r` resolution against the selected real runtime/DCMI libraries. It records
-whether the CANN libraries provide the spatial-policy APIs. These checks do not
-initialize CANN or DCMI and do not execute NPU kernels.
+`ldd -r` resolution against the selected real runtime/DCMI libraries. It requires
+and records the spatial-policy APIs, because spatial is the default policy.
+These checks do not initialize CANN or DCMI and do not execute NPU kernels.
 
-CI runs this build on native `ubuntu-24.04-arm` and uploads the three files as the
-`libvnpu-cann8.5.2-arm64` artifact. The build container remains Ubuntu 22.04. Deploy
-the resulting library with compatible ARM64 system, CANN and driver libraries;
-the artifact does not bundle the SDK or a driver.
+CI runs this build independently on native runners:
+
+| Target | Runner | Uploaded artifact |
+| --- | --- | --- |
+| Linux AMD64 (`x86_64`) | `ubuntu-24.04` | `libvnpu-cann8.5.2-amd64` |
+| Linux ARM64 (`aarch64`) | `ubuntu-24.04-arm` | `libvnpu-cann8.5.2-arm64` |
+
+Each artifact contains the three files above. The build containers remain Ubuntu
+22.04. Deploy each library with matching-architecture system libraries and
+compatible CANN/driver libraries; the artifact does not bundle the SDK or a driver.
 
 ### Run CPU regressions locally
 
@@ -98,7 +118,7 @@ backend for the calls under test. Standalone workspace `cargo check --workspace
 
 The [workflow](../.github/workflows/ci.yml) runs on pull requests, pushes to `main`
 and manual dispatch. CPU jobs use native x86-64 and ARM64 Ubuntu 24.04 runners,
-separate from the release job. It uses a read-only repository token and does not
+separate from the release jobs. It uses a read-only repository token and does not
 retain checkout credentials. Repository settings can require a maintainer to
 approve the first workflow run from a fork.
 
@@ -126,7 +146,7 @@ changing them and keep formatting-only cleanup separate from behavior changes.
 
 ### 构建发布库
 
-[发布构建任务](../.github/workflows/ci.yml) 使用真实 CANN runtime 和 DCMI 库完整编译
+[发布构建任务](../.github/workflows/ci.yml) 分别使用真实 CANN runtime 和 DCMI 库完整编译
 Rust 工作区，与本地构建共用 [Dockerfile](../dockerfiles/Dockerfile) 和
 [Make 入口](../Makefile)，采用与
 [HAMi-core](https://github.com/Project-HAMi/HAMi-core/blob/main/.github/workflows/build-src.yml)
@@ -139,16 +159,25 @@ make build-in-docker
 cd dist && sha256sum -c SHA256SUMS
 ```
 
-该镜像为 Linux ARM64，建议使用原生 ARM64 构建器；其他架构需先配置 Docker Buildx
-的 ARM64 模拟。构建需要联网获取 SDK 镜像及工具链，无需 NPU、驱动内核模块、集群
-凭据或仓库 secrets。
+官方镜像支持 Linux AMD64 和 ARM64，Make 默认选择当前主机架构。显式选择目标并
+分别保存两种架构的产物：
+
+```sh
+make build-in-docker PLATFORM=linux/amd64 OUT_DIR=dist/amd64
+make build-in-docker PLATFORM=linux/arm64 OUT_DIR=dist/arm64
+```
+
+建议使用目标架构的原生构建器，跨架构构建需先配置 Docker Buildx 模拟。构建需要
+联网获取 SDK 镜像及工具链，无需 NPU、驱动内核模块、集群凭据或仓库 secrets。
 
 构建环境固定使用官方 `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11`
 镜像的不可变摘要、CANN **8.5.2**、Ubuntu 22.04、HDK 驱动用户态库 **25.5.1** 和
 Rust **1.94.0**，完整镜像地址及摘要见上方构建输入表。Rust 依赖通过 `Cargo.lock`
-和 `--locked` 固定。即使镜像标签变化，摘要仍确定同一 SDK 镜像。
+和 `--locked` 固定。即使镜像标签变化，摘要仍确定同一多架构 SDK 镜像索引，
+Docker 根据目标架构选择对应镜像。
 
-Dockerfile 下载官方 HDK 包并验证 SHA256，通过 `--noexec` 只提取用户态库，
+Dockerfile 下载匹配目标架构的官方 HDK 包，并核对其中固定的各架构 SHA256，
+通过 `--noexec` 只提取用户态库，
 不安装内核驱动；官方配套表包含 CANN 8.5.2 与 HDK 25.5.x，镜像源码、下载地址及
 配套表链接见英文部分。构建使用 `/usr/local/Ascend/cann-8.5.2/lib64` 下的真实
 runtime 库，以及 `/usr/local/Ascend/driver/lib64/driver` 下的 DCMI 库和依赖，
@@ -159,17 +188,24 @@ runtime 库，以及 `/usr/local/Ascend/driver/lib64/driver` 下的 DCMI 库和�
 
 | 文件 | 用途 |
 | --- | --- |
-| `dist/libvnpu.so` | 可部署到兼容业务容器的 ARM64 release 库。 |
+| `dist/libvnpu.so` | 可部署到兼容业务容器、与所选目标架构一致的 release 库。 |
 | `dist/build-info.json` | 源码提交、Rust/Cargo 版本、SDK 镜像、CANN 版本信息、SDK 库哈希、ELF 依赖、hook 导出和 SDK API 可用性。 |
 | `dist/SHA256SUMS` | 库和构建信息的校验和。 |
 
 导出前，[产物检查脚本](../scripts/ci/verify-release.py) 核对 ELF 架构与共享库类型、
 hook 与 SDK 导出符号，以及 `ldd -r` 是否正确解析到指定的真实 runtime/DCMI 库，
-并记录 CANN 是否提供空分所需 API。这些检查不会初始化 CANN/DCMI 或执行 NPU 算子。
+要求并记录 CANN 提供空分所需 API，因为空分已是默认策略。
+这些检查不会初始化 CANN/DCMI 或执行 NPU 算子。
 
-CI 使用原生 `ubuntu-24.04-arm` 运行器构建，容器内部仍为 Ubuntu 22.04，并将三个
-文件上传为 `libvnpu-cann8.5.2-arm64` artifact。业务容器需提供兼容的 ARM64 系统库、
-CANN 和驱动库；产物不包含 SDK 或驱动。
+CI 分别在原生运行器构建：
+
+| 目标架构 | 运行器 | 上传产物 |
+| --- | --- | --- |
+| Linux AMD64（`x86_64`） | `ubuntu-24.04` | `libvnpu-cann8.5.2-amd64` |
+| Linux ARM64（`aarch64`） | `ubuntu-24.04-arm` | `libvnpu-cann8.5.2-arm64` |
+
+每个 artifact 都包含上述三个文件，容器内部仍为 Ubuntu 22.04。业务容器需提供
+架构匹配的系统库以及兼容的 CANN 和驱动库；产物不包含 SDK 或驱动。
 
 ### 本地运行 CPU 回归
 

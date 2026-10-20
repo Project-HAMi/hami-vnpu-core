@@ -13,7 +13,7 @@ pub const DEFAULT_LOCAL_SHMEM_PATH: &str = "/tmp/vnpu_local_shmem";
 // 沿用旧配置的默认数值，避免仅改名就把每轮令牌数增加 100 倍。
 pub const DEFAULT_COMPUTE_LIMIT: u32 = 1;
 pub const DEFAULT_MEMORY_LIMIT_MB: u64 = 0;
-pub const DEFAULT_SCHED_POLICY: SchedPolicy = SchedPolicy::Dynamic;
+pub const DEFAULT_SCHED_POLICY: SchedPolicy = SchedPolicy::Spatial;
 
 #[derive(Debug, Clone, Copy)]
 pub struct OverdraftConfig {
@@ -211,11 +211,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_preserve_existing_scheduling_granularity() {
+    fn defaults_select_spatial_and_preserve_resource_values() {
         let cfg = config(&[(ENV_GLOBAL_SHM_PATH, "/tmp/global")]).unwrap();
         assert_eq!(cfg.compute_limit, 1);
         assert_eq!(cfg.memory_limit_mb, 0);
-        assert_eq!(cfg.sched_policy, SchedPolicy::Dynamic);
+        assert_eq!(cfg.sched_policy, SchedPolicy::Spatial);
         assert_eq!(cfg.local_shm_path, DEFAULT_LOCAL_SHMEM_PATH);
     }
 

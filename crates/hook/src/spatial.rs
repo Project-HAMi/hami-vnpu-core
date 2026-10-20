@@ -11,7 +11,7 @@ use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use limiter::config::{ENV_SCHED_POLICY, ManagerConfig, SchedPolicy};
+use limiter::config::{ManagerConfig, SchedPolicy};
 
 const MAX_DEVICES: i32 = 256;
 const CUBE: i32 = 0;
@@ -44,8 +44,8 @@ fn policy() -> &'static Policy {
     let pid = std::process::id();
     let policy = POLICY.get_or_init(pid, || {
         // Other policies must not require any of the optional resource APIs.
-        let spatial = std::env::var(ENV_SCHED_POLICY)
-            .ok().is_some_and(|value| value.trim() == "spatial");
+        let spatial = SchedPolicy::from_env().unwrap_or_else(|error| fatal(&error))
+            == SchedPolicy::Spatial;
         let percent = if spatial {
             let cfg = ManagerConfig::from_env().unwrap_or_else(|error| fatal(&error));
             if cfg.sched_policy != SchedPolicy::Spatial { fatal("inconsistent spatial policy"); }

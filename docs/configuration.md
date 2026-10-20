@@ -12,7 +12,7 @@ This reference describes the library in this branch. Load the matching `libvnpu.
 | `NPU_LOCAL_SHM_PATH` | `/tmp/vnpu_local_shmem` | Nonempty file path for one accounting/scheduling group of application processes. All participating processes must see the same underlying file. Give independent groups different files. |
 | `NPU_MEMORY_LIMIT_MB` | `0` | Non-negative integer, in MiB despite the historical `_MB` name: `1` means `1,048,576` bytes. `0` disables the HBM quota. Values too large to convert to a `u64` byte count are rejected. |
 | `NPU_COMPUTE_LIMIT` | `1` | Integer `1`–`100`, inclusive. Relative share with `dynamic`/`overdraft`, target run/rest percentage with `fixed`, cooperative per-process Cube/Vector percentage with `spatial`. Set it explicitly for your workload. |
-| `NPU_SCHED_POLICY` | `dynamic` | Exactly `dynamic`, `fixed`, `overdraft`, or `spatial`. Surrounding whitespace is trimmed; the core's names are case-sensitive. See [policy tradeoffs](scheduling-policies.md). |
+| `NPU_SCHED_POLICY` | `spatial` | Exactly `dynamic`, `fixed`, `overdraft`, or `spatial`. Surrounding whitespace is trimmed; the core's names are case-sensitive. See [policy tradeoffs](scheduling-policies.md). |
 
 There is one memory quota and one compute setting per local SHM group, not a list of per-device settings. HBM accounting sums allocations across its processes and device counters. A `spatial` compute budget applies independently to each process/device, so adding worker processes does not divide that budget between them.
 
@@ -66,6 +66,11 @@ The virtual HBM free-memory report reserves 128 MiB of overhead. This internal c
 The library also links the CANN `runtime` library. Build against the intended Linux architecture and install compatible runtime/driver dependencies in the deployment. Setting the two build roots does not install those dependencies or configure the application's runtime library lookup.
 
 ## Migration from older variables
+
+The default scheduling policy is now `spatial`; `NPU_COMPUTE_LIMIT` still defaults
+to `1`. Deployments that previously relied on an unset policy for Dynamic
+scheduling must set `NPU_SCHED_POLICY=dynamic` explicitly to preserve that behavior.
+Keep `NPU_GLOBAL_SHM_PATH` configured for every policy.
 
 Remove the old variables completely, even if set to an empty string or alongside the replacement. The current parser rejects their presence.
 
