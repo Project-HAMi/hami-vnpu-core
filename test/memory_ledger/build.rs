@@ -14,9 +14,9 @@ fn main() {
         .replace("pub mod setup;", &format!("#[path = {:?}] pub mod setup;", source.join("shmem/setup.rs")))
         .replace("pub mod futex;", &futex)).unwrap();
     fs::write(output.join("source.rs"), format!(
-        "#[path = {:?}] pub mod config; #[path = {:?}] pub mod worker;",
-        source.join("config.rs"), source.join("worker.rs"))).unwrap();
-    for name in ["config.rs", "worker.rs", "shmem/mod.rs", "shmem/setup.rs", "shmem/futex.rs"] {
+        "#[path = {:?}] pub mod config; #[path = {:?}] pub mod overdraft; #[path = {:?}] pub mod worker;",
+        source.join("config.rs"), source.join("overdraft.rs"), source.join("worker.rs"))).unwrap();
+    for name in ["config.rs", "overdraft.rs", "worker.rs", "shmem/mod.rs", "shmem/setup.rs", "shmem/futex.rs"] {
         println!("cargo:rerun-if-changed={}", source.join(name).display());
     }
 }

@@ -283,6 +283,12 @@ impl SchedulerClient {
             return;
         }
 
+        let wait_start = Instant::now();
+        // No event or active-worker accounting for successful IDLE overdraft admissions.
+        if self.try_idle_overdraft(false) {
+            return;
+        }
+
         // The shared guard is dropped before acquiring the writer lock.
         // Batch initialization, stream changes and measurement remain exclusive.
         let mut lock = self.inner.lock.write().unwrap();
@@ -362,14 +368,35 @@ impl SchedulerClient {
                 // IDLE
                 // ---------------------------------------------------------
                 _ => {
+                    let shared = self.inner.shmem;
+                    let limit = shared.overdraft_limit.load(Ordering::Acquire);
+                    let timed_out = wait_start.elapsed().as_micros()
+                        >= shared.overdraft_timeout_us.load(Ordering::Relaxed) as u128;
+                    if limit > 0 && self.try_idle_overdraft(timed_out) {
+                        return;
+                    }
                     drop(lock); // UNLOCK
-                    if self.inner.shmem.state.load(Ordering::Acquire) == STATE_IDLE {
-                        futex::wait(&self.inner.shmem.state, STATE_IDLE);
+                    if shared.state.load(Ordering::Acquire) == STATE_IDLE {
+                        if limit > 0 {
+                            futex::wait_timeout(&shared.state, STATE_IDLE,
+                                shared.overdraft_poll_interval_us.load(Ordering::Relaxed).max(1));
+                        } else {
+                            futex::wait(&shared.state, STATE_IDLE);
+                        }
                     }
                     lock = self.inner.lock.write().unwrap(); // RELOCK
+                    // Always re-enter the state machine after a wake/timeout.
+                    // A successful poll alone is never permission to launch.
                 }
             }
         }
+    }
+
+    fn try_idle_overdraft(&self, timed_out: bool) -> bool {
+        let shared = self.inner.shmem;
+        shared.overdraft_pool.try_acquire_idle(
+            &shared.state, &shared.batch_id, STATE_IDLE, &shared.overdraft_limit, timed_out,
+        )
     }
 
     fn measure_and_report_batch(&self, lock: &mut InnerLock) {

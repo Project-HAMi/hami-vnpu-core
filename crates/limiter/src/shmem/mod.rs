@@ -15,7 +15,7 @@ pub struct GlobalManagerSlot {
     pub avg_kernel_time: AtomicU64,
     pub last_heartbeat: AtomicU64,
     pub is_active: AtomicU32,
-    pub priority: AtomicU64,
+    pub compute_limit: AtomicU64,
 }
 
 #[repr(C)]
@@ -78,7 +78,7 @@ const _: () = {
 pub struct LocalContainerShmem {
     pub memory_limit: AtomicU64,
     pub memory_used: AtomicU64,
-    pub compute_priority: AtomicU64,
+    pub compute_limit: AtomicU64,
 
     pub state: AtomicU32,
     pub batch_id: AtomicU64,
@@ -95,5 +95,21 @@ pub struct LocalContainerShmem {
     pub manager_pid: AtomicI32,        // elected manager's container PID; 0 = none
     pub manager_heartbeat: AtomicU64,  // manager heartbeat (us); stale => eligible for takeover
     pub manager_global_idx: AtomicI32, // global slot the manager holds (for takeover reclaim)
-    pub initialized: AtomicU32,        // 1 once manager published limit/priority; workers wait on it
+    pub initialized: AtomicU32,        // 1 once manager published resource configuration; workers wait on it
+
+    // Append only: the monitor's existing reports/procs offsets remain stable.
+    pub overdraft_pool: crate::overdraft::OverdraftPool,
+    pub overdraft_limit: AtomicU32,
+    pub overdraft_timeout_us: AtomicU64,
+    pub overdraft_poll_interval_us: AtomicU64,
 }
+
+// Keep offsets consumed by the device-plugin monitor unchanged.
+const _: () = {
+    assert!(std::mem::size_of::<GlobalManagerSlot>() == 40);
+    assert!(std::mem::offset_of!(GlobalManagerSlot, compute_limit) == 32);
+    assert!(std::mem::offset_of!(LocalContainerShmem, compute_limit) == 16);
+    assert!(std::mem::offset_of!(LocalContainerShmem, reports) == 56);
+    assert!(std::mem::offset_of!(LocalContainerShmem, procs) == 1080);
+    assert!(std::mem::offset_of!(LocalContainerShmem, overdraft_pool) == 6224);
+};

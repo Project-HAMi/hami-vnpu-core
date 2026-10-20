@@ -68,6 +68,7 @@ pub fn run() {
             let g = *global.get_or_insert_with(|| setup::open_global_registry(&cfg.global_shm_path));
 
             reclaim_stale_global_slot(g, local, old_pid);
+            local.overdraft_pool.close();
             local.state.store(STATE_IDLE, Ordering::Release);
             futex::wake_all(&local.state);
 

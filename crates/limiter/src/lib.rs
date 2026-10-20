@@ -3,6 +3,7 @@ pub mod manager;
 pub mod shmem;
 pub mod externed_api;
 pub mod config;
+pub mod overdraft;
 pub mod supervisor;
 
 use ctor::ctor;

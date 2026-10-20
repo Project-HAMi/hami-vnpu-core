@@ -9,7 +9,7 @@ fn client(limit: u64, used: u64) -> SchedulerClient {
     shmem.state.store(STATE_RUNNING, Ordering::Relaxed);
     shmem.batch_id.store(19, Ordering::Relaxed);
     shmem.tokens_remaining.store(137, Ordering::Relaxed);
-    shmem.compute_priority.store(50, Ordering::Relaxed);
+    shmem.compute_limit.store(50, Ordering::Relaxed);
     set_slot(shmem, 0, std::process::id() as i32, used);
     // Start with the production constructor's lock type so this independent
     // suite also composes with the worker read-lock PR.
@@ -29,7 +29,7 @@ fn assert_compute_unchanged(shmem: &LocalContainerShmem) {
     assert_eq!(STATE_RUNNING, shmem.state.load(Ordering::Acquire));
     assert_eq!(19, shmem.batch_id.load(Ordering::Acquire));
     assert_eq!(137, shmem.tokens_remaining.load(Ordering::Acquire));
-    assert_eq!(50, shmem.compute_priority.load(Ordering::Acquire));
+    assert_eq!(50, shmem.compute_limit.load(Ordering::Acquire));
 }
 fn me() -> i32 { std::process::id() as i32 }
 fn other(offset: i32) -> i32 { me().checked_add(100_000 + offset).unwrap() }
@@ -237,9 +237,10 @@ fn real_fork_refreshes_self_pid_without_exempting_inherited_parent_slot() {
 }
 
 #[test]
-fn memory_abi_size_and_process_offset_remain_original_main() {
-    assert_eq!(6224, std::mem::size_of::<LocalContainerShmem>());
+fn memory_abi_preserves_original_prefix_and_appends_overdraft_fields() {
+    assert_eq!(6256, std::mem::size_of::<LocalContainerShmem>());
     assert_eq!(1080, std::mem::offset_of!(LocalContainerShmem, procs));
+    assert_eq!(6224, std::mem::offset_of!(LocalContainerShmem, overdraft_pool));
 }
 
 #[test]

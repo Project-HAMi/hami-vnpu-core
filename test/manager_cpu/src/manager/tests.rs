@@ -1,13 +1,14 @@
 use super::*;
 
-fn manager(priority: f64, fixed: bool, average: u64) -> ContainerManager {
+fn manager(compute_limit: f64, fixed: bool, average: u64) -> ContainerManager {
     let global = Box::leak(Box::new(unsafe { std::mem::zeroed::<GlobalRegistry>() }));
     let local = Box::leak(Box::new(unsafe { std::mem::zeroed::<LocalContainerShmem>() }));
     global.slots[0].is_active.store(1, Ordering::Relaxed);
     global.slots[0].avg_kernel_time.store(average, Ordering::Relaxed);
     ContainerManager { global, local, my_pid: std::process::id() as i32,
-        my_global_idx: 0, current_avg_us: average, my_priority: priority,
-        token_scale: 100.0, ema_alpha: 0.7, fixed_share_ratio: fixed,
+        my_global_idx: 0, current_avg_us: average, compute_limit,
+        token_scale: 100.0, ema_alpha: 0.7,
+        sched_policy: if fixed { SchedPolicy::Fixed } else { SchedPolicy::Dynamic },
         next_run_not_before: None }
 }
 
