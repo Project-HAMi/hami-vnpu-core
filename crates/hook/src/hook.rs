@@ -1,6 +1,7 @@
 #![allow(non_snake_case)]
 use crate::npu_limiter;
 use limiter::externed_api::{RT_ERROR_MEMORY_ALLOCATION, RT_ERROR_NONE};
+use limiter::worker::AllocationKind;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtAicpuKernelLaunchExWithArgs(
@@ -128,7 +129,29 @@ pub extern "C" fn rtMalloc(devPtr: u64, size: u64, t: u32, moduleId: u16) -> u64
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtMallocPhysical(handle: u64, size: u64, prop: u64, flags: u64) -> u64 {
-    let client = npu_limiter();
+    // rtDrvMemProp_t in CANN 8.5.2 begins with uint32 side, uint32 devid.
+    // Device memory is side=1, and devid is the target logical ordinal. ACL's
+    // public physical-memory property has a DIFFERENT layout.
+    let target = if prop != 0 {
+        let prefix = unsafe { std::ptr::read_unaligned(prop as *const [u32; 2]) };
+        (prefix[0] == 1)
+            .then_some(prefix[1])
+            .filter(|id| *id <= i32::MAX as u32)
+    } else {
+        None
+    };
+    let Some(target) = target else {
+        // Host allocations and invalid/null properties retain native validation.
+        return passthrough!(
+            "rtMallocPhysical",
+            (u64, u64, u64, u64),
+            handle,
+            size,
+            prop,
+            flags
+        );
+    };
+    let client = crate::npu_limiter_for_device(target as i32);
     if client.is_hbm_limited() {
         if client.check_memory_quota(size) == 0 {
             let ret = passthrough!(
@@ -142,11 +165,11 @@ pub extern "C" fn rtMallocPhysical(handle: u64, size: u64, prop: u64, flags: u64
             if ret == RT_ERROR_NONE {
                 // malloc successfully
                 let actual_handle = unsafe { *(handle as *const u64) };
-                client.post_alloc_hbm(actual_handle, size, ret);
+                client.post_alloc_hbm_kind(actual_handle, size, ret, AllocationKind::Physical);
                 return RT_ERROR_NONE;
             } else {
                 // malloc failed
-                client.post_alloc_hbm(0, size, ret);
+                client.post_alloc_hbm_kind(0, size, ret, AllocationKind::Physical);
                 return RT_ERROR_MEMORY_ALLOCATION;
             }
         } else {
@@ -167,10 +190,7 @@ pub extern "C" fn rtMallocPhysical(handle: u64, size: u64, prop: u64, flags: u64
 #[unsafe(no_mangle)]
 pub extern "C" fn rtFreePhysical(handle: u64) -> u64 {
     let ret = passthrough!("rtFreePhysical", (u64), handle);
-    let client = npu_limiter();
-    if client.is_hbm_limited() {
-        client.post_free_hbm(handle, ret);
-    }
+    crate::release_hbm(handle, ret, AllocationKind::Physical);
 
     ret
 }
@@ -178,10 +198,7 @@ pub extern "C" fn rtFreePhysical(handle: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn rtFree(ptr: u64) -> u64 {
     let ret = passthrough!("rtFree", (u64), ptr);
-    let client = npu_limiter();
-    if client.is_hbm_limited() {
-        client.post_free_hbm(ptr, ret);
-    }
+    crate::release_hbm(ptr, ret, AllocationKind::Virtual);
 
     ret
 }
@@ -259,4 +276,19 @@ pub unsafe extern "C" fn aclrtSetStreamResLimit(
 /// default stream as permitted by CANN.
 pub unsafe extern "C" fn aclrtResetStreamResLimit(stream: *mut std::ffi::c_void) -> i32 {
     unsafe { crate::spatial::reset_stream_resources(stream) }
+}
+
+// Runtime-only applications must receive the same before-tiling budgets as ACL users.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtSetDevice(device: i32) -> i32 {
+    crate::spatial::runtime_selection(|| passthrough!("rtSetDevice", (i32), device) as i32)
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+/// `context` must be a valid live CANN context handle.
+pub unsafe extern "C" fn rtCtxSetCurrent(context: *mut std::ffi::c_void) -> i32 {
+    crate::spatial::runtime_selection(|| {
+        passthrough!("rtCtxSetCurrent", (*mut std::ffi::c_void), context) as i32
+    })
 }

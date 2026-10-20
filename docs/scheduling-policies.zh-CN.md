@@ -61,7 +61,7 @@ core 库默认采用 `spatial`，`NPU_COMPUTE_LIMIT` 默认仍是 `1`。请按�
 | `60` | 12 | 24 |
 | `100` | 20 | 40 |
 
-在 `aclrtSetDevice` 或 `aclrtSetCurrentContext` 成功后，库通过 CANN 设备资源 API 设置预算并读回校验。应先选择设备或 Context，再初始化算子和计算 Tiling。仅调用 `aclrtCreateContext` 不会应用预算；之后在分配/提交入口补做检查，也无法改变已经完成 Tiling 的算子。
+在 `aclrtSetDevice` 或 `aclrtSetCurrentContext` 成功后，库通过 CANN 设备资源 API 设置预算并读回校验。应先选择设备或 Context，再初始化算子和计算 Tiling。被拦截的 Context 创建成功后也会在返回前应用预算；之后在分配/提交入口补做检查，也无法改变已经完成 Tiling 的算子。
 
 Spatial worker 跳过正常准入令牌、时间测量、Overdraft 和全局算力轮转。本地 Manager 继续维护共享 HBM 计量和进程清理。
 
@@ -71,7 +71,7 @@ Spatial worker 跳过正常准入令牌、时间测量、Overdraft 和全局算�
 - 不会独占预留具体核 ID。20/40 硬件上，三个 `33` 进程的预算之和为 21 Cube / 42 Vector，实际资源由 CANN 共享；不会因为向上取整而拒绝请求。
 - 算子必须查询并遵守资源预算。直接使用完整物理核数进行 Tiling 的自定义算子可能不受约束。关键算子应通过设备 Trace 确认，不能只根据预算读回成功作判断。
 - 父进程开始设备初始化后，worker 应通过 spawn 或重新执行程序启动。此时 fork 出来的子进程继续使用 NPU 会被拒绝。
-- CANN 运行时必须提供被拦截的设备与 Stream 资源 API。缺少 API、初始资源数无效、预算设置或读回失败时，进程以状态码 `78` 退出。同一进程初始化多张设备后，对非默认 Stream 修改资源限制会被拒绝，因为无法安全确认 Stream 的设备归属。
+- CANN 运行时必须提供被拦截的设备与 Stream 资源 API。缺少 API、初始资源数无效、预算设置或读回失败时，进程以状态码 `78` 退出。创建/销毁 Hook 会记录 Stream 所属设备和 Context，因此同一进程可以设置/重置多张卡上的显式 Stream 预算。无法确认归属的非默认 Stream 会被拒绝，不会猜测其属于当前卡。
 
 图执行、跨设备 Stream 使用，以及直接通过更底层接口修改资源的场景，需要单独验证应用。API 约定和实现细节参见 [Spatial 设计](spatial-policy.md)。
 
@@ -81,11 +81,11 @@ Spatial worker 跳过正常准入令牌、时间测量、Overdraft 和全局算�
 
 | 资源 | `dynamic`、`fixed`、`overdraft` | `spatial` |
 | --- | --- | --- |
-| 正常算力配额 | 本地 SHM 组内的进程共享准入令牌池 | 每进程、每设备各有一份预算 |
+| 正常算力配额 | 每张卡独立，组内使用该卡的进程共享准入令牌池 | 每进程、每设备各有一份预算 |
 | 额外借用 | 仅 `overdraft` 增加 IDLE 令牌 | 无；按 CANN 资源预算执行 |
-| HBM 上限 | 本地 SHM 组内的进程、设备合计共享 | 相同的共享 HBM 上限 |
+| HBM 上限 | 每张卡独立，由使用该卡的组内进程共享 | 相同的每卡 HBM 上限 |
 
-`NPU_MEMORY_LIMIT_MB=20480` 表示整个组共有 20 GiB HBM 配额，不是每进程或每张选中卡各有 20 GiB。显存控制与算力策略独立。算力配置为 `100` 时仍保留显存控制以及所选策略的 Hook，并不会移除库。
+`NPU_MEMORY_LIMIT_MB=20480` 表示**每张卡各有 20 GiB** HBM 配额，由使用该卡的组内进程共享；各卡用量不累加。显存控制与算力策略独立。算力配置为 `100` 时仍保留显存控制以及所选策略的 Hook，并不会移除库。
 
 时间调度负载只会与共享其全局注册表的参与者协调。Spatial 负载和未加载 Hook 的应用不加入时间轮转。混合部署需要规划容量：时间调度组的百分比不会限制相邻负载。
 
@@ -94,7 +94,7 @@ Spatial worker 跳过正常准入令牌、时间测量、Overdraft 和全局算�
 准备好共享文件和库后，显式配置一个参与负载：
 
 ```bash
-export NPU_GLOBAL_SHM_PATH=/hami-shared-region/device-7-registry
+export NPU_GLOBAL_SHM_PATH=/hami-shared-region/registry
 export NPU_LOCAL_SHM_PATH=/tmp/vnpu-local
 export NPU_MEMORY_LIMIT_MB=20480
 export NPU_COMPUTE_LIMIT=30

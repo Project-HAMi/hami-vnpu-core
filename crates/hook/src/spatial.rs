@@ -35,7 +35,7 @@ static POLICY: crate::process::ProcessLocal<Policy> = crate::process::ProcessLoc
 static DEVICE_PROCESS: AtomicU32 = AtomicU32::new(0);
 thread_local! { static INTERNAL: Cell<bool> = const { Cell::new(false) }; }
 
-fn fatal(reason: &str) -> ! {
+pub(crate) fn fatal(reason: &str) -> ! {
     eprintln!(
         "[hami-vnpu-core spatial] fatal pid={}: {reason}",
         std::process::id()
@@ -78,7 +78,7 @@ pub fn enabled() -> bool {
     policy().percent.is_some()
 }
 
-fn internal() -> bool {
+pub(crate) fn internal() -> bool {
     // A CANN callback can fork on this very thread while InternalGuard is live.
     // Check the process before consulting inherited TLS; otherwise `true` would
     // bypass policy() and its PID guard in the child. Owner zero is the ordinary
@@ -90,16 +90,15 @@ fn internal() -> bool {
     INTERNAL.with(Cell::get)
 }
 
-struct InternalGuard;
+struct InternalGuard(bool);
 impl InternalGuard {
     fn enter() -> Self {
-        INTERNAL.with(|flag| flag.set(true));
-        Self
+        Self(INTERNAL.with(|flag| flag.replace(true)))
     }
 }
 impl Drop for InternalGuard {
     fn drop(&mut self) {
-        INTERNAL.with(|flag| flag.set(false));
+        INTERNAL.with(|flag| flag.set(self.0));
     }
 }
 
@@ -110,7 +109,7 @@ fn devices(policy: &Policy) -> MutexGuard<'_, HashMap<i32, Budget>> {
         .unwrap_or_else(|_| fatal("resource bookkeeping lock is poisoned"))
 }
 
-fn mark_device_use() {
+pub(crate) fn mark_device_use() {
     let pid = std::process::id();
     let owner = DEVICE_PROCESS.load(Ordering::Acquire);
     if owner == 0 {
@@ -215,9 +214,64 @@ pub fn ensure_current_device() {
     apply(&mut map, current_device(), percent);
 }
 
+/// Apply the configured budget after an API creates a context for this device.
+pub(crate) fn ensure_device(device: i32) {
+    if internal() {
+        return;
+    }
+    let policy = policy();
+    let Some(percent) = policy.percent else {
+        return;
+    };
+    let _internal = InternalGuard::enter();
+    apply(&mut devices(policy), device, percent);
+}
+
+/// Runtime selection may create native internal streams before its context is
+/// fully installed. Suppress lifecycle tracking for those implementation details.
+pub(crate) fn runtime_selection(operation: impl FnOnce() -> i32) -> i32 {
+    let nested = internal();
+    if enabled() {
+        mark_device_use();
+    }
+    let guard = InternalGuard::enter();
+    let rc = operation();
+    drop(guard);
+    if rc == 0 && !nested {
+        ensure_current_device();
+    }
+    rc
+}
+
+/// Invalidate device-owned handles after a successful outer runtime reset. A
+/// reset may destroy the current context, so do not query it on the return path.
+pub(crate) fn runtime_reset(device: i32, operation: impl FnOnce() -> i32) -> i32 {
+    let nested = internal();
+    if enabled() {
+        mark_device_use();
+    }
+    let guard = InternalGuard::enter();
+    let rc = operation();
+    drop(guard);
+    if rc == 0 && !nested {
+        crate::ownership::forget_device(device);
+        let policy = policy();
+        if policy.percent.is_some()
+            && let Some(budget) = devices(policy).get_mut(&device)
+        {
+            budget.applied = false;
+        }
+    }
+    rc
+}
+
 pub fn set_device(device: i32) -> i32 {
     let real: unsafe extern "C" fn(i32) -> i32 = unsafe { symbol(c"aclrtSetDevice") };
-    if internal() || !enabled() {
+    if internal() {
+        return unsafe { real(device) };
+    }
+    if !enabled() {
+        let _internal = InternalGuard::enter();
         return unsafe { real(device) };
     }
     let policy = policy();
@@ -236,7 +290,11 @@ pub fn set_device(device: i32) -> i32 {
 pub unsafe fn set_context(context: *mut c_void) -> i32 {
     let real: unsafe extern "C" fn(*mut c_void) -> i32 =
         unsafe { symbol(c"aclrtSetCurrentContext") };
-    if internal() || !enabled() {
+    if internal() {
+        return unsafe { real(context) };
+    }
+    if !enabled() {
+        let _internal = InternalGuard::enter();
         return unsafe { real(context) };
     }
     let policy = policy();
@@ -258,13 +316,25 @@ pub fn reset_device(device: i32, force: bool) -> i32 {
             c"aclrtResetDevice"
         })
     };
-    if internal() || !enabled() {
+    if internal() {
         return unsafe { real(device) };
+    }
+    if !enabled() {
+        let guard = InternalGuard::enter();
+        let rc = unsafe { real(device) };
+        drop(guard);
+        if rc == 0 {
+            crate::ownership::forget_device(device);
+        }
+        return rc;
     }
     let policy = policy();
     let _internal = InternalGuard::enter();
     let mut map = devices(policy);
     let rc = unsafe { real(device) };
+    if rc == 0 {
+        crate::ownership::forget_device(device);
+    }
     if rc == 0
         && let Some(budget) = map.get_mut(&device)
     {
@@ -311,14 +381,10 @@ pub fn reset_device_resources(device: i32) -> i32 {
     rc
 }
 
-fn stream_device(map: &HashMap<i32, Budget>, stream: *mut c_void) -> i32 {
-    // CANN 9.1 exposes no public general stream-to-device query. Do not apply a
-    // larger current-device cap to a stream belonging to a different device.
-    let device = current_device();
-    if !stream.is_null() && (map.len() > 1 || (!map.is_empty() && !map.contains_key(&device))) {
-        fatal("explicit stream resource overrides with multiple devices are unsupported");
-    }
-    device
+fn stream_device(stream: *mut c_void) -> i32 {
+    crate::ownership::owner_for_stream(stream)
+        .unwrap_or_else(|| fatal("cannot determine the owner of an untracked stream"))
+        .device
 }
 
 /// # Safety
@@ -332,7 +398,7 @@ pub unsafe fn set_stream_resource(stream: *mut c_void, resource: i32, value: u32
     let policy = policy();
     let _internal = InternalGuard::enter();
     let mut map = devices(policy);
-    let device = stream_device(&map, stream);
+    let device = stream_device(stream);
     apply(&mut map, device, policy.percent.unwrap());
     let cap = map[&device].limit[resource as usize];
     let rc = unsafe { real(stream, resource, value.min(cap)) };
@@ -358,7 +424,7 @@ pub unsafe fn reset_stream_resources(stream: *mut c_void) -> i32 {
     let policy = policy();
     let _internal = InternalGuard::enter();
     let mut map = devices(policy);
-    let device = stream_device(&map, stream);
+    let device = stream_device(stream);
     apply(&mut map, device, policy.percent.unwrap());
     let rc = unsafe { real(stream) };
     if rc == 0 {

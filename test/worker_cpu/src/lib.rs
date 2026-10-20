@@ -12,33 +12,73 @@ include!(concat!(env!("OUT_DIR"), "/source.rs"));
 pub mod shmem { include!(concat!(env!("OUT_DIR"), "/shared.rs")); }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Call { StreamCreate, EventCreate, Record(u64,u64), Wait(u64,u64),
+pub enum Call { StreamCreate(u64), EventCreate(u64), Record(u64,u64), Wait(u64,u64),
     StreamSync(u64), DeviceSync, Elapsed(u64,u64), Capture(u64), Native(&'static str, Vec<u64>,u64) }
 pub static CALLS: std::sync::Mutex<Vec<Call>> = std::sync::Mutex::new(Vec::new());
 pub fn trace(call: Call) { CALLS.lock().unwrap().push(call); }
 pub fn calls() -> Vec<Call> { CALLS.lock().unwrap().clone() }
 pub fn clear_calls() { CALLS.lock().unwrap().clear(); }
+static DEVICE_ONE: std::sync::OnceLock<worker::SchedulerClient> = std::sync::OnceLock::new();
+static NATIVE_MEMORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NEXT_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10000);
 static CLIENT: std::sync::OnceLock<worker::SchedulerClient> = std::sync::OnceLock::new();
 pub fn npu_limiter() -> &'static worker::SchedulerClient { CLIENT.get().expect("test client not installed") }
+pub fn npu_limiter_for_device(logical: i32) -> &'static worker::SchedulerClient {
+    match logical {
+        0 => npu_limiter(),
+        1 => DEVICE_ONE.get().expect("target card client not installed"),
+        _ => panic!("invalid test logical device"),
+    }
+}
+pub(crate) fn release_hbm(handle: u64, ret: u64, kind: worker::AllocationKind) {
+    for client in [CLIENT.get(), DEVICE_ONE.get()].into_iter().flatten() {
+        if client.owns_hbm_handle_kind(handle, kind) {
+            client.post_free_hbm_kind(handle, ret, kind);
+            return;
+        }
+    }
+}
+pub(crate) fn retire_context(context: u64) {
+    if let Some(client) = CLIENT.get() { client.retire_context(context); }
+}
 fn native(name: &'static str, args: &[u64]) -> u64 {
     #[cfg(test)] let remaining = worker::audit::remaining(npu_limiter());
     #[cfg(not(test))] let remaining = 0;
     trace(Call::Native(name, args.to_vec(), remaining));
+    if NATIVE_MEMORY.load(std::sync::atomic::Ordering::Acquire) {
+        if name == "rtMalloc" || name == "rtMallocPhysical" {
+            let handle = NEXT_MEMORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            unsafe { *(args[0] as *mut u64) = handle; }
+        }
+        return 0;
+    }
     89
 }
 pub mod externed_api {
     use super::{Call,trace};
     use std::sync::atomic::{AtomicU64,Ordering};
+    static OWNERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, u64>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    fn track_resource(handle: u64) { OWNERS.lock().unwrap().insert(handle, CONTEXT.get()); }
+    fn check_resource(handle: u64) {
+        if let Some(owner) = OWNERS.lock().unwrap().get(&handle) {
+            assert_eq!(*owner, CONTEXT.get(), "timing resource reused in another context");
+        }
+    }
     static NEXT: AtomicU64 = AtomicU64::new(100);
     pub const RT_ERROR_NONE: u64 = 0;
     pub const RT_ERROR_MEMORY_ALLOCATION: u64 = 207001;
-    pub unsafe fn rtStreamCreate(out: *mut u64, _: i32) -> i32 { unsafe { *out = NEXT.fetch_add(1,Ordering::Relaxed); } trace(Call::StreamCreate); 0 }
-    pub unsafe fn rtEventCreate(out: *mut u64) -> usize { unsafe { *out = NEXT.fetch_add(1,Ordering::Relaxed); } trace(Call::EventCreate); 0 }
-    pub unsafe fn rtEventRecord(event: u64, stream: u64) -> usize { trace(Call::Record(event,stream)); 0 }
-    pub unsafe fn rtStreamWaitEvent(stream: u64, event: u64) -> usize { trace(Call::Wait(stream,event)); 0 }
-    pub unsafe fn rtStreamSynchronize(stream: u64) -> i32 { trace(Call::StreamSync(stream)); 0 }
+    pub unsafe fn rtStreamCreate(out: *mut u64, _: i32) -> i32 { unsafe { *out = NEXT.fetch_add(1,Ordering::Relaxed); } track_resource(unsafe { *out }); trace(Call::StreamCreate(CONTEXT.get())); 0 }
+    pub unsafe fn rtEventCreate(out: *mut u64) -> usize { unsafe { *out = NEXT.fetch_add(1,Ordering::Relaxed); } track_resource(unsafe { *out }); trace(Call::EventCreate(CONTEXT.get())); 0 }
+    pub unsafe fn rtEventRecord(event: u64, stream: u64) -> usize { check_resource(event); check_resource(stream); trace(Call::Record(event,stream)); 0 }
+    pub unsafe fn rtStreamWaitEvent(stream: u64, event: u64) -> usize { check_resource(stream); check_resource(event); trace(Call::Wait(stream,event)); 0 }
+    pub unsafe fn rtStreamSynchronize(stream: u64) -> i32 { check_resource(stream); trace(Call::StreamSync(stream)); 0 }
     pub unsafe fn rtDeviceSynchronize() -> i32 { trace(Call::DeviceSync); 0 }
-    pub unsafe fn rtEventElapsedTime(out: *mut f32, first: u64,last:u64) -> usize { trace(Call::Elapsed(first,last)); unsafe { *out = 2.5; } 0 }
+    pub unsafe fn rtEventElapsedTime(out: *mut f32, first: u64,last:u64) -> usize { check_resource(first); check_resource(last); trace(Call::Elapsed(first,last)); unsafe { *out = 2.5; } 0 }
+    std::thread_local! { static CONTEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+    pub fn set_context(context: u64) { CONTEXT.set(context); }
+    pub unsafe fn rtCtxGetCurrent(out: *mut u64) -> i32 { unsafe { *out = CONTEXT.get() }; 0 }
+    pub unsafe fn rtGetDevicePhyIdByIndex(logical: u32, out: *mut u32) -> i32 { unsafe { *out = logical }; 0 }
     pub unsafe fn rtSetDevice(_: i32) -> i32 { 0 }
     pub unsafe fn rtGetDevice(out: *mut i32) -> i32 { unsafe { *out=0; } 0 }
     pub unsafe fn rtStreamGetCaptureInfo(stream: u64, status: *mut u32,_: *mut u64) -> i32 { trace(Call::Capture(stream)); unsafe { *status=0; } 0 }

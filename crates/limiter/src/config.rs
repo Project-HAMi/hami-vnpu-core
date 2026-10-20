@@ -116,6 +116,8 @@ impl std::fmt::Display for SchedPolicy {
 pub struct ManagerConfig {
     pub global_shm_path: String,
     pub local_shm_path: String,
+    /// Physical NPU assigned to this independent accounting/scheduling domain.
+    pub physical_device_id: Option<u32>,
     pub compute_limit: u32,
     pub memory_limit_mb: u64,
     pub sched_policy: SchedPolicy,
@@ -123,6 +125,22 @@ pub struct ManagerConfig {
 }
 
 impl ManagerConfig {
+    /// Derive one domain per physical NPU, shared across logical-device remapping.
+    pub fn for_device(&self, physical_device_id: u32) -> Self {
+        let mut config = self.clone();
+        let derive = |path: &str| {
+            let base = self
+                .physical_device_id
+                .and_then(|previous| path.strip_suffix(&format!(".device-{previous}")))
+                .unwrap_or(path);
+            format!("{base}.device-{physical_device_id}")
+        };
+        config.global_shm_path = derive(&self.global_shm_path);
+        config.local_shm_path = derive(&self.local_shm_path);
+        config.physical_device_id = Some(physical_device_id);
+        config
+    }
+
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|name| match std::env::var(name) {
             Ok(value) => Ok(Some(value)),
@@ -186,6 +204,7 @@ impl ManagerConfig {
         Ok(Self {
             global_shm_path,
             local_shm_path,
+            physical_device_id: None,
             compute_limit,
             memory_limit_mb,
             sched_policy,
@@ -229,6 +248,34 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| value.to_string()))
         })
+    }
+
+    #[test]
+    fn physical_devices_have_independent_stable_domain_paths() {
+        let base = config(&[
+            (ENV_GLOBAL_SHM_PATH, "/shared/npu"),
+            (ENV_LOCAL_SHM_PATH, "/tmp/pod"),
+            (ENV_MEMORY_LIMIT_MB, "20480"),
+            (ENV_COMPUTE_LIMIT, "30"),
+            (ENV_SCHED_POLICY, "overdraft"),
+        ])
+        .unwrap();
+        let first = base.for_device(7);
+        let second = base.for_device(3);
+        assert_eq!(first.global_shm_path, "/shared/npu.device-7");
+        assert_eq!(first.local_shm_path, "/tmp/pod.device-7");
+        assert_eq!(second.global_shm_path, "/shared/npu.device-3");
+        assert_eq!(second.local_shm_path, "/tmp/pod.device-3");
+        assert_eq!(first.physical_device_id, Some(7));
+        assert_eq!(second.physical_device_id, Some(3));
+        assert_eq!(first.memory_limit_mb, 20480);
+        assert_eq!(first.compute_limit, 30);
+        assert_eq!(first.sched_policy, SchedPolicy::Overdraft);
+        assert_eq!(base.physical_device_id, None);
+        assert_eq!(base.local_shm_path, "/tmp/pod");
+        assert_eq!(first.for_device(7).local_shm_path, first.local_shm_path);
+        assert_eq!(first.for_device(3).global_shm_path, second.global_shm_path);
+        assert_eq!(first.for_device(3).local_shm_path, second.local_shm_path);
     }
 
     #[test]

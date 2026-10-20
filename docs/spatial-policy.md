@@ -29,9 +29,9 @@ The ACL hooks call the real `aclrtSetDevice` or `aclrtSetCurrentContext`, then a
 
 The process/device cache retains original resource counts separately from the applied state, so a reference-counted device reset does not scale an already reduced count again. ACL resource resets restore the configured budgets. Later ACL device/stream setters are clamped to the cap; lower values are permitted. Missing required APIs, zero physical resource counts, and application/readback failures terminate with status 78.
 
-The implementation uses PID-local bookkeeping and a thread-local recursion guard. It refuses device use in a fork child after the parent enters device initialization, including inherited callbacks. Spawn fresh workers and select the device before operator initialization. Non-default-stream overrides after multiple device initializations are refused because supported ACL APIs do not provide a general stream-to-device ownership query.
+The implementation uses PID-local bookkeeping and a thread-local recursion guard. It refuses device use in a fork child after the parent enters device initialization, including inherited callbacks. Spawn fresh workers and select the device before operator initialization. Successful ACL/runtime stream creation records the stream's device and Context; destruction, Context destruction and device reset invalidate those records. Explicit stream budgets work after multiple device initializations. Unknown non-default streams are refused because CANN 8.5.2 does not provide a general stream-to-device ownership query.
 
-Spatial workers bypass time admission, NPU timing events, overdraft tickets, and global rotation. Their local manager does not register a global compute slot or modify another policy's turn. It retains local heartbeat, process reaping, DCMI discovery, and the existing HBM accounting.
+Spatial workers bypass time admission, NPU timing events, overdraft tickets, and global rotation. Their local manager does not register a global compute slot or modify another policy's turn. It retains per-card local heartbeat, process reaping, diagnostic DCMI discovery, and HBM accounting. The same memory setting is independently available on each physical card; see the [configuration reference](configuration.md).
 
 ## Compute-focused validation
 
@@ -69,7 +69,7 @@ The [structured benchmark summary](benchmarks/spatial-gemm-20261016.json) record
 
 ## Spatial operating boundaries
 
-Direct `aclrtCreateContext` is not an initialization hook. Applications using that API must explicitly select the device or context before operator initialization. The allocation/submission fallback cannot repair work already tiled with the full hardware resource count.
+Successful intercepted ACL/runtime Context creation also applies the device budget before returning. Select the intended device or Context before operator initialization. The allocation/submission fallback cannot repair work already tiled with the full hardware resource count.
 
 Spatial resource setters/resetters initialize the budget before the requested operation. An invalid device can therefore terminate with status 78 instead of returning the native parameter error; native setter-error preservation applies to successfully initialized valid devices.
 
@@ -77,4 +77,4 @@ Code references: [ACL hook coverage](../crates/hook/src/hook.rs), [device valida
 
 Processes sharing local SHM must share one PID namespace as well as policy/configuration: manager election and process slots use numeric PIDs. The hardware tests use the host PID namespace and do not qualify arbitrary containers with colliding PIDs. Use a fresh local SHM file when switching policies or upgrading its layout.
 
-Operators must honor CANN resource budgets. Arbitrary Vector/custom kernels, graph execution, direct lower-level resource resets, and cross-device stream ownership remain unqualified. Do not reduce arbitrary launch dimensions: this can skip work. The implemented contract is a cooperative per-process budget; it does not assign exclusive core IDs, enforce Pod-wide aggregate compute, or guarantee utilization percentages or priority fairness.
+Operators must honor CANN resource budgets. Arbitrary Vector/custom kernels, graph execution, direct lower-level resource resets remain subject to workload validation. Do not reduce arbitrary launch dimensions: this can skip work. The implemented contract is a cooperative per-process budget; it does not assign exclusive core IDs, enforce Pod-wide aggregate compute, or guarantee utilization percentages or priority fairness.

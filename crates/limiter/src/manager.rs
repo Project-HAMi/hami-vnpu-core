@@ -21,12 +21,76 @@ struct DcmiProcMemInfo {
 unsafe extern "C" {
     fn dcmi_init() -> i32;
     fn dcmi_get_card_list(card_num: *mut i32, card_list: *mut i32, list_len: i32) -> i32;
+    fn dcmi_get_card_id_device_id_from_phyid(
+        card_id: *mut i32,
+        device_id: *mut i32,
+        physical_device_id: u32,
+    ) -> i32;
     fn dcmi_get_device_resource_info(
         card_id: i32,
         device_id: i32,
         proc_info: *mut DcmiProcMemInfo,
         proc_num: *mut i32,
     ) -> i32;
+}
+
+fn physical_device_location(physical_device_id: u32) -> Option<(i32, i32)> {
+    let mut card_id = -1;
+    let mut device_id = -1;
+    let result = unsafe {
+        dcmi_get_card_id_device_id_from_phyid(&mut card_id, &mut device_id, physical_device_id)
+    };
+    (result == 0 && card_id >= 0 && device_id >= 0).then_some((card_id, device_id))
+}
+
+fn device_process_memory(card_id: i32, device_id: i32) -> Option<HashMap<i32, u64>> {
+    let mut procs: [DcmiProcMemInfo; MAX_DCMI_PROCS] = unsafe { std::mem::zeroed() };
+    let mut proc_num = MAX_DCMI_PROCS as i32;
+    let result = unsafe {
+        dcmi_get_device_resource_info(card_id, device_id, procs.as_mut_ptr(), &mut proc_num)
+    };
+    if result != 0 || proc_num < 0 || proc_num as usize > MAX_DCMI_PROCS {
+        return None;
+    }
+    Some(
+        procs[..proc_num as usize]
+            .iter()
+            .filter(|process| process.proc_id > 0)
+            .map(|process| (process.proc_id, process.proc_mem_usage))
+            .collect(),
+    )
+}
+
+/// Hardware snapshots are diagnostic only in a per-card domain. They cannot replace
+/// the hook ledger: the driver can expose an allocation while its reservation is
+/// still pending, and an asynchronous overwrite would lose or double-charge bytes.
+fn observe_physical_device(
+    local: &LocalContainerShmem,
+    physical_device_id: u32,
+    mut resolve: impl FnMut(u32) -> Option<(i32, i32)>,
+    mut query: impl FnMut(i32, i32) -> Option<HashMap<i32, u64>>,
+) -> Option<usize> {
+    let (card_id, device_id) = resolve(physical_device_id)?;
+    let usage = query(card_id, device_id)?;
+    let mut matched = 0;
+    for slot in &local.procs {
+        let pid = slot.pid.load(Ordering::Acquire);
+        if pid > 0
+            && let Some(hardware_used) = usage.get(&pid)
+        {
+            debug!(
+                "[DCMI physical:{} card:{} device:{} PID:{}] hardware={} hook={} bytes",
+                physical_device_id,
+                card_id,
+                device_id,
+                pid,
+                hardware_used,
+                slot.hbm_used[0].load(Ordering::Acquire)
+            );
+            matched += 1;
+        }
+    }
+    Some(matched)
 }
 
 /// Discover (card_id, device_id) pairs for all present NPU logic devices.
@@ -89,7 +153,18 @@ fn reap_dead_slots(local: &LocalContainerShmem) {
 /// DCMI hardware refresh of LIVE slots (per device). In its own thread because the
 /// in-container `dcmi_get_device_resource_info` can block indefinitely; isolating it means
 /// such a stall only delays hardware correction, never the reaper above.
-fn discover_and_update(local: &LocalContainerShmem) {
+fn discover_and_update(local: &LocalContainerShmem, physical_device_id: Option<u32>) {
+    if let Some(physical_device_id) = physical_device_id {
+        if unsafe { dcmi_init() } == 0 {
+            let _ = observe_physical_device(
+                local,
+                physical_device_id,
+                physical_device_location,
+                device_process_memory,
+            );
+        }
+        return;
+    }
     let devices = discover_npu_devices();
     for (idx, &(card_id, device_id)) in devices.iter().enumerate() {
         let mut procs: [DcmiProcMemInfo; MAX_DCMI_PROCS] = unsafe { std::mem::zeroed() };
@@ -167,6 +242,7 @@ pub struct ContainerManager {
     token_scale: f64,
     ema_alpha: f64,
     sched_policy: SchedPolicy,
+    physical_device_id: Option<u32>,
     next_run_not_before: Option<Instant>,
 }
 
@@ -264,6 +340,7 @@ impl ContainerManager {
             token_scale,
             ema_alpha,
             sched_policy,
+            physical_device_id: config.physical_device_id,
             next_run_not_before: None,
         })
     }
@@ -300,10 +377,11 @@ impl ContainerManager {
         });
 
         let local_shmem = self.local;
+        let physical_device_id = self.physical_device_id;
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(DCMI_UPDATE_INTERVAL_SECS));
-                discover_and_update(local_shmem);
+                discover_and_update(local_shmem, physical_device_id);
             }
         });
 

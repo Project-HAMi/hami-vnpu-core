@@ -14,12 +14,12 @@
 | `NPU_COMPUTE_LIMIT` | `1` | `1`～`100` 的整数。`dynamic`/`overdraft` 中为相对份额，`fixed` 中为运行/休息目标百分比，`spatial` 中为每进程的 Cube/Vector 协作预算百分比。请按工作负载显式设置。 |
 | `NPU_SCHED_POLICY` | `spatial` | 仅接受 `dynamic`、`fixed`、`overdraft`、`spatial`。去除首尾空白，core 的策略名区分大小写。详见[策略利弊](scheduling-policies.zh-CN.md)。 |
 
-一个本地 SHM 组只有一个显存配额和一个算力配置，不接受逐设备配置列表。HBM 记账汇总组内进程及各设备计数。`spatial` 算力预算分别作用于每个进程/设备；增加 worker 进程不会在进程之间平分该预算。
+同一组环境变量分别作用于每张选中的物理卡。`NPU_MEMORY_LIMIT_MB=20480` 表示**每张卡各有 20 GiB**，由组内使用该卡的进程共享；卡 A 的用量不占用卡 B 的额度。不需要逐卡配置列表。每张卡的时分调度状态和令牌也独立。`spatial` 算力预算分别作用于每个进程/设备；增加 worker 进程不会在进程之间平分该预算。
 
 准备好可写共享目录并安装匹配的库后，可这样启动：
 
 ```bash
-export NPU_GLOBAL_SHM_PATH=/hami-shared-region/device-7-registry
+export NPU_GLOBAL_SHM_PATH=/hami-shared-region/registry
 export NPU_LOCAL_SHM_PATH=/tmp/vnpu-local
 export NPU_MEMORY_LIMIT_MB=20480
 export NPU_COMPUTE_LIMIT=30
@@ -27,17 +27,25 @@ export NPU_SCHED_POLICY=spatial
 LD_PRELOAD=/opt/hami/libvnpu.so python3 your_model.py
 ```
 
-示例文件名中的 `7` 标识参与协同的物理卡，文件名本身不会选择设备。应用应选择对应的 CANN runtime 设备或 Context。只有需要在该设备上相互协调的负载才共用全局注册表；每个独立记账组使用不同的本地 SHM 文件。
+应用通过 CANN 选择设备或 Context。两个路径都是**基础路径**，库会追加 `.device-<物理卡 ID>`，单卡也采用此规则。例如使用物理卡 6、7 时，会创建 `/tmp/vnpu-local.device-6` 和 `/tmp/vnpu-local.device-7`，各有 20 GiB 配额。库通过 CANN 将逻辑序号映射到物理卡，因此不同进程的可见设备顺序不同也不会记错卡。同卡竞争的时分负载应使用同一全局基础路径；独立记账组使用不同本地基础路径。
+
 
 ## 共享内存与进程生命周期
 
-首次调用被拦截的 NPU 路径时，库延迟启动 supervisor。共享本地 SHM 的进程选出进程内 manager，无须另起 manager 程序。宿主进程至少运行三秒后才参加选举；worker 最多等待十秒，等待本地 SHM 完成初始化。
+每张物理卡首次进入被拦截的 NPU 路径时，库为该卡延迟启动 supervisor。共享本地 SHM 的进程选出进程内 manager，无须另起 manager 程序。宿主进程至少运行三秒后才参加选举；worker 最多等待十秒，等待本地 SHM 完成初始化。
 
 共享本地文件的进程必须采用相同策略、配额、全局注册表路径和 PID namespace，且能互相读取 `/proc/<pid>/stat`。库通过这些 PID 完成选举及退出进程清理。配置一致性需要部署保证，SHM 不会校验配置指纹。如果一个组跨越容器等隔离边界，需要显式安排共享文件访问和共享 PID namespace。
 
 升级库、切换策略或配置时，先停止所有使用该本地文件的进程，再使用全新的本地 SHM 文件启动。参与进程仍在映射文件时，不要截断、删除或重建 SHM。追加字段保留了监控偏移，不代表新旧进程映射可以混用。打开全局注册表时只会等待文件至少达到当前布局大小，不识别兼容版本，也不校验 schema。全局布局兼容性需要部署保证；只有全部使用者停止后才能替换该注册表。
 
-显式资源配置非法时，输出 `invalid resource configuration`，被拦截的进程以状态码 `78` 退出。`spatial` 无法初始化必要 CANN 资源限制时也以 `78` 退出。时分策略的 worker 初始化失败，例如本地 SHM 不可用时，可能回退到不执行限制的 worker；应用能够运行不代表限制已经生效，应结合 manager、SHM 数值及工作负载行为验证。
+资源配置非法、无法确定当前物理卡或无法初始化必要的每卡 limiter 时，进程以状态码 `78` 退出。空分资源设置或读回校验失败也以 `78` 退出。
+
+HBM 准入计数包含尚未完成的分配预留；分配失败时回退。切卡后释放已拦截的分配，仍扣减其原属卡的用量。每卡域的 DCMI 快照仅用于诊断，不覆盖这份记账。限额覆盖被拦截的分配，不覆盖绕过库的程序。每张卡上的不同 Context 使用各自的计时 stream/event。每卡域有 32 个由 Context 共享的计时/报告槽位和 64 个进程记账槽位；空分 worker 不占计时槽位。刚销毁的 Context 已完成的报告可能保留到当前批次消费完毕。
+
+SHM 字段偏移保持不变，但文件名现在表示物理卡域。监控程序须读取带后缀的文件，每个文件中的 `hbm_used[0]` 表示该卡用量。升级时停止旧参与进程并使用新的基础路径；旧的无后缀文件不会与此版本协调。
+
+
+显式 Stream 资源修改按记录的归属卡处理。Kernel 提交仍遵守 CANN 的要求：Stream 所属 Context 必须是当前 Context，请先切换再提交。设备重置会使已跟踪的 Stream 归属失效；重新选择设备/Context 后重新创建 Stream。
 
 ## 高级调度与日志
 

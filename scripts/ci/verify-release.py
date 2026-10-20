@@ -20,16 +20,23 @@ RUNTIME_HOOKS = {
     "rtAicpuKernelLaunchExWithArgs", "rtAicpuKernelLaunchWithFlag",
     "rtKernelLaunchWithFlagV2", "rtKernelLaunchWithHandleV2", "rtModelExecute",
     "rtMalloc", "rtMallocPhysical", "rtFreePhysical", "rtFree", "rtMemGetInfoEx",
+    "rtSetDevice", "rtCtxSetCurrent", "rtStreamCreate", "rtStreamCreateWithFlags",
+    "rtStreamCreateWithConfig", "rtStreamDestroy", "rtStreamDestroyForce",
+    "rtCtxCreate", "rtCtxDestroy", "rtDeviceReset", "rtDeviceResetEx",
+    "rtDeviceResetWithoutTsd", "rtDeviceResetForce",
 }
 RUNTIME_LINK_APIS = {
     "rtStreamCreate", "rtEventCreate", "rtEventRecord", "rtStreamWaitEvent",
     "rtStreamSynchronize", "rtEventElapsedTime", "rtSetDevice", "rtGetDevice",
-    "rtDeviceSynchronize", "rtStreamGetCaptureInfo",
+    "rtDeviceSynchronize", "rtStreamGetCaptureInfo", "rtGetDevicePhyIdByIndex",
+    "rtCtxGetCurrent",
 }
 ACL_HOOKS = {
     "aclrtSetDevice", "aclrtSetCurrentContext", "aclrtResetDevice",
     "aclrtResetDeviceForce", "aclrtSetDeviceResLimit", "aclrtResetDeviceResLimit",
     "aclrtSetStreamResLimit", "aclrtResetStreamResLimit",
+    "aclrtCreateStream", "aclrtCreateStreamWithConfig", "aclrtCreateStreamV2", "aclrtDestroyStream",
+    "aclrtDestroyStreamForce", "aclrtCreateContext", "aclrtDestroyContext",
 }
 SPATIAL_APIS = ACL_HOOKS | {
     "aclrtGetDevice", "aclrtGetDeviceResLimit", "aclrtGetStreamResLimit",
@@ -134,11 +141,16 @@ def validate(args):
     if sonames and sonames != ["libvnpu.so"]:
         raise ValueError("unexpected SONAME: " + ", ".join(sonames))
     require_symbols(library, RUNTIME_HOOKS | ACL_HOOKS, env)
-    require_symbols(runtime, RUNTIME_LINK_APIS, env)
+    require_symbols(runtime, RUNTIME_LINK_APIS | {
+        "rtCtxSetCurrent", "rtStreamCreateWithFlags", "rtStreamCreateWithConfig",
+        "rtStreamDestroy", "rtStreamDestroyForce", "rtCtxCreate", "rtCtxDestroy",
+        "rtDeviceReset", "rtDeviceResetEx", "rtDeviceResetWithoutTsd", "rtDeviceResetForce",
+    }, env)
     missing_spatial = sorted(SPATIAL_APIS - exports(acl, env))
     if args.require_spatial_apis and missing_spatial:
         raise ValueError("CANN lacks spatial APIs: " + ", ".join(missing_spatial))
-    require_symbols(dcmi, {"dcmi_init", "dcmi_get_card_list", "dcmi_get_device_resource_info"}, env)
+    require_symbols(dcmi, {"dcmi_init", "dcmi_get_card_list", "dcmi_get_device_resource_info",
+                           "dcmi_get_card_id_device_id_from_phyid"}, env)
 
     linkage = run("ldd", "-r", str(library), env=env)
     if re.search(r"not found|undefined symbol|symbol lookup error", linkage, re.I):
