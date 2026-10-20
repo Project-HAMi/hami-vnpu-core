@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #[path = "../../../crates/limiter/src/config.rs"]
 pub mod config;
+#[path = "../../../crates/limiter/src/overdraft.rs"]
+pub mod overdraft;
 #[path = "../../../crates/limiter/src/dcmi.rs"]
 pub mod dcmi;
 #[path = "../../../crates/limiter/src/dcmi_protocol.rs"]

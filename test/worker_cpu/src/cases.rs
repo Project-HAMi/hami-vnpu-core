@@ -9,7 +9,7 @@ fn client(tokens: u64, active: bool) -> SchedulerClient {
     shmem.batch_id.store(42, Ordering::Release);
     shmem.tokens_remaining.store(tokens, Ordering::Release);
     shmem.active_workers.store(if active {1} else {0}, Ordering::Release);
-    shmem.compute_priority.store(50, Ordering::Release);
+    shmem.compute_limit.store(50, Ordering::Release);
     shmem.reports[0].cpu_start_us.store(if active {100} else {0}, Ordering::Release);
     shmem.reports[0].occupied.store(1, Ordering::Release);
     shmem.reports[0].pid.store(std::process::id() as i32, Ordering::Release);
@@ -204,9 +204,10 @@ fn all_five_actual_hook_wrappers_charge_before_native_and_keep_one_process_repor
 }
 
 #[test]
-fn shared_memory_abi_is_still_main() {
-    assert_eq!(6224,std::mem::size_of::<LocalContainerShmem>());
+fn shared_memory_abi_preserves_original_prefix_and_appends_overdraft_fields() {
+    assert_eq!(6256,std::mem::size_of::<LocalContainerShmem>());
     assert_eq!(1080,std::mem::offset_of!(LocalContainerShmem,procs));
+    assert_eq!(6224,std::mem::offset_of!(LocalContainerShmem,overdraft_pool));
 }
 
 #[test]

@@ -42,7 +42,7 @@ def local_sample(path):
         data = path.read_bytes()
     except FileNotFoundError:
         return None
-    if len(data) != 6224:
+    if len(data) < 6256:
         return None
     return {"state": struct.unpack_from("<I", data, 24)[0],
             "batch": struct.unpack_from("<Q", data, 32)[0],
@@ -62,12 +62,14 @@ def exercise(artifacts, policy, timeout):
             for index in range(2):
                 env = os.environ.copy()
                 env.pop("NPU_DCMI_HELPER_PROCESS", None)
+                for legacy in ["NPU_MEM_QUOTA", "NPU_PRIORITY", "NPU_FIXED_SHARE_RATIO", "NPU_OVERDRAFT_ENABLED"]:
+                    env.pop(legacy, None)
                 env.update({"LD_PRELOAD": str(artifacts / "libvnpu.so"),
                             "NPU_DCMI_HELPER_PATH": str(artifacts / "vnpu-dcmi"),
                             "NPU_GLOBAL_SHM_PATH": str(region / "global"),
                             "NPU_LOCAL_SHM_PATH": str(region / f"local-{index}"),
-                            "NPU_PRIORITY": "80" if index == 0 else "20",
-                            "NPU_MEM_QUOTA": "0", "NPU_FIXED_SHARE_RATIO": "1" if policy == "fixed" else "0",
+                            "NPU_COMPUTE_LIMIT": "80" if index == 0 else "20",
+                            "NPU_MEMORY_LIMIT_MB": "0", "NPU_SCHED_POLICY": policy,
                             "RUST_LOG": "limiter::manager=debug", "PYTHONUNBUFFERED": "1"})
                 output = (region / f"actor-{index}.log").open("w")
                 files.append(output)

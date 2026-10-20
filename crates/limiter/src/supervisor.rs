@@ -118,6 +118,7 @@ pub fn run() {
                 local
                     .manager_generation
                     .store(generation, Ordering::Release);
+                local.overdraft_pool.close();
                 local.tokens_remaining.store(0, Ordering::Relaxed);
                 local.state.store(STATE_IDLE, Ordering::Release);
                 futex::wake_all(&local.state);

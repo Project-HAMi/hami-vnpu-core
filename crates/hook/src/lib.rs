@@ -15,6 +15,10 @@ fn ensure_supervisor(me: i32) {
     if cur == me {
         return;
     }
+    if let Err(error) = limiter::config::validate_requested_limits() {
+        eprintln!("[hami-vnpu-core] invalid resource configuration: {error}");
+        unsafe { libc::_exit(78) };
+    }
     if SUPERVISOR_PID
         .compare_exchange(cur, me, Ordering::AcqRel, Ordering::Relaxed)
         .is_ok()

@@ -1,5 +1,5 @@
 use crate::{
-    config::ManagerConfig,
+    config::{ManagerConfig, OverdraftConfig, SchedPolicy},
     manager::ContainerManager,
     shmem::{GlobalRegistry, LocalContainerShmem},
 };
@@ -15,7 +15,13 @@ fn quota_conversion_preserves_normal_values_and_never_wraps_to_unlimited() {
         let config = ManagerConfig {
             global_shm_path: String::new(),
             local_shm_path: String::new(),
-            priority: 50.0,
+            compute_limit: 50,
+            sched_policy: SchedPolicy::Dynamic,
+            overdraft: OverdraftConfig {
+                limit: 10,
+                timeout_us: 5000,
+                poll_interval_us: 1000,
+            },
             memory_limit_mb: mb,
         };
         let path =

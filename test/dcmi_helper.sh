@@ -140,8 +140,10 @@ done
 
 # An incompatible legacy registry must terminate the application, not allow
 # the old worker-startup timeout to fall back to an unlimited stub.
+# Reject both the original queue protocol and the pre-overdraft fenced protocol.
+for marker in '\001\000\000\000' '\062\120\116\126'; do
 dd if=/dev/zero of="$fixture/legacy" bs=2848 count=1 status=none
-printf '\001' | dd of="$fixture/legacy" bs=1 seek=16 conv=notrunc status=none
+printf '%b' "$marker" | dd of="$fixture/legacy" bs=1 seek=16 conv=notrunc status=none
 set +e
 env -u NPU_DCMI_HELPER_PROCESS LD_LIBRARY_PATH="$fixture${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     LD_PRELOAD="$artifacts/libvnpu.so" NPU_GLOBAL_SHM_PATH="$fixture/legacy" \
@@ -149,6 +151,7 @@ env -u NPU_DCMI_HELPER_PROCESS LD_LIBRARY_PATH="$fixture${LD_LIBRARY_PATH:+:$LD_
 status=$?
 set -e
 test "$status" = 78
+done
 echo 'PASS: isolated query, no eager CANN, protocol, helper bypass, descendant reaping, legacy registry rejection'
 
 # Simulate kernels without CONFIG_PROC_CHILDREN, and an unreadable fallback.
@@ -288,7 +291,7 @@ for mode in adjacent override; do
         env -u NPU_DCMI_HELPER_PROCESS -u NPU_DCMI_HELPER_PATH \
             LD_LIBRARY_PATH="$fixture" LD_PRELOAD=./relative/libvnpu.so \
             NPU_GLOBAL_SHM_PATH="$fixture/chdir-global-$mode" \
-            NPU_LOCAL_SHM_PATH="$fixture/chdir-local-$mode" NPU_MEM_QUOTA=0 \
+            NPU_LOCAL_SHM_PATH="$fixture/chdir-local-$mode" NPU_MEMORY_LIMIT_MB=0 \
             ASCEND_DRIVER_HOME="$fixture" RUST_LOG=limiter::manager=debug \
             "${extra[@]}" timeout 25 "$fixture/chdir-probe" "$fixture/chdir-log-$mode" \
             2> "$fixture/chdir-log-$mode"

@@ -3,6 +3,7 @@ pub mod dcmi;
 pub mod dcmi_protocol;
 pub mod externed_api;
 pub mod manager;
+pub mod overdraft;
 pub mod registry_lock;
 pub mod shmem;
 pub mod supervisor;

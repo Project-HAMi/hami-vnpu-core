@@ -23,7 +23,7 @@ fn manager(priority: f64, fixed: bool, average: u64) -> ContainerManager {
     global.slots[0].pid.store(pid, Ordering::Relaxed);
     global.slots[0].generation.store(1, Ordering::Relaxed);
     global.slots[0]
-        .priority
+        .compute_limit
         .store(priority as u64, Ordering::Relaxed);
     global.slots[0]
         .last_heartbeat
@@ -38,15 +38,74 @@ fn manager(priority: f64, fixed: bool, average: u64) -> ContainerManager {
         my_pid: std::process::id() as i32,
         my_global_idx: 0,
         current_avg_us: average,
-        my_priority: priority,
+        compute_limit: priority,
         token_scale: 100.0,
         ema_alpha: 0.7,
-        fixed_share_ratio: fixed,
+        sched_policy: if fixed {
+            SchedPolicy::Fixed
+        } else {
+            SchedPolicy::Dynamic
+        },
         next_run_not_before: None,
         generation: 1,
         registry,
         stopped: Arc::new(AtomicBool::new(false)),
     }
+}
+
+#[test]
+fn bounded_overdraft_round_opens_idle_and_next_round_closes_it() {
+    let mut m = manager(10.0, false, 500);
+    m.sched_policy = SchedPolicy::Overdraft;
+    m.local.overdraft_limit.store(10, Ordering::Release);
+    let plan = SharePlan {
+        tokens: 1,
+        time_limit_us: 10_000,
+        expected_run_us: 500,
+        rest_wait_us: 0,
+        anchor_speed_us: 500,
+    };
+    // Even a round with no submitted work must release normal ownership and
+    // open its IDLE allowance when the no-progress deadline expires.
+    assert_eq!(m.run_local_round(&plan), (0, 0));
+    let local = m.local;
+    let acquire = || {
+        local.overdraft_pool.try_acquire_idle(
+            &local.state,
+            &local.batch_id,
+            STATE_IDLE,
+            &local.overdraft_limit,
+            true,
+        )
+    };
+    assert!(acquire());
+    assert!(m.start_local_batch(2, 1).is_ok());
+    assert!(!acquire());
+    // Publishing IDLE alone must not reopen the new round's gate.
+    local.state.store(STATE_IDLE, Ordering::Release);
+    assert!(!acquire());
+    drop(m);
+    assert!(!acquire());
+}
+
+#[test]
+fn replaced_manager_cannot_close_successors_overdraft_allowance() {
+    let m = manager(10.0, false, 500);
+    let local = m.local;
+    local.overdraft_limit.store(10, Ordering::Release);
+    local.manager_generation.store(2, Ordering::Release);
+    m.global.slots[0].generation.store(2, Ordering::Release);
+    let round = local.overdraft_pool.begin_round().unwrap();
+    assert!(local.overdraft_pool.open_idle(round));
+    assert!(m.start_local_batch(8, 1).is_err());
+    drop(m);
+    assert!(local.overdraft_pool.try_acquire_idle(
+        &local.state,
+        &local.batch_id,
+        STATE_IDLE,
+        &local.overdraft_limit,
+        true,
+    ));
 }
 
 #[test]
@@ -122,7 +181,7 @@ fn capped_common_unit_keeps_relative_priorities() {
     a.global.slots[1]
         .avg_kernel_time
         .store(10_000, Ordering::Release);
-    a.global.slots[1].priority.store(80, Ordering::Release);
+    a.global.slots[1].compute_limit.store(80, Ordering::Release);
     let a = a.calculate_fair_share();
     let b = b.calculate_fair_share();
     assert_eq!(a.tokens * 4, b.tokens);
@@ -228,7 +287,7 @@ fn replaced_manager_cannot_reset_successor_state_or_reused_slot_even_on_drop() {
         local.tokens_remaining.store(123, Ordering::Release);
     }
     assert!(!m.update_heartbeat());
-    assert!(!m.start_local_batch(10, 999));
+    assert!(m.start_local_batch(10, 999).is_err());
     assert!(!m.pass_baton());
     assert!(!m.wait_for_global_turn());
     m.update_local_stats(10_000, 100);

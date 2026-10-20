@@ -47,7 +47,7 @@ fn reap_dead_slots(local: &LocalContainerShmem) {
     }
 }
 
-use crate::config::ManagerConfig;
+use crate::config::{ManagerConfig, SchedPolicy};
 use crate::shmem::{
     GlobalRegistry, LocalContainerShmem, MAX_MANAGERS, MAX_WORKERS, NPU_DEVICE_MAX, STATE_IDLE,
     STATE_MEASURING, STATE_RUNNING, futex,
@@ -60,7 +60,7 @@ const STALE_MANAGER_US: u64 = 3_000_000;
 // Cap a complete run/rest period without changing ordinary 500us seed budgets.
 const MAX_RUN_US: u64 = 5_000_000;
 const NO_PROGRESS_US: u64 = 5_000;
-pub(crate) const REGISTRY_PROTOCOL: u32 = 0x564e_5032;
+pub(crate) const REGISTRY_PROTOCOL: u32 = 0x564e_5033;
 // How long the manager waits in MEASURING for workers to report.
 // Was 50ms, which was too short when kernels take hundreds of ms; make it longer
 // and also extend dynamically in the run loop.
@@ -88,10 +88,10 @@ pub struct ContainerManager {
     my_pid: i32,
     my_global_idx: usize,
     current_avg_us: u64,
-    my_priority: f64,
+    compute_limit: f64,
     token_scale: f64,
     ema_alpha: f64,
-    fixed_share_ratio: bool,
+    sched_policy: SchedPolicy,
     next_run_not_before: Option<Instant>,
     generation: u32,
     registry: Arc<RegistryLock>,
@@ -122,23 +122,40 @@ impl ContainerManager {
             .parse::<f64>()
             .unwrap_or(0.7)
             .clamp(0.05, 0.95);
-        let fixed_share_ratio = std::env::var("NPU_FIXED_SHARE_RATIO")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let sched_policy = config.sched_policy;
 
         // default value
-        let comp_priority = config.priority;
+        let compute_limit = f64::from(config.compute_limit);
         let memory_limit = config.memory_limit_mb;
+        local.overdraft_pool.close();
+        local.overdraft_limit.store(
+            if sched_policy == SchedPolicy::Overdraft {
+                config.overdraft.limit
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
+        local
+            .overdraft_timeout_us
+            .store(config.overdraft.timeout_us, Ordering::Relaxed);
+        local
+            .overdraft_poll_interval_us
+            .store(config.overdraft.poll_interval_us, Ordering::Relaxed);
 
         info!(
-            "[Manager] Registered as Global Manager #{} (PID: {}). Compute limit: {}, Memory limit: {}, FixedShare: {}",
-            idx, pid, comp_priority, memory_limit, fixed_share_ratio
+            "[Manager] Registered as Global Manager #{} (PID: {}). Compute limit: {}, Memory limit: {}, Policy: {}",
+            idx,
+            pid,
+            compute_limit,
+            memory_limit,
+            sched_policy.as_str()
         );
 
         // Write our priority to the global slot so other pods can calculate compute share
         global.slots[idx]
-            .priority
-            .store(comp_priority as u64, Ordering::Release);
+            .compute_limit
+            .store(compute_limit as u64, Ordering::Release);
 
         let memory_limit_bytes = memory_limit.saturating_mul(MB_TO_BYTES);
 
@@ -149,8 +166,8 @@ impl ContainerManager {
             local.memory_used.store(0, Ordering::Relaxed);
         }
         local
-            .compute_priority
-            .store(comp_priority as u64, Ordering::Relaxed);
+            .compute_limit
+            .store(compute_limit as u64, Ordering::Relaxed);
         local
             .manager_global_idx
             .store(idx as i32, Ordering::Release);
@@ -162,10 +179,10 @@ impl ContainerManager {
             my_pid: pid,
             my_global_idx: idx,
             current_avg_us: DEFAULT_AVG_US,
-            my_priority: comp_priority,
+            compute_limit,
             token_scale,
             ema_alpha,
-            fixed_share_ratio,
+            sched_policy,
             next_run_not_before: None,
             generation,
             registry,
@@ -386,12 +403,12 @@ impl ContainerManager {
     fn calculate_fair_share(&self) -> SharePlan {
         // Anchor is the slowest active; never let it fall below 1us to preserve relativity.
         let mut anchor_speed_us = 1u64;
-        let mut highest_priority = self.my_priority.max(1.0);
+        let mut highest_priority = self.compute_limit.max(1.0);
 
         for slot in self.global.slots.iter() {
             if slot.is_active.load(Ordering::Relaxed) == 1 {
                 highest_priority =
-                    highest_priority.max(slot.priority.load(Ordering::Relaxed) as f64);
+                    highest_priority.max(slot.compute_limit.load(Ordering::Relaxed) as f64);
                 let time = slot.avg_kernel_time.load(Ordering::Relaxed);
                 if time > anchor_speed_us {
                     anchor_speed_us = time;
@@ -400,12 +417,8 @@ impl ContainerManager {
         }
 
         let my_time = self.current_avg_us.max(1);
-        // Allow sub-1.0 priorities to act as fractions only when fixed-share is requested.
-        let prio_for_tokens = if self.fixed_share_ratio {
-            self.my_priority.max(0.01)
-        } else {
-            self.my_priority.max(1.0)
-        };
+        // Resource validation guarantees an integer percentage in [1, 100].
+        let prio_for_tokens = self.compute_limit;
 
         // Base tokens before scaling (used for time budgeting and averaging).
         // Formula: tokens = priority * (anchor / my_time)
@@ -417,7 +430,7 @@ impl ContainerManager {
         let mut tokens = (base_tokens as f64 * self.token_scale) as u64;
         tokens = tokens.clamp(MIN_TOKENS, MAX_TOKENS);
 
-        let priority_span = if self.fixed_share_ratio {
+        let priority_span = if self.sched_policy.is_fixed() {
             100.0
         } else {
             highest_priority
@@ -435,9 +448,9 @@ impl ContainerManager {
             .min(MAX_RUN_US);
 
         // Compute an off-duty window so the runtime/wait ratio depends on priority only.
-        let rest_wait_us = if self.fixed_share_ratio {
+        let rest_wait_us = if self.sched_policy.is_fixed() {
             // User-requested: rest = (100 - p) * (anchor * scale)
-            let p = self.my_priority.clamp(1.0, 100.0);
+            let p = self.compute_limit.clamp(1.0, 100.0);
             let wait = ((100.0 - p) * unit_us).round();
             wait.clamp(0.0, MAX_RUN_US as f64) as u64
         } else {
@@ -445,10 +458,10 @@ impl ContainerManager {
         };
 
         debug!(
-            "[Sched] Anchor: {}us, MyAvg: {}us, Prio: {}, BaseTokens: {}, Scale: {}, FinalTokens: {}, Timeout: {}ms, Rest: {}ms",
+            "[Sched] Anchor: {}us, MyAvg: {}us, ComputeLimit: {}, BaseTokens: {}, Scale: {}, FinalTokens: {}, Timeout: {}ms, Rest: {}ms",
             anchor_speed_us,
             my_time,
-            self.my_priority,
+            self.compute_limit,
             base_tokens,
             self.token_scale,
             tokens,
@@ -465,20 +478,21 @@ impl ContainerManager {
         }
     }
 
-    fn start_local_batch(&self, batch_id: u64, tokens: u64) -> bool {
+    fn start_local_batch(&self, batch_id: u64, tokens: u64) -> Result<Option<u32>, ()> {
         let Some(_guard) = self.transaction() else {
-            return false;
+            return Err(());
         };
         if !self.has_turn() {
-            return false;
+            return Err(());
         }
+        let round = self.local.overdraft_pool.begin_round();
         self.local.batch_id.store(batch_id, Ordering::Relaxed);
         self.local.tokens_remaining.store(tokens, Ordering::Relaxed);
         self.local.active_workers.store(0, Ordering::Relaxed);
         self.local.reported_count.store(0, Ordering::Relaxed);
         self.local.state.store(STATE_RUNNING, Ordering::Release);
         futex::wake_all(&self.local.state);
-        true
+        Ok(round)
     }
 
     fn run_local_round(&self, plan: &SharePlan) -> (u64, u64) {
@@ -489,9 +503,9 @@ impl ContainerManager {
             .load(Ordering::Acquire)
             .wrapping_add(1)
             .max(1);
-        if !self.start_local_batch(batch, plan.tokens) {
+        let Ok(overdraft_round) = self.start_local_batch(batch, plan.tokens) else {
             return (0, 0);
-        }
+        };
         let mut last_progress = start;
         let mut last_observation = start;
         let mut timely_observations = true;
@@ -512,7 +526,7 @@ impl ContainerManager {
             if current == 0 {
                 break true;
             }
-            if self.fixed_share_ratio {
+            if self.sched_policy.is_fixed() {
                 if start.elapsed().as_micros() >= plan.expected_run_us as u128 {
                     break false;
                 }
@@ -569,6 +583,11 @@ impl ContainerManager {
             return (0, 0);
         }
         self.local.state.store(STATE_IDLE, Ordering::Release);
+        if self.sched_policy == SchedPolicy::Overdraft {
+            if let Some(round) = overdraft_round {
+                self.local.overdraft_pool.open_idle(round);
+            }
+        }
         futex::wake_all(&self.local.state);
         // Event endpoints are recorded by a later hook. A delayed report can
         // include idle time after the final launch, even if all tokens were used.
@@ -701,7 +720,7 @@ impl ContainerManager {
     }
 
     fn schedule_rest_wait(&mut self, rest_wait_us: u64) {
-        if !self.fixed_share_ratio || rest_wait_us == 0 {
+        if !self.sched_policy.is_fixed() || rest_wait_us == 0 {
             self.next_run_not_before = None;
             return;
         }
@@ -752,6 +771,7 @@ impl Drop for ContainerManager {
             }
         }
         if self.owns_local_lease() {
+            self.local.overdraft_pool.close();
             self.local.manager_pid.store(0, Ordering::Release);
             self.local.manager_global_idx.store(-1, Ordering::Release);
             self.local.tokens_remaining.store(0, Ordering::Release);
