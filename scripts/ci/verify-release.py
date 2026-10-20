@@ -41,6 +41,10 @@ ACL_HOOKS = {
 SPATIAL_APIS = ACL_HOOKS | {
     "aclrtGetDevice", "aclrtGetDeviceResLimit", "aclrtGetStreamResLimit",
 }
+# Some SDK headers declare optional creation variants that the corresponding
+# runtime does not export. Their interceptors are only used when native callers
+# use that variant; they are not hard-linked requirements of libvnpu.
+OPTIONAL_RUNTIME_APIS = {"rtStreamCreateWithConfig"}
 MACHINES = {"x86_64": "Advanced Micro Devices X86-64", "aarch64": "AArch64"}
 
 
@@ -142,10 +146,11 @@ def validate(args):
         raise ValueError("unexpected SONAME: " + ", ".join(sonames))
     require_symbols(library, RUNTIME_HOOKS | ACL_HOOKS, env)
     require_symbols(runtime, RUNTIME_LINK_APIS | {
-        "rtCtxSetCurrent", "rtStreamCreateWithFlags", "rtStreamCreateWithConfig",
+        "rtCtxSetCurrent", "rtStreamCreateWithFlags",
         "rtStreamDestroy", "rtStreamDestroyForce", "rtCtxCreate", "rtCtxDestroy",
         "rtDeviceReset", "rtDeviceResetEx", "rtDeviceResetWithoutTsd", "rtDeviceResetForce",
     }, env)
+    optional_runtime_missing = sorted(OPTIONAL_RUNTIME_APIS - exports(runtime, env))
     missing_spatial = sorted(SPATIAL_APIS - exports(acl, env))
     if args.require_spatial_apis and missing_spatial:
         raise ValueError("CANN lacks spatial APIs: " + ", ".join(missing_spatial))
@@ -173,7 +178,8 @@ def validate(args):
                  "version_file_sha256": sha256(version_file) if version_file else None,
                  "version_metadata": version_text,
                  "spatial_api_available": not missing_spatial,
-                 "missing_spatial_apis": missing_spatial},
+                 "missing_spatial_apis": missing_spatial,
+                 "optional_runtime_apis_missing": optional_runtime_missing},
         "driver": driver_metadata,
         "sdk_libraries": {name: {"path": str(path), "sha256": sha256(path)}
                           for name, path in {"runtime": runtime, "acl": acl, "dcmi": dcmi}.items()},
