@@ -102,10 +102,13 @@ registry 文件。切换配置或 SHM 布局前，先停止本组进程，再使
 ## 开发检查
 
 ```sh
+cargo fmt --all -- --check
 bash scripts/ci.sh
 ```
 
-在 Linux 上运行，依赖见[测试与 CI](docs/testing.md)。CPU 回归任务使用假的 ACL/DCMI
+使用 Rust 1.94.0 并安装 `rustfmt` 和 `clippy`，CPU 脚本在 Linux 上运行，依赖见
+[测试与 CI](docs/testing.md)。CI 检查根工作区格式，并对工作区所有目标运行 Clippy，
+将警告视为错误。CPU 回归任务使用假的 ACL/DCMI
 后端及直接引用生产源码的测试，检查配置、调度逻辑与 hook 行为。独立的发布构建任务
 使用真实 SDK，分别上传通过检查的 AMD64 和 ARM64 库。NPU 执行和业务性能需要
 在兼容的昇腾环境中另行验证。

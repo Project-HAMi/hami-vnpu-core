@@ -118,11 +118,14 @@ process lifecycle requirements.
 ## Development checks
 
 ```sh
+cargo fmt --all -- --check
 bash scripts/ci.sh
 ```
 
-Run on Linux; see [testing and CI](docs/testing.md) for dependencies. The CPU
-regression jobs use fake ACL/DCMI backends and source-linked tests for
+Use Rust 1.94.0 with `rustfmt` and `clippy`; run the CPU script on Linux. See
+[testing and CI](docs/testing.md) for dependencies. CI checks formatting and
+runs Clippy with warnings denied across the root workspace and all its targets.
+The CPU regression jobs use fake ACL/DCMI backends and source-linked tests for
 configuration, scheduling logic and hooks. Separate release jobs use the real
 SDK and upload verified AMD64 and ARM64 libraries. Validate NPU execution and
 workload performance separately in a compatible Ascend environment.

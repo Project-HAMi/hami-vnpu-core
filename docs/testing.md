@@ -88,27 +88,37 @@ Each artifact contains the three files above. The build containers remain Ubuntu
 22.04. Deploy each library with matching-architecture system libraries and
 compatible CANN/driver libraries; the artifact does not bundle the SDK or a driver.
 
-### Run CPU regressions locally
+### Run development checks locally
 
-Use Linux with Rust 1.94.0, Cargo, Python 3 and a C compiler (`cc`). A CANN SDK,
-Ascend driver, NPU, Docker daemon and cluster credentials are not required for
-these regression checks.
+Use Linux with Rust 1.94.0 as the active toolchain, Cargo, Python 3 and a C
+compiler (`cc`). A CANN SDK, Ascend driver, NPU, Docker daemon and cluster
+credentials are not required for these checks. Install the Rust formatting and
+lint components, then run:
 
 ```sh
+rustup component add rustfmt clippy
+cargo fmt --all -- --check
 bash scripts/ci.sh
 python3 scripts/ci/check-doc-links.py
 ```
+
+Formatting checks the root workspace's two production crates and does not need
+Linux or the SDK. The CPU script prepares test-only link dependencies, then runs
+`cargo clippy --workspace --all-targets --locked -- -D warnings` for the root
+workspace, including its test targets. The standalone CPU test workspaces are
+run separately below; they are not included in `--workspace`.
 
 The CPU script builds in a temporary directory and removes it on exit. It never
 replaces an installed library. Its `libvnpu.so` is linked against test-only
 runtime/DCMI dependencies and must not be deployed. Any unexpected call into
 those link dependencies aborts; the spatial runner supplies its own fake ACL
-backend for the calls under test. Standalone workspace `cargo check --workspace
---all-targets --locked` performs Rust type checking without a CANN installation.
+backend for the calls under test. Clippy uses this test link environment; it does
+not build or validate the deployable release artifact.
 
 | Check | Coverage |
 | --- | --- |
-| Workspace `cargo check` and `cargo test` | Both Rust crates; configuration defaults, bounds and migration errors; atomic overdraft pool behavior. |
+| `cargo fmt --all -- --check` | Rust formatting for the root workspace's two production crates. |
+| Workspace `cargo clippy` and `cargo test` | Clippy across both Rust crates and all their targets with warnings denied; configuration defaults, bounds and migration errors; atomic overdraft pool behavior. |
 | `test/manager_cpu` | Production manager arithmetic, fixed rest calculation, report aggregation and spatial exclusion from time rotation. The unused process scan is a panic-on-call test double. |
 | `test/memory_cpu` | Production memory scan/quota paths, rollback, shared-memory ABI and bounded fork cleanup. Procfs reads and CANN calls use explicit test doubles; Linux futexes are real. |
 | `test/worker_cpu/run.py` | Source-linked worker and hook admission cases with observed lock/futex boundaries. Each case runs in a separate process with a timeout. |
@@ -117,9 +127,10 @@ backend for the calls under test. Standalone workspace `cargo check --workspace
 | Documentation links | Local Markdown link destinations in the root READMEs and `docs/`; no external requests or rendered-anchor checks. |
 
 The [workflow](../.github/workflows/ci.yml) runs on pull requests, pushes to `main`
-and manual dispatch. CPU jobs use native x86-64 and ARM64 Ubuntu 24.04 runners,
-separate from the release jobs. It uses a read-only repository token and does not
-retain checkout credentials. Repository settings can require a maintainer to
+and manual dispatch. A dedicated job checks formatting with Rust 1.94.0 and
+`rustfmt`. CPU jobs run Clippy and regressions on native x86-64 and ARM64 Ubuntu
+24.04 runners, separate from the release jobs. It uses a read-only repository
+token and does not retain checkout credentials. Repository settings can require a maintainer to
 approve the first workflow run from a fork.
 
 ### Hardware validation
@@ -137,10 +148,6 @@ budgets, run allocation and cleanup checks, and measure the actual workload afte
 warmup. Test each selected policy and resource configuration; keep those results
 separate from CI. The historical [spatial validation](spatial-policy.md) records
 its own hardware and workload scope.
-
-The repository has existing formatting differences, so CI does not impose a
-whole-repository `cargo fmt --check` gate in this change. Format Rust files when
-changing them and keep formatting-only cleanup separate from behavior changes.
 
 ## 中文
 
@@ -207,23 +214,32 @@ CI 分别在原生运行器构建：
 每个 artifact 都包含上述三个文件，容器内部仍为 Ubuntu 22.04。业务容器需提供
 架构匹配的系统库以及兼容的 CANN 和驱动库；产物不包含 SDK 或驱动。
 
-### 本地运行 CPU 回归
+### 本地运行开发检查
 
-在 Linux 上准备 Rust 1.94.0、Cargo、Python 3 和 C 编译器（`cc`），运行：
+在 Linux 上将 Rust 1.94.0 设为当前工具链，准备 Cargo、Python 3 和 C 编译器
+（`cc`），安装格式和静态检查组件后运行：
 
 ```sh
+rustup component add rustfmt clippy
+cargo fmt --all -- --check
 bash scripts/ci.sh
 python3 scripts/ci/check-doc-links.py
 ```
 
-这些回归检查无需 CANN SDK、Ascend 驱动、NPU、Docker 服务或集群凭据。
+这些检查无需 CANN SDK、Ascend 驱动、NPU、Docker 服务或集群凭据。
+格式检查覆盖根工作区的两个生产 crate，不依赖 Linux 或 SDK。CPU 脚本先准备测试
+链接库，再执行 `cargo clippy --workspace --all-targets --locked -- -D warnings`，
+覆盖根工作区及其测试目标，警告作为错误。独立 CPU 测试工作区在后续步骤运行，
+不属于这里的 `--workspace` 范围。
+
 CPU 脚本在临时目录构建，退出时清理，不替换已安装的库。脚本生成的 `libvnpu.so`
 依赖测试用 runtime/DCMI 链接库，不能部署到业务环境；意外进入这些链接桩函数会
 立即中止测试。空分测试使用独立的 fake ACL 后端。
-单独执行 `cargo check --workspace --all-targets --locked` 可在没有 CANN 的环境
-进行 Rust 类型检查。
+Clippy 使用这套测试链接环境，不构建或验证可部署的发布产物。
 
-- 工作区检查和单元测试：配置默认值、范围、旧变量迁移错误，以及 overdraft 原子票池。
+- 格式检查：`cargo fmt --all -- --check` 检查根工作区的两个生产 crate。
+- 工作区 Clippy 和单元测试：对两个 crate 的所有目标运行 Clippy，将警告视为错误；
+  验证配置默认值、范围、旧变量迁移错误，以及 overdraft 原子票池。
 - Manager：实际源码的份额计算、fixed 休息时间、报告聚合、spatial 不参与时间轮转。
 - Memory：内存扫描、配额、回滚、共享内存 ABI、带超时的 fork 清理；procfs 和 CANN 使用
   明确的测试替身，Linux futex 使用真实实现。
@@ -235,7 +251,8 @@ CPU 脚本在临时目录构建，退出时清理，不替换已安装的库。�
   不检查渲染后的锚点。
 
 [CI 工作流](../.github/workflows/ci.yml) 在 PR、`main` 推送和手动触发时执行。
-CPU 任务使用原生 x86-64 与 ARM64 Ubuntu 24.04 运行器，与发布构建任务分开。
+独立格式任务使用 Rust 1.94.0 和 `rustfmt`；CPU 任务在原生 x86-64 与 ARM64
+Ubuntu 24.04 运行器上执行 Clippy 和回归，与发布构建任务分开。
 Token 仅有仓库读取权限，不保留 checkout 凭据；fork 的首次运行可能需要维护者
 按仓库设置批准。
 
@@ -249,6 +266,3 @@ Token 仅有仓库读取权限，不保留 checkout 凭据；fork 的首次运�
 Core 发布前，应在目标 CANN/驱动环境核对实际选卡和核心预算，验证分配与清理，
 并在完整预热后测量业务负载。验证所选策略和资源配置，将结果与 CI 分开记录。
 [已有空分验证](spatial-policy.md) 单独说明了其硬件与负载范围。
-
-仓库已有格式差异，本次不增加全仓 `cargo fmt --check` 门禁。修改 Rust 文件时保持
-格式整洁，并将纯格式清理与行为修改分开。

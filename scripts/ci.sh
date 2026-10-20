@@ -28,7 +28,7 @@ export LD_LIBRARY_PATH="$runtime_dir:$driver_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_
 
 rustc --version
 cargo --version
-cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo test --manifest-path test/manager_cpu/Cargo.toml --locked
 cargo test --manifest-path test/memory_cpu/Cargo.toml --locked -- --test-threads=1
