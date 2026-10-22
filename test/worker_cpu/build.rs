@@ -17,10 +17,12 @@ fn main() {
     fs::write(out.join("worker.rs"), worker.replace(import,
         "use std::sync::{Arc, Mutex}; use crate::wait_observer::RwLock;")).unwrap();
     fs::write(out.join("source.rs"), format!(
-        "#[path = {:?}] pub mod raw_futex; #[path = {:?}] pub mod config; #[path = {:?}] pub mod overdraft; pub mod worker {{ include!({:?}); #[cfg(test)] pub mod audit {{ include!({:?}); }} }} #[path = {:?}] pub mod actual_hook; #[path = {:?}] pub(crate) mod process; #[path = {:?}] pub mod spatial; #[path = {:?}] pub(crate) mod ownership;",
+        "#[path = {:?}] pub mod raw_futex; #[path = {:?}] pub mod config; #[path = {:?}] pub mod overdraft; pub mod worker {{ include!({:?}); #[cfg(test)] pub mod audit {{ include!({:?}); }} }} #[path = {:?}] pub mod actual_hook; #[path = {:?}] pub(crate) mod process; #[path = {:?}] pub mod spatial; #[path = {:?}] pub(crate) mod ownership; #[path = {:?}] pub(crate) mod memory; #[path = {:?}] pub mod actual_memory_extra; #[path = {:?}] pub mod actual_memory_physical;",
         src.join("shmem/futex.rs"), src.join("config.rs"), src.join("overdraft.rs"), out.join("worker.rs"), manifest.join("src/cases.rs"),
         root.join("crates/hook/src/hook.rs"), root.join("crates/hook/src/process.rs"),
-        root.join("crates/hook/src/spatial.rs"), root.join("crates/hook/src/ownership.rs"))).unwrap();
+        root.join("crates/hook/src/spatial.rs"), root.join("crates/hook/src/ownership.rs"),
+        root.join("crates/hook/src/memory.rs"), root.join("crates/hook/src/memory_extra.rs"),
+        root.join("crates/hook/src/memory_physical.rs"))).unwrap();
     for name in ["config.rs", "overdraft.rs", "worker.rs", "shmem/mod.rs", "shmem/setup.rs", "shmem/futex.rs"] {
         println!("cargo:rerun-if-changed={}", src.join(name).display());
     }
@@ -28,5 +30,11 @@ fn main() {
     println!("cargo:rerun-if-changed={}", root.join("crates/hook/src/process.rs").display());
     println!("cargo:rerun-if-changed={}", root.join("crates/hook/src/spatial.rs").display());
     println!("cargo:rerun-if-changed={}", root.join("crates/hook/src/ownership.rs").display());
+    println!("cargo:rerun-if-changed={}", root.join("crates/hook/src/memory.rs").display());
+    println!("cargo:rerun-if-changed={}", root.join("crates/hook/src/memory_extra.rs").display());
+    println!("cargo:rerun-if-changed={}", root.join("crates/hook/src/memory_physical.rs").display());
     println!("cargo:rerun-if-changed={}", manifest.join("src/cases.rs").display());
+    println!("cargo:rerun-if-changed={}", manifest.join("src/memory_hooks.rs").display());
+    println!("cargo:rerun-if-changed={}", manifest.join("src/runtime_memory_extra.rs").display());
+    println!("cargo:rerun-if-changed={}", manifest.join("src/runtime_memory_physical.rs").display());
 }

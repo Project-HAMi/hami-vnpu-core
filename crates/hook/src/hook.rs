@@ -105,26 +105,41 @@ pub extern "C" fn rtModelExecute(mdl: u64, stm: u64, flag: u32) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtMalloc(devPtr: u64, size: u64, t: u32, moduleId: u16) -> u64 {
-    let client = npu_limiter();
-    if client.is_hbm_limited() {
-        if client.check_memory_quota(size) == 0 {
-            let ret = passthrough!("rtMalloc", (u64, u64, u32, u16), devPtr, size, t, moduleId);
-            if ret == RT_ERROR_NONE {
-                // malloc successfully
-                let actual_ptr = unsafe { *(devPtr as *const u64) };
-                client.post_alloc_hbm(actual_ptr, size, ret);
-                return RT_ERROR_NONE;
-            } else {
-                // malloc failed
-                client.post_alloc_hbm(0, size, ret);
-                return RT_ERROR_MEMORY_ALLOCATION;
-            }
-        } else {
-            return RT_ERROR_MEMORY_ALLOCATION;
-        }
-    }
+    crate::memory::allocate_virtual(devPtr, size, true, || {
+        passthrough!("rtMalloc", (u64, u64, u32, u16), devPtr, size, t, moduleId)
+    })
+}
 
-    passthrough!("rtMalloc", (u64, u64, u32, u16), devPtr, size, t, moduleId)
+#[unsafe(no_mangle)]
+pub extern "C" fn rtMallocCached(devPtr: u64, size: u64, t: u32, moduleId: u16) -> u64 {
+    crate::memory::allocate_virtual(devPtr, size, false, || {
+        passthrough!(
+            "rtMallocCached",
+            (u64, u64, u32, u16),
+            devPtr,
+            size,
+            t,
+            moduleId
+        )
+    })
+}
+
+// CANN 8.5.2's rtsMalloc tail-calls this five-argument runtime entry point.
+// Preserve both 32-bit arguments and the configuration pointer unchanged; this
+// policy/configuration ABI differs from rtMalloc's type flags/module ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtMemAlloc(devPtr: u64, size: u64, policy: u32, flags: u32, cfg: u64) -> u64 {
+    crate::memory::allocate_virtual(devPtr, size, false, || {
+        passthrough!(
+            "rtMemAlloc",
+            (u64, u64, u32, u32, u64),
+            devPtr,
+            size,
+            policy,
+            flags,
+            cfg
+        )
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -187,20 +202,35 @@ pub extern "C" fn rtMallocPhysical(handle: u64, size: u64, prop: u64, flags: u64
     )
 }
 
+// CANN's runtime ABI takes the mapped VA first, then the output handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtMemRetainAllocationHandle(virPtr: u64, handle: u64) -> u64 {
+    crate::memory::retain_with_accounting(handle, || {
+        passthrough!("rtMemRetainAllocationHandle", (u64, u64), virPtr, handle)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rtFreePhysical(handle: u64) -> u64 {
-    let ret = passthrough!("rtFreePhysical", (u64), handle);
-    crate::release_hbm(handle, ret, AllocationKind::Physical);
-
-    ret
+    crate::memory::free_with_accounting(handle, AllocationKind::Physical, || {
+        passthrough!("rtFreePhysical", (u64), handle)
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rtFree(ptr: u64) -> u64 {
-    let ret = passthrough!("rtFree", (u64), ptr);
-    crate::release_hbm(ptr, ret, AllocationKind::Virtual);
+    crate::memory::free_with_accounting(ptr, AllocationKind::Virtual, || {
+        passthrough!("rtFree", (u64), ptr)
+    })
+}
 
-    ret
+// CANN 8.5.2's rtsFree dispatches directly to the same one-pointer native
+// implementation as rtFree; it does not pass through the rtFree export.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtsFree(ptr: u64) -> u64 {
+    crate::memory::free_with_accounting(ptr, AllocationKind::Virtual, || {
+        passthrough!("rtsFree", (u64), ptr)
+    })
 }
 
 #[unsafe(no_mangle)]

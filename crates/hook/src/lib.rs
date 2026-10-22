@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use limiter::worker::{AllocationKind, SchedulerClient};
+use limiter::worker::{AllocationKind, HbmFreeTicket, HbmRetainTicket, SchedulerClient};
 
 #[derive(Default)]
 struct DeviceClient {
@@ -106,12 +106,9 @@ fn client_for_physical(physical: u32) -> &'static SchedulerClient {
     })
 }
 
-/// Locate the allocation's original card even when the caller switched cards.
-/// Never initialize another card's client during a free.
-pub(crate) fn release_hbm(handle: u64, result: u64, kind: AllocationKind) {
-    if result != limiter::externed_api::RT_ERROR_NONE {
-        return;
-    }
+/// Claim the allocation on its original card before native code may free/reuse
+/// its handle. Never initialize another card's client during a free.
+pub(crate) fn claim_hbm_free(handle: u64, kind: AllocationKind) -> Option<HbmFreeTicket> {
     let devices: Vec<_> = clients()
         .devices
         .lock()
@@ -121,12 +118,30 @@ pub(crate) fn release_hbm(handle: u64, result: u64, kind: AllocationKind) {
         .collect();
     for entry in devices {
         if let Some(client) = entry.client.get()
-            && client.owns_hbm_handle_kind(handle, kind)
+            && let Some(ticket) = client.claim_hbm_free(handle, kind)
         {
-            client.post_free_hbm_kind(handle, result, kind);
-            return;
+            return Some(ticket);
         }
     }
+    None
+}
+
+/// Pin only this process's already charged physical backings across a retain.
+pub(crate) fn prepare_hbm_retain() -> HbmRetainTicket {
+    limiter::worker::prepare_hbm_retain(|| {
+        let devices: Vec<_> = clients()
+            .devices
+            .lock()
+            .unwrap_or_else(|_| fatal("client registry lock poisoned"))
+            .values()
+            .copied()
+            .collect();
+        devices
+            .into_iter()
+            .filter_map(|entry| entry.client.get())
+            .cloned()
+            .collect()
+    })
 }
 
 pub(crate) fn retire_context(context: u64) {
@@ -162,6 +177,9 @@ macro_rules! passthrough {
 }
 
 mod hook;
+mod memory;
+mod memory_extra;
+mod memory_physical;
 mod ownership;
 mod process;
 mod signal_compat;

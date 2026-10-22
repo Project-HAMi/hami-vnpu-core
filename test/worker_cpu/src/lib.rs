@@ -22,21 +22,27 @@ static DEVICE_ONE: std::sync::OnceLock<worker::SchedulerClient> = std::sync::Onc
 static NATIVE_MEMORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static NEXT_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10000);
 static CLIENT: std::sync::OnceLock<worker::SchedulerClient> = std::sync::OnceLock::new();
-pub fn npu_limiter() -> &'static worker::SchedulerClient { CLIENT.get().expect("test client not installed") }
+static NATIVE_OVERRIDE: std::sync::OnceLock<fn(&'static str, &[u64]) -> Option<u64>> = std::sync::OnceLock::new();
+pub fn npu_limiter() -> &'static worker::SchedulerClient {
+    npu_limiter_for_device(externed_api::current_device())
+}
 pub fn npu_limiter_for_device(logical: i32) -> &'static worker::SchedulerClient {
     match logical {
-        0 => npu_limiter(),
+        0 => CLIENT.get().expect("test client not installed"),
         1 => DEVICE_ONE.get().expect("target card client not installed"),
         _ => panic!("invalid test logical device"),
     }
 }
-pub(crate) fn release_hbm(handle: u64, ret: u64, kind: worker::AllocationKind) {
+pub(crate) fn claim_hbm_free(handle: u64, kind: worker::AllocationKind) -> Option<worker::HbmFreeTicket> {
     for client in [CLIENT.get(), DEVICE_ONE.get()].into_iter().flatten() {
-        if client.owns_hbm_handle_kind(handle, kind) {
-            client.post_free_hbm_kind(handle, ret, kind);
-            return;
+        if let Some(ticket) = client.claim_hbm_free(handle, kind) {
+            return Some(ticket);
         }
     }
+    None
+}
+pub(crate) fn prepare_hbm_retain() -> worker::HbmRetainTicket {
+    worker::prepare_hbm_retain(|| [CLIENT.get(), DEVICE_ONE.get()].into_iter().flatten().cloned().collect())
 }
 pub(crate) fn retire_context(context: u64) {
     if let Some(client) = CLIENT.get() { client.retire_context(context); }
@@ -45,6 +51,11 @@ fn native(name: &'static str, args: &[u64]) -> u64 {
     #[cfg(test)] let remaining = worker::audit::remaining(npu_limiter());
     #[cfg(not(test))] let remaining = 0;
     trace(Call::Native(name, args.to_vec(), remaining));
+    if let Some(handler) = NATIVE_OVERRIDE.get()
+        && let Some(result) = handler(name, args)
+    {
+        return result;
+    }
     if NATIVE_MEMORY.load(std::sync::atomic::Ordering::Acquire) {
         if name == "rtMalloc" || name == "rtMallocPhysical" {
             let handle = NEXT_MEMORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -78,8 +89,13 @@ pub mod externed_api {
     std::thread_local! { static CONTEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
     pub fn set_context(context: u64) { CONTEXT.set(context); }
     pub unsafe fn rtCtxGetCurrent(out: *mut u64) -> i32 { unsafe { *out = CONTEXT.get() }; 0 }
-    pub unsafe fn rtGetDevicePhyIdByIndex(logical: u32, out: *mut u32) -> i32 { unsafe { *out = logical }; 0 }
-    pub unsafe fn rtSetDevice(_: i32) -> i32 { 0 }
-    pub unsafe fn rtGetDevice(out: *mut i32) -> i32 { unsafe { *out=0; } 0 }
+    pub unsafe fn rtGetDevicePhyIdByIndex(logical: u32, out: *mut u32) -> i32 {
+        if logical > 1 { return 107001; }
+        unsafe { *out = logical }; 0
+    }
+    std::thread_local! { static DEVICE: std::cell::Cell<i32> = const { std::cell::Cell::new(0) }; }
+    pub fn current_device() -> i32 { DEVICE.get() }
+    pub unsafe fn rtSetDevice(device: i32) -> i32 { DEVICE.set(device); 0 }
+    pub unsafe fn rtGetDevice(out: *mut i32) -> i32 { unsafe { *out=DEVICE.get(); } 0 }
     pub unsafe fn rtStreamGetCaptureInfo(stream: u64, status: *mut u32,_: *mut u64) -> i32 { trace(Call::Capture(stream)); unsafe { *status=0; } 0 }
 }
