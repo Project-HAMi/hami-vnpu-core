@@ -19,7 +19,9 @@ import sys
 RUNTIME_HOOKS = {
     "rtAicpuKernelLaunchExWithArgs", "rtAicpuKernelLaunchWithFlag",
     "rtKernelLaunchWithFlagV2", "rtKernelLaunchWithHandleV2", "rtModelExecute",
-    "rtMalloc", "rtMallocPhysical", "rtFreePhysical", "rtFree", "rtMemGetInfoEx",
+    "rtMalloc", "rtMallocCached", "rtMemAlloc", "rtMallocPhysical",
+    "rtFreePhysical", "rtsMemMallocPhysical", "rtFree", "rtsFree", "rtMemGetInfoEx",
+    "rtDvppMalloc", "rtDvppMallocWithFlag", "rtDvppFree", "rtMemRetainAllocationHandle",
     "rtSetDevice", "rtCtxSetCurrent", "rtStreamCreate", "rtStreamCreateWithFlags",
     "rtStreamCreateWithConfig", "rtStreamDestroy", "rtStreamDestroyForce",
     "rtCtxCreate", "rtCtxDestroy", "rtDeviceReset", "rtDeviceResetEx",

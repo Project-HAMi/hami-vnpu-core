@@ -50,6 +50,239 @@ pub enum AllocationKind {
     Physical,
 }
 
+/// Private backing identity. Retained physical handles share one byte charge.
+#[derive(Debug)]
+struct HbmAllocationRecord {
+    size: u64,
+    state: Mutex<HbmAllocationState>,
+}
+
+#[derive(Debug)]
+struct HbmAllocationState {
+    live_refs: u64,
+    pending_free: u64,
+    pending_retain: u64,
+    refunded: bool,
+}
+
+/// A claim on one native release, tied to the pre-call backing identity.
+#[derive(Debug)]
+#[must_use = "complete the ticket after the native free returns"]
+pub struct HbmFreeTicket {
+    client: SchedulerClient,
+    handle: u64,
+    kind: AllocationKind,
+    record: Arc<HbmAllocationRecord>,
+}
+
+impl HbmFreeTicket {
+    pub fn finish(self, result: u64) {
+        let mut map = self.client.inner.hbm_handle_map.lock().unwrap();
+        let mut state = self.record.state.lock().unwrap();
+        state.pending_free -= 1;
+        if result == RT_ERROR_NONE {
+            state.live_refs -= 1;
+        } else {
+            match map.entry((self.kind, self.handle)) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(self.record.clone());
+                }
+                std::collections::hash_map::Entry::Occupied(entry)
+                    if !Arc::ptr_eq(entry.get(), &self.record) =>
+                {
+                    // A valid native failure cannot have freed this backing
+                    // for reuse. Never overwrite a newer allocation's record.
+                    warn!(
+                        "[Limiter] failed free of {:?} handle 0x{:x} conflicts with a newer allocation; original {} bytes remain charged",
+                        self.kind, self.handle, self.record.size
+                    );
+                }
+                _ => {}
+            }
+            warn!(
+                "[Limiter] native free FAILED (code: {}), handle: 0x{:x}. Quota not released.",
+                result, self.handle
+            );
+        }
+        let refund =
+            retire_hbm_record(&mut map, (self.kind, self.handle), &self.record, &mut state);
+        drop(state);
+        drop(map);
+        if refund {
+            self.client.refund_hbm(self.record.size);
+        }
+    }
+}
+
+/// A retain returns its backing handle only after native code completes. A
+/// process-private scope pins both existing and newly published physical
+/// records until the returned handle can be matched to its current identity.
+#[derive(Debug)]
+#[must_use = "complete the ticket after the native retain returns"]
+pub struct HbmRetainTicket {
+    pid: u32,
+    id: u64,
+}
+
+#[derive(Debug)]
+struct ScopedHbmRecord {
+    client: SchedulerClient,
+    handle: u64,
+    record: Arc<HbmAllocationRecord>,
+}
+
+struct HbmRetainScopes {
+    pid: u32,
+    next_id: u64,
+    active: HashMap<u64, Vec<ScopedHbmRecord>>,
+}
+
+impl HbmRetainScopes {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            next_id: 0,
+            active: HashMap::new(),
+        }
+    }
+}
+
+// Check PID before touching a mutex inherited across fork. Published states
+// are retained: dropping inherited clients could clear the parent's SHM slot.
+struct ProcessRetainScopes {
+    pid: u32,
+    scopes: Mutex<HbmRetainScopes>,
+}
+
+static HBM_RETAIN_SCOPES: std::sync::atomic::AtomicPtr<ProcessRetainScopes> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn retain_scopes() -> std::sync::MutexGuard<'static, HbmRetainScopes> {
+    let pid = std::process::id();
+    loop {
+        let old = HBM_RETAIN_SCOPES.load(Ordering::Acquire);
+        if !old.is_null() && unsafe { (*old).pid } == pid {
+            return unsafe { &*old }.scopes.lock().unwrap();
+        }
+        let fresh = Box::into_raw(Box::new(ProcessRetainScopes {
+            pid,
+            scopes: Mutex::new(HbmRetainScopes::new(pid)),
+        }));
+        if HBM_RETAIN_SCOPES
+            .compare_exchange(old, fresh, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return unsafe { &*fresh }.scopes.lock().unwrap();
+        }
+        // A losing state was never published and contains no client records.
+        unsafe {
+            drop(Box::from_raw(fresh));
+        }
+    }
+}
+
+/// Do not create clients here. Allocations published by any client while this
+/// scope is live also join it in post_alloc_hbm_kind below.
+pub fn prepare_hbm_retain(clients: impl FnOnce() -> Vec<SchedulerClient>) -> HbmRetainTicket {
+    let mut scopes = retain_scopes();
+    let mut records = Vec::new();
+    // Collect registered clients only after acquiring the scope lock. A new
+    // client's allocation either appears here or joins the published scope.
+    for client in clients() {
+        let map = client.inner.hbm_handle_map.lock().unwrap();
+        for (&(kind, handle), record) in map.iter() {
+            if kind != AllocationKind::Physical {
+                continue;
+            }
+            let mut state = record.state.lock().unwrap();
+            if !state.refunded {
+                state.pending_retain += 1;
+                records.push(ScopedHbmRecord {
+                    client: client.clone(),
+                    handle,
+                    record: record.clone(),
+                });
+            }
+        }
+    }
+    let id = scopes.next_id;
+    scopes.next_id = id.checked_add(1).expect("retain scope overflow");
+    scopes.active.insert(id, records);
+    HbmRetainTicket {
+        pid: scopes.pid,
+        id,
+    }
+}
+
+impl HbmRetainTicket {
+    pub fn finish(self, retained_handle: Option<u64>) {
+        let mut scopes = retain_scopes();
+        if scopes.pid != self.pid {
+            return;
+        }
+        let Some(records) = scopes.active.remove(&self.id) else {
+            return;
+        };
+        let mut refunds = Vec::new();
+        for ScopedHbmRecord {
+            client,
+            handle,
+            record,
+        } in records
+        {
+            let mut map = client.inner.hbm_handle_map.lock().unwrap();
+            let mut state = record.state.lock().unwrap();
+            if retained_handle == Some(handle)
+                && map
+                    .get(&(AllocationKind::Physical, handle))
+                    .is_some_and(|current| Arc::ptr_eq(current, &record))
+            {
+                // Only this process's charged current generation is eligible.
+                state.live_refs = state
+                    .live_refs
+                    .checked_add(1)
+                    .expect("physical reference overflow");
+            }
+            state.pending_retain -= 1;
+            if retire_hbm_record(
+                &mut map,
+                (AllocationKind::Physical, handle),
+                &record,
+                &mut state,
+            ) {
+                refunds.push((client.clone(), record.size));
+            }
+        }
+        drop(scopes);
+        for (client, size) in refunds {
+            client.refund_hbm(size);
+        }
+    }
+}
+
+fn retire_hbm_record(
+    map: &mut HashMap<(AllocationKind, u64), Arc<HbmAllocationRecord>>,
+    key: (AllocationKind, u64),
+    record: &Arc<HbmAllocationRecord>,
+    state: &mut HbmAllocationState,
+) -> bool {
+    if state.live_refs != 0
+        || state.pending_free != 0
+        || state.pending_retain != 0
+        || state.refunded
+    {
+        return false;
+    }
+    state.refunded = true;
+    if map
+        .get(&key)
+        .is_some_and(|current| Arc::ptr_eq(current, record))
+    {
+        map.remove(&key);
+    }
+    true
+}
+
 #[derive(Clone, Debug)]
 pub struct SchedulerClient {
     inner: Arc<SchedulerClientInner>,
@@ -67,7 +300,7 @@ struct SchedulerClientInner {
     my_proc_idx: usize,
     physical_id: u32,
     contexts: Mutex<HashMap<u64, Arc<ContextTiming>>>,
-    hbm_handle_map: Mutex<HashMap<(AllocationKind, u64), u64>>,
+    hbm_handle_map: Mutex<HashMap<(AllocationKind, u64), Arc<HbmAllocationRecord>>>,
     /// True for the no-op stub (no shmem / no manager). All limit checks are
     /// short-circuited so the worker never blocks on the state futex.
     is_stub: bool,
@@ -218,7 +451,11 @@ impl SchedulerClient {
             .hbm_handle_map
             .lock()
             .unwrap()
-            .contains_key(&(kind, handle))
+            .get(&(kind, handle))
+            .is_some_and(|record| {
+                let state = record.state.lock().unwrap();
+                state.live_refs > state.pending_free
+            })
     }
 
     fn register_worker_slot(shmem: &'static LocalContainerShmem, pid: i32) -> usize {
@@ -669,8 +906,32 @@ impl SchedulerClient {
 
     pub fn post_alloc_hbm_kind(&self, p: u64, size: u64, rts_return: u64, kind: AllocationKind) {
         if rts_return == RT_ERROR_NONE {
+            // Global scope -> card map -> record is the only retain lock order.
+            // No one holds any of these guards while executing native code.
+            let mut scopes = (kind == AllocationKind::Physical).then(retain_scopes);
             let mut map = self.inner.hbm_handle_map.lock().unwrap();
-            map.insert((kind, p), size);
+            let pending_retain = scopes
+                .as_ref()
+                .map_or(0, |scopes| scopes.active.len() as u64);
+            let record = Arc::new(HbmAllocationRecord {
+                size,
+                state: Mutex::new(HbmAllocationState {
+                    live_refs: 1,
+                    pending_free: 0,
+                    pending_retain,
+                    refunded: false,
+                }),
+            });
+            if let Some(scopes) = scopes.as_mut() {
+                for records in scopes.active.values_mut() {
+                    records.push(ScopedHbmRecord {
+                        client: self.clone(),
+                        handle: p,
+                        record: record.clone(),
+                    });
+                }
+            }
+            map.insert((kind, p), record);
             // Reservation already charged this card's process and quota ledgers.
         } else {
             let slot = &self.inner.shmem.procs[self.inner.my_proc_idx];
@@ -689,29 +950,50 @@ impl SchedulerClient {
         self.post_free_hbm_kind(handle, ret, AllocationKind::Virtual);
     }
 
+    /// Claim the old record before calling native code. A concurrent allocation
+    /// may reuse its numeric handle after the native free but before its caller
+    /// returns; completing this ticket must not remove that newer record.
+    pub fn claim_hbm_free(&self, handle: u64, kind: AllocationKind) -> Option<HbmFreeTicket> {
+        let mut map = self.inner.hbm_handle_map.lock().unwrap();
+        let record = map.get(&(kind, handle))?.clone();
+        let mut state = record.state.lock().unwrap();
+        if state.refunded || state.live_refs <= state.pending_free {
+            return None;
+        }
+        state.pending_free += 1;
+        if kind == AllocationKind::Virtual {
+            // Ordinary addresses have a single reference. Detach now so an
+            // alias cannot claim it and a reused address gets a new identity.
+            map.remove(&(kind, handle));
+        }
+        drop(state);
+        Some(HbmFreeTicket {
+            client: self.clone(),
+            handle,
+            kind,
+            record,
+        })
+    }
+
+    fn refund_hbm(&self, size: u64) {
+        let slot = &self.inner.shmem.procs[self.inner.my_proc_idx];
+        let slot_underflow = atomic_saturating_sub(&slot.hbm_used[0], size);
+        let global_underflow = atomic_saturating_sub(&self.inner.shmem.memory_used, size);
+        if slot_underflow || global_underflow {
+            warn!(
+                "[Worker PID:{}] memory_used underflow on free",
+                std::process::id()
+            );
+            let _ = self.recalculate_usage();
+        }
+    }
+
+    // Compatibility for callers that already completed a synchronous operation.
+    // Native interceptors claim a ticket BEFORE entering CANN instead.
     pub fn post_free_hbm_kind(&self, handle: u64, ret: u64, kind: AllocationKind) {
         if ret == RT_ERROR_NONE {
-            let size = {
-                let mut map = self.inner.hbm_handle_map.lock().unwrap();
-                map.remove(&(kind, handle)).unwrap_or(0)
-            };
-
-            if size > 0 {
-                let dev = 0;
-                let slot = &self.inner.shmem.procs[self.inner.my_proc_idx];
-                let slot_underflow = atomic_saturating_sub(&slot.hbm_used[dev], size);
-                let global_underflow = atomic_saturating_sub(&self.inner.shmem.memory_used, size);
-                if slot_underflow || global_underflow {
-                    warn!(
-                        "[Worker PID:{}] memory_used underflow on free",
-                        std::process::id()
-                    );
-                    let _ = self.recalculate_usage();
-                }
-                debug!(
-                    "[Limiter] Free Success: Handle 0x{:x}, Size {} bytes returned to quota.",
-                    handle, size
-                );
+            if let Some(ticket) = self.claim_hbm_free(handle, kind) {
+                ticket.finish(ret);
             } else {
                 warn!(
                     "[Limiter] Free Success but Handle 0x{:x} was untracked!",
@@ -720,7 +1002,7 @@ impl SchedulerClient {
             }
         } else {
             warn!(
-                "[Limiter] rtFreePhysical FAILED (code: {}), handle: 0x{:x}. Quota not released.",
+                "[Limiter] native free FAILED (code: {}), handle: 0x{:x}. Quota not released.",
                 ret, handle
             );
         }

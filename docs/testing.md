@@ -121,7 +121,7 @@ not build or validate the deployable release artifact.
 | Workspace `cargo clippy` and `cargo test` | Clippy across both Rust crates and all their targets with warnings denied; configuration defaults, bounds and migration errors; atomic overdraft pool behavior. |
 | `test/manager_cpu` | Production manager arithmetic, fixed rest calculation, report aggregation and spatial exclusion from time rotation. The unused process scan is a panic-on-call test double. |
 | `test/memory_cpu` | Production memory scan/quota paths, rollback, shared-memory ABI and bounded fork cleanup. Procfs reads and CANN calls use explicit test doubles; Linux futexes are real. |
-| `test/worker_cpu/run.py` | Source-linked worker and hook admission cases with observed lock/futex boundaries. Each case runs in a separate process with a timeout. |
+| `test/worker_cpu/run.py` | Source-linked worker and hook admission cases with observed lock/futex boundaries; Cached/configured/DVPP/physical allocation admission, failure rollback, allocation/free alias deduplication, physical retain lifetimes, concurrent free/address reuse, per-card ownership, threads and fork. Each case runs in a separate process with a timeout. |
 | `test/process_local.sh` | Actual per-process cache, concurrent initialization and real fork cases. |
 | `test/spatial_cpu/run.py` | Actual built Rust hook library preloaded into a C client with fake ACL: ceil budgets, resets, API failures, device/context switching and fork handling. |
 | Documentation links | Local Markdown link destinations in the root READMEs and `docs/`; no external requests or rendered-anchor checks. |
@@ -243,7 +243,7 @@ Clippy 使用这套测试链接环境，不构建或验证可部署的发布产�
 - Manager：实际源码的份额计算、fixed 休息时间、报告聚合、spatial 不参与时间轮转。
 - Memory：内存扫描、配额、回滚、共享内存 ABI、带超时的 fork 清理；procfs 和 CANN 使用
   明确的测试替身，Linux futex 使用真实实现。
-- Worker：源码链接的准入与 hook 路径，观测锁和 futex 边界，每个用例独立进程并限制超时。
+- Worker：源码链接的准入与 hook 路径，观测锁和 futex 边界；覆盖 Cached/配置/DVPP/物理分配的准入、失败回滚、分配及释放转调去重、物理句柄 retain 生命周期、并发释放时地址复用、每卡归属、线程及 fork。每个用例独立进程并限制超时。
 - Process-local：真实缓存实现的并发初始化和 fork。
 - Spatial：预加载实际构建的 Rust 库，通过 fake ACL 验证向上取整、重置、API 错误、
   设备/上下文切换及 fork 行为。

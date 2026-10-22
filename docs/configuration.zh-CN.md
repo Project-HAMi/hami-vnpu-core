@@ -40,7 +40,13 @@ LD_PRELOAD=/opt/hami/libvnpu.so python3 your_model.py
 
 资源配置非法、无法确定当前物理卡或无法初始化必要的每卡 limiter 时，进程以状态码 `78` 退出。空分资源设置或读回校验失败也以 `78` 退出。
 
-HBM 准入计数包含尚未完成的分配预留；分配失败时回退。切卡后释放已拦截的分配，仍扣减其原属卡的用量。每卡域的 DCMI 快照仅用于诊断，不覆盖这份记账。限额覆盖被拦截的分配，不覆盖绕过库的程序。每张卡上的不同 Context 使用各自的计时 stream/event。每卡域有 32 个由 Context 共享的计时/报告槽位和 64 个进程记账槽位；空分 worker 不占计时槽位。刚销毁的 Context 已完成的报告可能保留到当前批次消费完毕。
+HBM 准入计数包含尚未完成的分配预留；分配失败时回退。切卡后释放已拦截的分配，仍扣减其原属卡的用量。虚拟显存 Hook 通过底层 runtime 入口覆盖 `aclrtMalloc`、`aclrtMallocAlign32`、`aclrtMallocCached` 和 `aclrtMallocWithCfg`。入口之间转调时只计费一次；分配配置原样交给 CANN 校验。
+
+记账对象是当前容器本地记账组创建的分配。导出、导入或映射已有分配不会新增费用；从容器外导入的显存不计费。通过 `rtFree`、`rtsFree` 或 `rtFreePhysical` 成功释放时，按原分配记录退账。释放失败保留费用；并发释放期间地址被复用，也不会删除新分配的记录。
+
+DVPP 分配通过 `rtMemAlloc`、`rtDvppMalloc` 和 `rtDvppMallocWithFlag` 拦截。物理分配通过 `rtMallocPhysical` 或 `rtsMemMallocPhysical` 拦截；显式指定目标卡时，记到该卡。对已跟踪的物理句柄执行 retain，只增加引用数，不重复计费。最后一个引用成功释放，且在途生命周期操作完成后，才退回原费用。Managed/UVM 和驱动共享池/Buffer 记账不在本次支持范围内。
+
+每卡域的 DCMI 快照仅用于诊断，不覆盖这份记账。限额覆盖被拦截的分配，并非驱动归属到进程的全部物理 HBM。Runtime/Context 开销及绕过 Hook 的分配路径可能使驱动用量更高。每张卡上的不同 Context 使用各自的计时 stream/event。每卡域有 32 个由 Context 共享的计时/报告槽位和 64 个进程记账槽位；空分 worker 不占计时槽位。刚销毁的 Context 已完成的报告可能保留到当前批次消费完毕。
 
 SHM 字段偏移保持不变，但文件名现在表示物理卡域。监控程序须读取带后缀的文件，每个文件中的 `hbm_used[0]` 表示该卡用量。升级时停止旧参与进程并使用新的基础路径；旧的无后缀文件不会与此版本协调。
 

@@ -435,3 +435,7 @@ fn physical_allocation_hook_charges_target_card_while_current_card_is_unchanged(
     assert_eq!(0, current.inner.shmem.memory_used.load(Ordering::Acquire));
     assert!(calls().iter().all(|call| !matches!(call, Call::DeviceSync)));
 }
+
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/memory_hooks.rs"));
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime_memory_extra.rs"));
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime_memory_physical.rs"));
