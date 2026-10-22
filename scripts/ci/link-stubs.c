@@ -36,6 +36,12 @@ int rtSetDevice(int device) {
 int rtGetDevice(int *device) {
     (void)device; unexpected(__func__);
 }
+int rtGetDevicePhyIdByIndex(uint32_t device, uint32_t *physical) {
+    (void)device; (void)physical; unexpected(__func__);
+}
+int rtCtxGetCurrent(uint64_t *context) {
+    (void)context; unexpected(__func__);
+}
 int rtDeviceSynchronize(void) { unexpected(__func__); }
 int rtStreamGetCaptureInfo(uint64_t stream, uint32_t *status, uint64_t *model) {
     (void)stream; (void)status; (void)model; unexpected(__func__);
@@ -44,6 +50,9 @@ int rtStreamGetCaptureInfo(uint64_t stream, uint32_t *status, uint64_t *model) {
 int dcmi_init(void) { unexpected(__func__); }
 int dcmi_get_card_list(int *count, int *cards, int capacity) {
     (void)count; (void)cards; (void)capacity; unexpected(__func__);
+}
+int dcmi_get_card_id_device_id_from_phyid(int *card, int *device, unsigned physical) {
+    (void)card; (void)device; (void)physical; unexpected(__func__);
 }
 int dcmi_get_device_resource_info(int card, int device, void *processes, int *count) {
     (void)card; (void)device; (void)processes; (void)count; unexpected(__func__);

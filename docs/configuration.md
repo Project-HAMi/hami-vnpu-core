@@ -14,12 +14,12 @@ This reference describes the library in this branch. Load the matching `libvnpu.
 | `NPU_COMPUTE_LIMIT` | `1` | Integer `1`–`100`, inclusive. Relative share with `dynamic`/`overdraft`, target run/rest percentage with `fixed`, cooperative per-process Cube/Vector percentage with `spatial`. Set it explicitly for your workload. |
 | `NPU_SCHED_POLICY` | `spatial` | Exactly `dynamic`, `fixed`, `overdraft`, or `spatial`. Surrounding whitespace is trimmed; the core's names are case-sensitive. See [policy tradeoffs](scheduling-policies.md). |
 
-There is one memory quota and one compute setting per local SHM group, not a list of per-device settings. HBM accounting sums allocations across its processes and device counters. A `spatial` compute budget applies independently to each process/device, so adding worker processes does not divide that budget between them.
+The same scalar settings apply independently to every selected physical card. `NPU_MEMORY_LIMIT_MB=20480` allows **20 GiB on each card**, shared by this group's processes on that card. Usage on card A does not consume card B's allowance. There is no per-device configuration list. Each card also has its own time-scheduling state and tickets. A `spatial` compute budget applies independently to each process/device; adding worker processes does not divide that budget between them.
 
 For example, after preparing a writable shared directory and installing the matching library:
 
 ```bash
-export NPU_GLOBAL_SHM_PATH=/hami-shared-region/device-7-registry
+export NPU_GLOBAL_SHM_PATH=/hami-shared-region/registry
 export NPU_LOCAL_SHM_PATH=/tmp/vnpu-local
 export NPU_MEMORY_LIMIT_MB=20480
 export NPU_COMPUTE_LIMIT=30
@@ -27,17 +27,24 @@ export NPU_SCHED_POLICY=spatial
 LD_PRELOAD=/opt/hami/libvnpu.so python3 your_model.py
 ```
 
-The `7` in this example labels the selected physical card for coordination; the filename does not select a device. Select the appropriate CANN runtime device or context in the application. Use the same global registry only for workloads that should coordinate on that device, and a different local SHM file for each independent accounting group.
+Select CANN devices or contexts in the application. These paths are **base names**: the library appends `.device-<physical-id>` to both paths, including single-card workloads. With physical cards 6 and 7, this example creates `/tmp/vnpu-local.device-6` and `/tmp/vnpu-local.device-7`, each with a 20 GiB quota. Logical ordinals are mapped through CANN to stable physical IDs, so processes with different visible-device orderings still account for the same card together. Time-scheduled workloads that contend on the same cards must share one global base path; independent accounting groups need different local base paths.
+
 
 ## Shared memory and process lifecycle
 
-The supervisor starts lazily on the first intercepted NPU use. Processes sharing local SHM elect an in-process manager; there is no separate manager executable. Manager election is delayed until the hosting process is at least three seconds old, and a worker waits up to ten seconds for initialized local SHM.
+A supervisor for each physical card starts lazily on its first intercepted NPU use. Processes sharing local SHM elect an in-process manager; there is no separate manager executable. Manager election is delayed until the hosting process is at least three seconds old, and a worker waits up to ten seconds for initialized local SHM.
 
 All processes sharing a local file must have matching policy, quotas, global registry path, and PID namespace, with readable `/proc/<pid>/stat` entries for each other. The library uses these PIDs for election and dead-process accounting. Configuration consistency is a deployment requirement; the SHM file does not validate a configuration fingerprint. If a group spans isolation boundaries such as containers, arrange both shared file access and the shared PID namespace explicitly.
 
 When upgrading the library or changing policy/configuration, stop every process using the local file and start with a fresh local SHM file. Do not truncate, delete, or recreate SHM while participants still map it. Appended fields preserve monitor offsets, not compatibility between old and new process mappings. The global registry opener waits for at least the current layout size; it does not identify compatible versions or validate a schema. Global layout compatibility is the deployer's responsibility. Replace that registry only after all of its users stop.
 
-Explicit invalid resource settings are reported as `invalid resource configuration` and terminate the intercepted process with status `78`. With `spatial`, inability to initialize required CANN resource limits also terminates with status `78`. For time-based policies, worker initialization failures such as unavailable local SHM can fall back to a no-op worker: a running application alone does not prove that limits are active. Verify the manager, SHM values, and the workload's behavior.
+Invalid resource settings, failure to identify the current physical card, and inability to initialize a required per-card limiter terminate the intercepted process with status `78`. Spatial resource application/readback failures also terminate with `78`.
+
+HBM admission includes pending allocations; failed allocations roll back their reservation. Freeing an intercepted allocation updates its original card even after a device switch. DCMI snapshots are diagnostic for per-card domains and do not overwrite this ledger. The quota covers intercepted allocations, not memory from applications that bypass the library. Timing streams/events are separate for each context on each card. A card domain has 32 timing/report slots shared by its contexts and 64 process accounting slots; spatial workers do not use timing slots. A just-retired completed report can retain its slot until the current batch is consumed.
+
+The SHM structures retain their field offsets, but the filenames now identify physical-card domains. Monitoring tools must open the suffixed files; each file's `hbm_used[0]` is that card's counter. Stop old participants and use fresh base names when upgrading; old unsuffixed files do not coordinate with this version.
+
+Explicit stream resource overrides use the recorded owner. Kernel submissions still require the stream's context to be current, as required by CANN. Select that context before submitting work. Device reset invalidates tracked stream ownership; recreate streams after selecting the device/context again.
 
 ## Advanced scheduling and logging
 

@@ -90,7 +90,7 @@ still selects its container-local logical device, commonly `0`.
 `NPU_GLOBAL_SHM_PATH` remains required for manager configuration, including
 the default spatial policy.
 
-This sets a shared HBM quota of 10 GiB and, for `spatial`, per-process core budgets
+This sets a shared HBM quota of 10 GiB on each card and, for `spatial`, per-process core budgets
 of `ceil(physical cores × 30 / 100)`. On a 20-Cube/40-Vector device, that is 6 Cube
 and 12 Vector cores. These budgets do not reserve exclusive physical cores.
 

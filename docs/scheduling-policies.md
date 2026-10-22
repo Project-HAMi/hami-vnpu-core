@@ -19,7 +19,7 @@ These controls do not guarantee a particular tokens/s rate, utilization reading,
 
 ## `dynamic`: relative time shares
 
-Participating local SHM groups share a global scheduling rotation. Within its turn, each group receives a shared pool of kernel-admission tickets. The manager uses the configured share and observed kernel timing to size that pool. Processes in one local SHM group consume the same normal ticket pool.
+Participating local SHM groups share a global scheduling rotation. Each physical card has its own rotation. Within its turn on a card, each group receives a shared pool of kernel-admission tickets. The manager uses the configured share and observed kernel timing to size that pool. Processes in one local SHM group consume the same normal ticket pool.
 
 For three continuously active groups configured as `10`, `30`, and `60`, those values request relative scheduling shares of `1:3:6`. They do not promise that each group stays below 10%, 30%, or 60% of the device at every moment. A lone active group may use more than its configured fraction. The numbers need not sum to `100`; they must each remain in `1..100`.
 
@@ -61,7 +61,7 @@ Every valid percentage is rounded upward; no rounding-error threshold is applied
 | `60` | 12 | 24 |
 | `100` | 20 | 40 |
 
-The library applies and reads back these budgets through CANN device resource APIs after successful `aclrtSetDevice` or `aclrtSetCurrentContext` calls. Select the device or context before initializing operators and computing their tiling. `aclrtCreateContext` alone does not apply the budget. A later allocation/submission check cannot change a kernel that was already tiled.
+The library applies and reads back these budgets through CANN device resource APIs after successful `aclrtSetDevice` or `aclrtSetCurrentContext` calls. Select the device or context before initializing operators and computing their tiling. Successful intercepted context creation also applies the budget before returning. A later allocation/submission check cannot change a kernel that was already tiled.
 
 Spatial workers bypass normal admission tickets, time measurement, overdraft, and global compute rotation. The local manager still maintains shared HBM accounting and process housekeeping.
 
@@ -71,7 +71,7 @@ The budget has these practical consequences:
 - Core IDs are not reserved exclusively. Three processes at `33` have summed budgets of 21 Cube / 42 Vector on 20/40 hardware; CANN shares the actual resources. Rounding does not cause the request to be rejected.
 - Operators must query and honor the resource budgets. A custom operator that tiles from the full hardware count may not be constrained. Confirm important operators with device traces, rather than relying only on successful budget readback.
 - Use spawned or freshly executed worker processes after device initialization. NPU use in a fork child after the parent begins device initialization is refused.
-- The CANN runtime must provide the intercepted device and stream resource APIs. Missing APIs, invalid initial resource counts, or budget application/readback failures terminate the process with exit status `78`. Non-default-stream resource overrides after multiple device initializations are refused because stream ownership cannot be verified safely.
+- The CANN runtime must provide the intercepted device and stream resource APIs. Missing APIs, invalid initial resource counts, or budget application/readback failures terminate the process with exit status `78`. Stream creation/destruction hooks record each stream's device and context, so explicit stream budgets can be set/reset on multiple cards. Unknown non-default stream handles are refused rather than assigned to the current card.
 
 Graph execution, cross-device stream use, and direct lower-level resource changes need separate workload validation. For the API contract and implementation details, see the [spatial design](spatial-policy.md).
 
@@ -81,11 +81,11 @@ For the core library, a shared `NPU_LOCAL_SHM_PATH` identifies one resource-acco
 
 | Resource | `dynamic`, `fixed`, `overdraft` | `spatial` |
 | --- | --- | --- |
-| Normal compute allowance | Shared admission pool across the local SHM group's processes | Separate budget for each process and device |
+| Normal compute allowance | Shared admission pool across the group's processes, independently on each card | Separate budget for each process and device |
 | Extra borrowing | Only `overdraft` adds IDLE tickets | None; execution follows CANN resource budgets |
-| HBM limit | Shared across the local SHM group's processes and devices | The same shared HBM limit |
+| HBM limit | Shared across the group's processes independently on each card | The same per-card HBM limit |
 
-`NPU_MEMORY_LIMIT_MB=20480` means a total 20 GiB HBM allowance for the group, not 20 GiB for each process or each selected card. Memory control is independent of the compute policy. A compute setting of `100` retains memory control and the selected policy's hooks; it does not remove the library.
+`NPU_MEMORY_LIMIT_MB=20480` means a 20 GiB HBM allowance on **each card**, shared by the group's processes using that card. Usage is not added across cards. Memory control is independent of the compute policy. A compute setting of `100` retains memory control and the selected policy's hooks; it does not remove the library.
 
 Time-scheduled workloads coordinate only with participants sharing their global registry. Spatial workloads and applications without the hooks do not join that time rotation. Co-locating them requires capacity planning; one time-scheduled group's percentage does not constrain its neighbors.
 
@@ -94,7 +94,7 @@ Time-scheduled workloads coordinate only with participants sharing their global 
 After preparing the shared files and library, configure one participating workload explicitly:
 
 ```bash
-export NPU_GLOBAL_SHM_PATH=/hami-shared-region/device-7-registry
+export NPU_GLOBAL_SHM_PATH=/hami-shared-region/registry
 export NPU_LOCAL_SHM_PATH=/tmp/vnpu-local
 export NPU_MEMORY_LIMIT_MB=20480
 export NPU_COMPUTE_LIMIT=30

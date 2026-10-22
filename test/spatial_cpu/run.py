@@ -129,13 +129,51 @@ def main():
         case("stream-current-device-failure", mode="stream-set", settings={"FAKE_FAIL_CURRENT": "1"}, code=78)
         case("two-device-bases", mode="multi-device", settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80"},
              expected=["7 14", "14 27", "7 14", "14 27"])
-        case("cross-device-explicit-stream-refused", mode="multi-stream", code=78,
-             error="multiple devices are unsupported")
+        case("tracked-cross-device-streams", mode="multi-stream",
+             settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80"},
+             expected=["stream=7/14", "stream=14/27"])
+        for object_type in ["stream", "context"]:
+            case(object_type + "-destroy-completion-does-not-forget-reused-handle",
+                 mode=object_type + "-destroy-reuse-race",
+                 settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80",
+                           "FAKE_" + object_type.upper() + "_DESTROY_RACE": "1"},
+                 expected=["stream=14/27"])
+        for mode in ["acl-stream-v2", "runtime-stream-config"]:
+            case(mode + "-tracked", mode=mode, settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80"},
+                 expected=["stream=14/27"])
+        for variant in ["basic", "ex", "without-tsd", "force"]:
+            case("runtime-reset-" + variant + "-removes-stream-owner", mode="runtime-reset-" + variant,
+                 code=78, error="untracked stream")
+            case("runtime-reset-" + variant + "-native-failure-keeps-owner", mode="runtime-reset-" + variant,
+                 settings={"FAKE_FAIL_RESET": "1"}, expected=["stream=7/14"])
+        case("runtime-reset-restores-budget-on-next-selection", mode="runtime-reset-reapply", expected=["7 14"])
+        case("unknown-cross-device-stream-refused", mode="unknown-stream", code=78,
+             error="untracked stream")
+        case("multi-device-default-stream", mode="multi-default-stream",
+             settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80"}, expected=["stream=14/27"])
+        case("create-context-only-initialization", mode="create-context-only",
+             settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80"}, expected=["14 27"])
+        case("create-native-error-preserved", mode="create-error", settings={"FAKE_FAIL_CREATE": "1"}, expected=["7 14"])
+        for api in ["acl", "runtime"]:
+            case(api + "-stream-handle-reused-on-another-card", mode="lifecycle-" + api + "-reuse",
+                 settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80"}, expected=["stream=14/27"])
+            case(api + "-destroyed-stream-owner-removed", mode="lifecycle-" + api + "-destroy",
+                 code=78, error="untracked stream")
+            case(api + "-destroyed-context-streams-removed", mode="lifecycle-" + api + "-context-destroy",
+                 code=78, error="untracked stream")
+            case(api + "-reset-device-streams-removed", mode="lifecycle-" + api + "-reset",
+                 code=78, error="untracked stream")
+            for object_type in ["stream", "context"]:
+                case(api + "-failed-" + object_type + "-destroy-owner-retained",
+                     mode="lifecycle-" + api + "-" + object_type + "-failed-destroy",
+                     settings={"FAKE_FAIL_DESTROY": "1"}, expected=["stream=7/14"])
         for action in ["set", "reset"]:
-            case("raw-switch-first-stream-" + action + "-refused", mode="raw-switch-stream-" + action,
-                 settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80"}, code=78,
-                 error="multiple devices are unsupported")
+            case("raw-switch-tracked-stream-" + action, mode="raw-switch-stream-" + action,
+                 settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80"},
+                 expected=["stream=20/14"] if action == "set" else ["stream=7/14"])
         case("concurrent-repeat-no-rescaling", mode="concurrent", expected=["7 14"])
+        case("concurrent-distinct-card-stream-lifecycles", mode="concurrent-multi-device",
+             settings={"FAKE_CUBE1": "40", "FAKE_VECTOR1": "80"}, expected=["7 14", "14 27"])
         case("fork-before-initialization", mode="fork-before", expected=["7 14", "child=0", "7 14"])
         case("fork-after-initialization-refused", mode="fork-after", expected=["child=78"])
         case("fork-inherited-lock-not-touched", mode="fork-locked", settings={"FAKE_SLOW_GET": "1"}, expected=["child=78"])
