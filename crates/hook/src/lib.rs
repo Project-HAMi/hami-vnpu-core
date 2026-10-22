@@ -73,5 +73,6 @@ macro_rules! passthrough {
 }
 
 mod hook;
+mod host_args;
 mod process;
 mod signal_compat;
