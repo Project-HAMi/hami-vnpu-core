@@ -45,40 +45,14 @@ fn discover_npu_devices() -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// Reap dead process slots and release their memory. Runs on its own fast cadence (see
-/// REAP_INTERVAL_SECS) so an abnormal exit (crash/kill-9/OOM/zombie) is reflected within
-/// one interval, regardless of the app's allocations.
-///
-/// Only SUBTRACTS the dead slot's own bytes — it never re-derives the whole counter from
-/// the slots, which would clobber the worker-maintained `memory_used` of live processes.
+/// Use the same slot-ownership protocol as allocation slow paths.
 fn reap_dead_slots(local: &LocalContainerShmem) {
-    for slot in &local.procs {
-        let pid = slot.pid.load(Ordering::Relaxed);
-        if pid == 0 || proc_alive(pid) {
-            continue;
-        }
-        if slot
-            .pid
-            .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            continue;
-        }
-        let mut leaked = 0u64;
-        for d in 0..NPU_DEVICE_MAX {
-            leaked += slot.hbm_used[d].swap(0, Ordering::AcqRel);
-        }
-        slot.is_active.store(0, Ordering::Release);
-        let _ = local.memory_used.fetch_update(Ordering::SeqCst, Ordering::Acquire, |cur| {
-            Some(cur.saturating_sub(leaked))
-        });
-        debug!("[Reap] cleared dead slot pid={} released {} MB", pid, leaked / 1024 / 1024);
-    }
+    crate::worker::reclaim_dead_process_slots(local);
 }
 
-/// DCMI hardware refresh of LIVE slots (per device). In its own thread because the
-/// in-container `dcmi_get_device_resource_info` can block indefinitely; isolating it means
-/// such a stall only delays hardware correction, never the reaper above.
+/// Sample hardware usage for diagnostics only. Stale DCMI snapshots must not
+/// overwrite pending Hook reservations. The independent thread isolates blocking
+/// hardware queries from process reclamation.
 fn discover_and_update(local: &LocalContainerShmem) {
     let devices = discover_npu_devices();
     for (idx, &(card_id, device_id)) in devices.iter().enumerate() {
@@ -104,11 +78,11 @@ fn discover_and_update(local: &LocalContainerShmem) {
             if pid == 0 {
                 continue;
             }
-            // ascend runtime reports CONTAINER PIDs here (== slot.pid = std::process::id()).
-            // Bare docker w/o ascend runtime reports HOST PIDs and won't match — memory then
-            // stays at the rtMalloc-hook value, which is the correct per-pod allocation anyway.
+            // DCMI is sampled asynchronously and may predate a new reservation
+            // or a slot's reuse. Observe it without writing the quota ledger.
             if let Some(&mem) = dcmimap.get(&pid) {
-                slot.hbm_used[dev].store(mem, Ordering::Release);
+                debug!("[DCMI] pid={} device={} sampled_bytes={} tracked_bytes={}",
+                    pid, dev, mem, slot.hbm_used[dev].load(Ordering::Acquire));
             }
         }
     }
@@ -116,7 +90,7 @@ fn discover_and_update(local: &LocalContainerShmem) {
 
 use crate::shmem::{GlobalRegistry, LocalContainerShmem, futex, MAX_MANAGERS, NPU_DEVICE_MAX, STATE_IDLE, STATE_RUNNING, STATE_MEASURING, MAX_WORKERS};
 use crate::config::{ManagerConfig, SchedPolicy};
-use crate::worker::proc_alive;
+
 
 const GLOBAL_WATCHDOG_TIMEOUT_US: u64 = 1_000_000;
 const GLOBAL_WAIT_POLL_US: u64 = 1_000;

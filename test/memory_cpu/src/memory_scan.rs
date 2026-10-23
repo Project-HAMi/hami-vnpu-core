@@ -48,7 +48,7 @@ fn self_proc_error_is_not_queried_or_misreaped() {
 }
 
 #[test]
-fn other_live_zombie_and_unreadable_pids_keep_existing_checks() {
+fn live_and_unreadable_pids_are_preserved_while_zombies_are_reaped() {
     let c = client(1000, 60);
     set_slot(c.inner.shmem, 0, me(), 10);
     set_slot(c.inner.shmem, 1, other(1), 20);
@@ -57,18 +57,19 @@ fn other_live_zombie_and_unreadable_pids_keep_existing_checks() {
     c.inner.shmem.memory_used.store(100, Ordering::Release);
     proc_mock::set(&[(me(), Answer::Unreadable), (other(1), Answer::Live),
                     (other(2), Answer::Zombie), (other(3), Answer::Unreadable)]);
-    assert_eq!(30, c.recalculate_usage());
+    assert_eq!(70, c.recalculate_usage());
     assert_eq!(vec![other(1), other(2), other(3)], proc_mock::calls());
-    assert_eq!(30, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(70, c.inner.shmem.memory_used.load(Ordering::Acquire));
     assert_eq!(other(1), c.inner.shmem.procs[1].pid.load(Ordering::Acquire));
-    for i in [2, 3] {
-        assert_eq!(0, c.inner.shmem.procs[i].pid.load(Ordering::Acquire));
-        assert_eq!(0, c.inner.shmem.procs[i].is_active.load(Ordering::Acquire));
-        assert_eq!(0, c.inner.shmem.procs[i].hbm_used[0].load(Ordering::Acquire));
-    }
-    proc_mock::set(&[(other(1), Answer::Live)]);
-    assert_eq!(30, c.recalculate_usage());
-    assert_eq!(vec![other(1)], proc_mock::calls()); // Reaped/pid0 slots are not read or refunded twice.
+    assert_eq!(0, c.inner.shmem.procs[2].pid.load(Ordering::Acquire));
+    assert_eq!(0, c.inner.shmem.procs[2].is_active.load(Ordering::Acquire));
+    assert_eq!(0, c.inner.shmem.procs[2].hbm_used[0].load(Ordering::Acquire));
+    assert_eq!(other(3), c.inner.shmem.procs[3].pid.load(Ordering::Acquire));
+    assert_eq!(1, c.inner.shmem.procs[3].is_active.load(Ordering::Acquire));
+    assert_eq!(40, c.inner.shmem.procs[3].hbm_used[0].load(Ordering::Acquire));
+    proc_mock::set(&[(other(1), Answer::Live), (other(3), Answer::Unreadable)]);
+    assert_eq!(70, c.recalculate_usage());
+    assert_eq!(vec![other(1), other(3)], proc_mock::calls()); // The reaped slot is not read or refunded twice.
     assert_compute_unchanged(c.inner.shmem);
 }
 
@@ -86,17 +87,18 @@ fn exemption_uses_current_pid_not_cached_process_slot_index() {
 }
 
 #[test]
-fn memory_query_preserves_reconciliation_and_128mib_overhead() {
+fn memory_query_reads_ledger_and_preserves_128mib_overhead() {
     let c = client(512 * MIB, 200 * MIB);
     set_slot(c.inner.shmem, 1, other(1), 28 * MIB);
-    c.inner.shmem.memory_used.store(1, Ordering::Release); // Existing reconciliation must still run.
+    c.inner.shmem.memory_used.store(1, Ordering::Release); // Admission and queries must use the ledger, not this sampled metric.
     proc_mock::set(&[(me(), Answer::Unreadable), (other(1), Answer::Live)]);
     let (mut free, mut total) = (usize::MAX, usize::MAX);
     c.get_hbm_info(&mut free, &mut total);
     assert_eq!(512 * MIB as usize, total);
     assert_eq!(156 * MIB as usize, free);
-    assert_eq!(228 * MIB, c.inner.shmem.memory_used.load(Ordering::Acquire));
-    assert_eq!(vec![other(1)], proc_mock::calls());
+    assert_eq!(Some(228 * MIB), ledger_total(c.inner.shmem));
+    assert_eq!(1, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert!(proc_mock::calls().is_empty());
     c.inner.shmem.procs[0].hbm_used[0].store(470 * MIB, Ordering::Release);
     c.get_hbm_info(&mut free, &mut total);
     assert_eq!(512 * MIB as usize, total);
@@ -142,8 +144,8 @@ fn lost_reap_cas_preserves_replacement_owner_and_slot_memory() {
     set_slot(c.inner.shmem, 1, dead, 20);
     proc_mock::set(&[(dead, Answer::Zombie)]);
     proc_mock::replace_pid_on_read(dead, &c.inner.shmem.procs[1].pid, replacement);
-    // Main skips this racing slot during this scan after losing its CAS.
-    assert_eq!(10, c.recalculate_usage());
+    // A lost reap CAS must retain the replacement owner and its reservation.
+    assert_eq!(30, c.recalculate_usage());
     let slot = &c.inner.shmem.procs[1];
     assert_eq!(replacement, slot.pid.load(Ordering::Acquire));
     assert_eq!(1, slot.is_active.load(Ordering::Acquire));

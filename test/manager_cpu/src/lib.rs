@@ -6,7 +6,11 @@ pub mod overdraft;
 #[path = "../../../crates/limiter/src/shmem/mod.rs"]
 pub mod shmem;
 // None of these arithmetic tests calls the DCMI/reaper paths.
-pub mod worker { pub fn proc_alive(_: i32) -> bool { panic!("unexpected process scan"); } }
+pub mod worker {
+    pub fn reclaim_dead_process_slots(_: &crate::shmem::LocalContainerShmem) {
+        panic!("unexpected process scan");
+    }
+}
 pub mod manager {
     include!("../../../crates/limiter/src/manager.rs");
     #[cfg(test)] mod tests;
