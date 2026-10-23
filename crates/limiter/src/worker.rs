@@ -73,6 +73,9 @@ impl SchedulerClient {
         info!("[Worker PID:{}] Initialize SchedulerClient...", my_pid);
 
         let shmem_path = local_shmem_path();
+        if let Ok(global) = std::env::var(crate::config::ENV_GLOBAL_SHM_PATH) {
+            crate::config::require_distinct_shmem_paths(&global, &shmem_path);
+        }
         let deadline = Instant::now() + Duration::from_secs(SHMEM_WAIT_TIMEOUT_SECS);
         let shmem = loop {
             if let Some(s) = shmem::setup::try_open_shmem::<LocalContainerShmem>(shmem_path.as_str()) {
@@ -379,7 +382,7 @@ impl SchedulerClient {
 
     fn measure_and_report_batch(&self, lock: &mut InnerLock) {
         let mut duration_us: u64 = 0;
-        let mut used_wall_clock = false;
+        let mut untimed_drain = false;
 
         if lock.last_user_stream != 0 {
             let mut status: u32 = 0;
@@ -387,28 +390,26 @@ impl SchedulerClient {
             let _ = check_rts!(rtStreamGetCaptureInfo(lock.last_user_stream, &mut status, &mut model));
             if status != 0 {
                 debug!(
-                    "[Limiter] stream 0x{:x} is capturing; using device sync timing.",
+                    "[Limiter] stream 0x{:x} is capturing; draining without a timing sample.",
                     lock.last_user_stream
                 );
                 check_rts!(rtDeviceSynchronize());
-                if lock.start_time_us != 0 {
-                    duration_us = get_time_us().saturating_sub(lock.start_time_us);
-                }
-                used_wall_clock = true;
+                // Wall time includes request gaps and delayed reporting. Mark
+                // completion, but do not use it to train the scheduling average.
+                untimed_drain = true;
             }
         }
 
-        // If there is no user stream, fall back to device sync + wall-clock.
-        if !used_wall_clock && lock.last_user_stream == 0 {
-            debug!("[Limiter] no last user stream; using device sync timing.");
+        // With no user stream, drain the device without a timing sample.
+        if !untimed_drain && lock.last_user_stream == 0 {
+            debug!("[Limiter] no last user stream; draining without a timing sample.");
             check_rts!(rtDeviceSynchronize());
-            if lock.start_time_us != 0 {
-                duration_us = get_time_us().saturating_sub(lock.start_time_us);
-            }
-            used_wall_clock = true;
+            // This synchronizes outstanding work without claiming a measured
+            // execution duration. A zero duration is an untimed completion.
+            untimed_drain = true;
         }
 
-        if !used_wall_clock {
+        if !untimed_drain {
             check_rts!(rtEventRecord(lock.tracking_event, lock.last_user_stream));
             check_rts!(rtStreamWaitEvent(lock.internal_stream, lock.tracking_event));
             check_rts!(rtEventRecord(lock.end_event, lock.internal_stream));

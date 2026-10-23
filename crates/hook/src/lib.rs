@@ -34,7 +34,9 @@ fn ensure_supervisor(me: i32) {
         });
         if !matches!(spawned, Ok(Ok(_))) {
             let _ = SUPERVISOR_PID.compare_exchange(me, cur, Ordering::AcqRel, Ordering::Relaxed);
-            log::warn!("[hook] failed to spawn vnpu-supervisor thread; will retry on next NPU call");
+            log::warn!(
+                "[hook] failed to spawn vnpu-supervisor thread; will retry on next NPU call"
+            );
         }
     }
 }
@@ -45,13 +47,23 @@ static LIMITER: process::ProcessLocal<SchedulerClient> = process::ProcessLocal::
 
 pub fn npu_limiter() -> &'static SchedulerClient {
     let pid = std::process::id();
+    // /etc/ld.so.preload is also applied to the fresh query executable. Its
+    // runtime callbacks must never register workers or elect another manager.
+    if limiter::is_dcmi_helper() {
+        return LIMITER.get_or_init(pid, SchedulerClient::stub);
+    }
     ensure_supervisor(pid as i32);
     LIMITER.get_or_init(pid, || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(SchedulerClient::new))
-            .unwrap_or_else(|e| {
-                log::warn!("SchedulerClient init failed (PID {}), using stub: {:?}", pid, e);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(SchedulerClient::new)).unwrap_or_else(
+            |e| {
+                log::warn!(
+                    "SchedulerClient init failed (PID {}), using stub: {:?}",
+                    pid,
+                    e
+                );
                 SchedulerClient::stub()
-            })
+            },
+        )
     })
 }
 
@@ -60,10 +72,8 @@ macro_rules! passthrough {
         {
             static REAL: ::std::sync::LazyLock<extern "C" fn($($sig)*) -> u64> =
                 ::std::sync::LazyLock::new(|| unsafe {
-                    let ptr = libc::dlsym(libc::RTLD_NEXT, concat!($name, "\0").as_ptr() as *const libc::c_char);
-                    if ptr.is_null() {
-                        panic!("cannot find original function: {}", $name);
-                    }
+                    let name = std::ffi::CStr::from_bytes_with_nul(concat!($name, "\0").as_bytes()).unwrap();
+                    let ptr = limiter::externed_api::runtime_symbol(name);
                     std::mem::transmute(ptr)
                 });
             // println!("in func {:?}", $name);

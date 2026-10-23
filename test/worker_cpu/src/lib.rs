@@ -30,6 +30,7 @@ pub mod externed_api {
     use super::{Call,trace};
     use std::sync::atomic::{AtomicU64,Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(100);
+    pub static CAPTURE_STATUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     pub const RT_ERROR_NONE: u64 = 0;
     pub const RT_ERROR_MEMORY_ALLOCATION: u64 = 207001;
     pub unsafe fn rtStreamCreate(out: *mut u64, _: i32) -> i32 { unsafe { *out = NEXT.fetch_add(1,Ordering::Relaxed); } trace(Call::StreamCreate); 0 }
@@ -41,5 +42,5 @@ pub mod externed_api {
     pub unsafe fn rtEventElapsedTime(out: *mut f32, first: u64,last:u64) -> usize { trace(Call::Elapsed(first,last)); unsafe { *out = 2.5; } 0 }
     pub unsafe fn rtSetDevice(_: i32) -> i32 { 0 }
     pub unsafe fn rtGetDevice(out: *mut i32) -> i32 { unsafe { *out=0; } 0 }
-    pub unsafe fn rtStreamGetCaptureInfo(stream: u64, status: *mut u32,_: *mut u64) -> i32 { trace(Call::Capture(stream)); unsafe { *status=0; } 0 }
+    pub unsafe fn rtStreamGetCaptureInfo(stream: u64, status: *mut u32,_: *mut u64) -> i32 { trace(Call::Capture(stream)); unsafe { *status=CAPTURE_STATUS.load(Ordering::Relaxed); } 0 }
 }
