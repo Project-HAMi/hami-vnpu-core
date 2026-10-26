@@ -10,8 +10,13 @@ The fixture builds the actual interceptor against fake CANN libraries. It checks
 the public CANN `aclrtLaunchKernelWithHostArgs` ABI (eight arguments, including
 64-bit sizes, and a negative `aclError`), then reads the real worker's shared
 token counter. It exercises ACL loaded with both `RTLD_GLOBAL` and `RTLD_LOCAL`.
+It selects the dynamic policy explicitly and preinitializes independent local
+domains for physical cards 0 and 1 (`NPU_LOCAL_SHM_PATH.device-<id>`). A live parent reserves the manager
+slot so the real supervisor cannot replace the fixture's controlled token state.
 
 - Eager calls consume one token and wait when no token is available.
+- Switching cards with default or unrecorded streams charges only the current
+  card. Concurrent threads on two cards retain independent token balances.
 - Capture records no execution, leaves the token balance unchanged, and does not
   initialize a worker, even when the provider delegates to legacy hooks.
 - A failed capture-status query still takes the admission path.
