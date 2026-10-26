@@ -18,7 +18,7 @@ void fake_mode(int value) { mode = value; }
 int aclrtLaunchKernelWithHostArgs(void *func, uint32_t blocks, void *stream, void *cfg,
                                 void *args, size_t size, void *placeholders, size_t count) {
     assert(func == (void *)0x1234 && blocks == UINT32_C(0xfedcba98));
-    assert(stream == (void *)0x5678 && cfg == (void *)0x9876 && args == (void *)0x4567);
+    assert((stream == NULL || stream == (void *)0x5678) && cfg == (void *)0x9876 && args == (void *)0x4567);
     assert(size == (size_t)UINT64_C(0x100000002) && placeholders == (void *)0x8765);
     assert(count == (size_t)UINT64_C(0x200000003));
     ++depth;

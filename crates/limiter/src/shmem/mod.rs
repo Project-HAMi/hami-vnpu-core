@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 
-pub mod setup;
 pub mod futex;
+pub mod setup;
 
 // =========================================================================================
 // GLOBAL SHARED MEMORY LAYOUT
@@ -92,10 +92,10 @@ pub struct LocalContainerShmem {
 
     pub procs: [ProcessSlot; MAX_PROCESSES],
 
-    pub manager_pid: AtomicI32,        // elected manager's container PID; 0 = none
-    pub manager_heartbeat: AtomicU64,  // manager heartbeat (us); stale => eligible for takeover
+    pub manager_pid: AtomicI32, // elected manager's container PID; 0 = none
+    pub manager_heartbeat: AtomicU64, // manager heartbeat (us); stale => eligible for takeover
     pub manager_global_idx: AtomicI32, // global slot the manager holds (for takeover reclaim)
-    pub initialized: AtomicU32,        // 1 once manager published resource configuration; workers wait on it
+    pub initialized: AtomicU32, // 1 once manager published resource configuration; workers wait on it
 
     // Append only: the monitor's existing reports/procs offsets remain stable.
     pub overdraft_pool: crate::overdraft::OverdraftPool,

@@ -3,12 +3,21 @@
 
 static _Thread_local unsigned capture_status;
 static _Thread_local int capture_error;
+static _Thread_local int current_device;
 void fake_capture(unsigned status, int error) { capture_status = status; capture_error = error; }
 int rtStreamGetCaptureInfo(uint64_t stream, unsigned *status, uint64_t *model) {
     (void)stream; *status = capture_status; *model = 0; return capture_error;
 }
-int rtGetDevice(int *device) { *device = 0; return 0; }
-int rtSetDevice(int device) { (void)device; return 0; }
+int rtGetDevice(int *device) { *device = current_device; return 0; }
+int rtSetDevice(int device) {
+    if (device < 0 || device > 1) return 107001;
+    current_device = device; return 0;
+}
+int rtGetDevicePhyIdByIndex(unsigned device, unsigned *physical) {
+    if (device > 1) return 107001;
+    *physical = device; return 0;
+}
+int rtCtxGetCurrent(uint64_t *context) { *context = UINT64_C(0x1000) + current_device; return 0; }
 int rtStreamCreate(uint64_t *stream, int priority) { (void)priority; *stream = 42; return 0; }
 size_t rtEventCreate(uint64_t *event) { *event = 42; return 0; }
 size_t rtEventRecord(uint64_t event, uint64_t stream) { (void)event; (void)stream; return 0; }
@@ -22,8 +31,9 @@ uint64_t rtKernelLaunchWithFlagV2(uint64_t a, unsigned b, uint64_t c, uint64_t d
 uint64_t rtKernelLaunchWithHandleV2(uint64_t a, uint64_t b, unsigned c, uint64_t d, uint64_t e, uint64_t f, uint64_t g) { return 0; }
 uint64_t rtModelExecute(uint64_t a, uint64_t b, unsigned c) { return 0; }
 
-// The main-branch interceptor still links DCMI eagerly. These are never queried
-// because this fixture supplies initialized local SHM without a global manager.
+// Link dependencies only: the fixture supplies initialized per-card local SHM
+// and reserves its manager slot, so admission must not reach real DCMI queries.
 int dcmi_init(void) { return -1; }
 int dcmi_get_card_list(int *count, int *cards, int capacity) { *count = 0; return -1; }
+int dcmi_get_card_id_device_id_from_phyid(int *card, int *device, unsigned physical) { return -1; }
 int dcmi_get_device_resource_info(int card, int device, void *out, int *count) { return -1; }

@@ -1,0 +1,388 @@
+{
+  "experiment": "spatial-gemm-20261016",
+  "run_id": "c803dee631ca",
+  "measured_source_commit": "99ccd065cdd4a6958316d5497f149f76c3d06e0e",
+  "library_sha256": "fbecc746beb1afb82bbaca8a850d405ec141273bf90c5eeeee61c4e0328a9388",
+  "image_id": "sha256:d07f64804fe607058318139c929ee5acb6ff3ffa98ae582b425cfeda25c86ea2",
+  "device": {
+    "model": "Ascend 910B3",
+    "index": 0,
+    "physical_cube": 20,
+    "physical_vector": 40
+  },
+  "software": {
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0.post4",
+    "cann": "9.1"
+  },
+  "native_baseline_included": false,
+  "protocol": {
+    "dtype": "bfloat16",
+    "m_n_k": [
+      4096,
+      8192
+    ],
+    "seed": 42,
+    "warmup_calls_per_size": 50,
+    "pilot_calls_per_size": 4,
+    "batch_rule": "clamp(ceil(50ms / pilot_wall_time_per_call), 1, 64)",
+    "formal_rounds": 1,
+    "window_ns": 20000000000,
+    "primary_metric": "whole-batch FLOPs completed inside fixed window / 20s",
+    "flops_per_call": "2*M*N*K",
+    "profiler_in_formal": false,
+    "manual_tuning_env_added": false,
+    "boundary_flops_prorated": false,
+    "output_preallocated": true,
+    "fresh_processes": 6
+  },
+  "formal_results": [
+    {
+      "phase": "solo30",
+      "quota": 30,
+      "size": 4096,
+      "batch_calls": 28,
+      "conservative_tflops": 83.1230790598656,
+      "window_upper_tflops": 83.3154935947264,
+      "boundary_uncertainty_tflops": 0.19241453486079999,
+      "drained_host_tflops": 83.28835957978906,
+      "event_span_tflops": 83.52919370900489,
+      "contained_calls": 12096,
+      "boundary_calls": 28,
+      "batch_count": 433,
+      "actual_first_start_lateness_ns": 87170,
+      "final_drain_past_window_ns": 6602850
+    },
+    {
+      "phase": "solo30",
+      "quota": 30,
+      "size": 8192,
+      "batch_calls": 4,
+      "conservative_tflops": 82.6832744087552,
+      "window_upper_tflops": 82.9031767343104,
+      "boundary_uncertainty_tflops": 0.2199023255552,
+      "drained_host_tflops": 82.84526338014082,
+      "event_span_tflops": 83.04826815154571,
+      "contained_calls": 1504,
+      "boundary_calls": 4,
+      "batch_count": 377,
+      "actual_first_start_lateness_ns": 282040,
+      "final_drain_past_window_ns": 14263130
+    },
+    {
+      "phase": "solo60",
+      "quota": 60,
+      "size": 4096,
+      "batch_calls": 49,
+      "conservative_tflops": 165.6689145151488,
+      "window_upper_tflops": 166.0056399511552,
+      "boundary_uncertainty_tflops": 0.3367254360064,
+      "drained_host_tflops": 165.7327895021461,
+      "event_span_tflops": 166.48903154742075,
+      "contained_calls": 24108,
+      "boundary_calls": 49,
+      "batch_count": 493,
+      "actual_first_start_lateness_ns": 93510,
+      "final_drain_past_window_ns": 33020060
+    },
+    {
+      "phase": "solo60",
+      "quota": 60,
+      "size": 8192,
+      "batch_calls": 8,
+      "conservative_tflops": 160.08889300418562,
+      "window_upper_tflops": 160.528697655296,
+      "boundary_uncertainty_tflops": 0.4398046511104,
+      "drained_host_tflops": 160.2943086649523,
+      "event_span_tflops": 160.72486173470028,
+      "contained_calls": 2912,
+      "boundary_calls": 8,
+      "batch_count": 365,
+      "actual_first_start_lateness_ns": 363100,
+      "final_drain_past_window_ns": 29607930
+    },
+    {
+      "phase": "dual",
+      "quota": 30,
+      "size": 4096,
+      "batch_calls": 27,
+      "conservative_tflops": 75.5158329851904,
+      "window_upper_tflops": 75.7013755723776,
+      "boundary_uncertainty_tflops": 0.18554258718720001,
+      "drained_host_tflops": 75.5732847494435,
+      "event_span_tflops": 75.81398608182582,
+      "contained_calls": 10989,
+      "boundary_calls": 27,
+      "batch_count": 408,
+      "actual_first_start_lateness_ns": 91010,
+      "final_drain_past_window_ns": 33989450
+    },
+    {
+      "phase": "dual",
+      "quota": 30,
+      "size": 8192,
+      "batch_calls": 4,
+      "conservative_tflops": 69.4891348754432,
+      "window_upper_tflops": 69.7090372009984,
+      "boundary_uncertainty_tflops": 0.2199023255552,
+      "drained_host_tflops": 69.62124529802631,
+      "event_span_tflops": 69.77563469106452,
+      "contained_calls": 1264,
+      "boundary_calls": 4,
+      "batch_count": 317,
+      "actual_first_start_lateness_ns": 288950,
+      "final_drain_past_window_ns": 25508810
+    },
+    {
+      "phase": "dual",
+      "quota": 60,
+      "size": 4096,
+      "batch_calls": 48,
+      "conservative_tflops": 151.0728976564224,
+      "window_upper_tflops": 151.4027511447552,
+      "boundary_uncertainty_tflops": 0.3298534883328,
+      "drained_host_tflops": 151.26472503282488,
+      "event_span_tflops": 151.79546777609968,
+      "contained_calls": 21984,
+      "boundary_calls": 48,
+      "batch_count": 459,
+      "actual_first_start_lateness_ns": 90870,
+      "final_drain_past_window_ns": 18340480
+    },
+    {
+      "phase": "dual",
+      "quota": 60,
+      "size": 8192,
+      "batch_calls": 7,
+      "conservative_tflops": 138.92329416949758,
+      "window_upper_tflops": 139.30812323921919,
+      "boundary_uncertainty_tflops": 0.38482906972159997,
+      "drained_host_tflops": 139.21244398819678,
+      "event_span_tflops": 139.58076188195804,
+      "contained_calls": 2527,
+      "boundary_calls": 7,
+      "batch_count": 362,
+      "actual_first_start_lateness_ns": 371980,
+      "final_drain_past_window_ns": 14117770
+    }
+  ],
+  "comparisons": [
+    {
+      "size": 4096,
+      "solo_60_over_30": {
+        "conservative_tflops": 1.9930555555555556,
+        "drained_host_tflops": 1.9898673756850314,
+        "event_span_tflops": 1.9931837499524716
+      },
+      "dual_60_over_30": {
+        "conservative_tflops": 2.0005460005460005,
+        "drained_host_tflops": 2.0015634563765436,
+        "event_span_tflops": 2.002209297005796
+      },
+      "dual_vs_matching_solo": {
+        "conservative_tflops": {
+          "30": {
+            "rate_ratio": 0.9084821428571428,
+            "competition_loss": 0.0915178571428572
+          },
+          "60": {
+            "rate_ratio": 0.9118964659034346,
+            "competition_loss": 0.08810353409656535
+          },
+          "dual_total_over_solo_sum": 0.9107557176002652
+        },
+        "drained_host_tflops": {
+          "30": {
+            "rate_ratio": 0.9073691105303302,
+            "competition_loss": 0.0926308894696698
+          },
+          "60": {
+            "rate_ratio": 0.9127024621212095,
+            "competition_loss": 0.08729753787879047
+          },
+          "dual_total_over_solo_sum": 0.9109186533696064
+        },
+        "event_span_tflops": {
+          "30": {
+            "rate_ratio": 0.9076345971438806,
+            "competition_loss": 0.09236540285611938
+          },
+          "60": {
+            "rate_ratio": 0.9117445537717845,
+            "competition_loss": 0.08825544622821546
+          },
+          "dual_total_over_solo_sum": 0.9103714484193419
+        }
+      },
+      "dual_joint_complete_batch_coverage": 0.9961188535,
+      "dual_joint_complete_batch_union_ns": 19922377070,
+      "note": "Joint overlap is a coverage diagnostic; FLOPs are never divided by this intersection.",
+      "fixed_window_ratio_bounds": {
+        "solo_60_over_30": [
+          1.9884526558891453,
+          1.9971064814814812
+        ],
+        "dual_60_over_30": [
+          1.9956427015250546,
+          2.004914004914005
+        ],
+        "dual30_over_solo30": [
+          0.9063840316727152,
+          0.9107142857142857
+        ],
+        "dual60_over_solo60": [
+          0.9100467773316224,
+          0.913887506222001
+        ]
+      }
+    },
+    {
+      "size": 8192,
+      "solo_60_over_30": {
+        "conservative_tflops": 1.936170212765958,
+        "drained_host_tflops": 1.9348638911247291,
+        "event_span_tflops": 1.9353186443504282
+      },
+      "dual_60_over_30": {
+        "conservative_tflops": 1.9992088607594933,
+        "drained_host_tflops": 1.9995684276009829,
+        "event_span_tflops": 2.000422676195775
+      },
+      "dual_vs_matching_solo": {
+        "conservative_tflops": {
+          "30": {
+            "rate_ratio": 0.8404255319148937,
+            "competition_loss": 0.15957446808510634
+          },
+          "60": {
+            "rate_ratio": 0.8677884615384613,
+            "competition_loss": 0.13221153846153866
+          },
+          "dual_total_over_solo_sum": 0.8584692028985507
+        },
+        "drained_host_tflops": {
+          "30": {
+            "rate_ratio": 0.8403768961245829,
+            "competition_loss": 0.15962310387541712
+          },
+          "60": {
+            "rate_ratio": 0.8684802670017381,
+            "competition_loss": 0.13151973299826192
+          },
+          "dual_total_over_solo_sum": 0.8589045688025329
+        },
+        "event_span_tflops": {
+          "30": {
+            "rate_ratio": 0.8401816948637458,
+            "competition_loss": 0.15981830513625417
+          },
+          "60": {
+            "rate_ratio": 0.8684453691573638,
+            "competition_loss": 0.1315546308426362
+          },
+          "dual_total_over_solo_sum": 0.8588165425398457
+        }
+      },
+      "dual_joint_complete_batch_coverage": 0.996104488,
+      "dual_joint_complete_batch_union_ns": 19922089760,
+      "note": "Joint overlap is a coverage diagnostic; FLOPs are never divided by this intersection.",
+      "fixed_window_ratio_bounds": {
+        "solo_60_over_30": [
+          1.9310344827586208,
+          1.9414893617021278
+        ],
+        "dual_60_over_30": [
+          1.9929022082018926,
+          2.0047468354430378
+        ],
+        "dual30_over_solo30": [
+          0.8381962864721485,
+          0.8430851063829787
+        ],
+        "dual60_over_solo60": [
+          0.8654109589041094,
+          0.8701923076923075
+        ]
+      }
+    }
+  ],
+  "separate_solo_profile": [
+    {
+      "quota": 30,
+      "size": 4096,
+      "matmul_count": 20,
+      "mean_matmul_device_ns": 1647434.0,
+      "cube_blocks": {
+        "6": 20
+      },
+      "process_gap_fraction": 1.3353922654079988e-05,
+      "input_sha256": {
+        "kernel_csv": "12cc51b14efff58cd0b823af92ef267d608cb60f0fdea481189545f2deb8e588",
+        "trace": "aa2269e39ff2039264e30b3a4d9732d142580fefb3b1cdb29df8e006268dee6f"
+      }
+    },
+    {
+      "quota": 30,
+      "size": 8192,
+      "matmul_count": 20,
+      "mean_matmul_device_ns": 13281001.0,
+      "cube_blocks": {
+        "6": 20
+      },
+      "process_gap_fraction": 1.957679929421121e-06,
+      "input_sha256": {
+        "kernel_csv": "12cc51b14efff58cd0b823af92ef267d608cb60f0fdea481189545f2deb8e588",
+        "trace": "aa2269e39ff2039264e30b3a4d9732d142580fefb3b1cdb29df8e006268dee6f"
+      }
+    },
+    {
+      "quota": 60,
+      "size": 4096,
+      "matmul_count": 20,
+      "mean_matmul_device_ns": 828470.0,
+      "cube_blocks": {
+        "12": 20
+      },
+      "process_gap_fraction": 3.138216720418686e-05,
+      "input_sha256": {
+        "kernel_csv": "171210afbc7299af5961f849e3f414930ff19179ff8df0768efaeb35221bac8d",
+        "trace": "a32a8903f211e9cf3492d474133761189aaaa826efaed31b14dcb065eb905eda"
+      }
+    },
+    {
+      "quota": 60,
+      "size": 8192,
+      "matmul_count": 20,
+      "mean_matmul_device_ns": 6710022.0,
+      "cube_blocks": {
+        "12": 20
+      },
+      "process_gap_fraction": 3.4276968336277925e-06,
+      "input_sha256": {
+        "kernel_csv": "171210afbc7299af5961f849e3f414930ff19179ff8df0768efaeb35221bac8d",
+        "trace": "a32a8903f211e9cf3492d474133761189aaaa826efaed31b14dcb065eb905eda"
+      }
+    }
+  ],
+  "validation": {
+    "formal_recalculation": "passed",
+    "profile_connections_verified": 80,
+    "independent_protocol_checks_passed": 13,
+    "deployed_libraries_unchanged": true,
+    "test_containers_removed": true,
+    "raw_archive_regular_members": 423,
+    "raw_archive_verified_data_files": 422
+  },
+  "raw_archive": {
+    "name": "hami-spatial-gemm-evidence-20261016.tar.gz",
+    "bytes": 2425327,
+    "sha256": "86ab9602d397636d482370bff49a5ceb5808306d975efa9999d358ba85cc371c"
+  },
+  "limitations": [
+    "One formal round; no claim of repeatability or production readiness.",
+    "GEMM rates measure tested Cube compute workloads, not vLLM token throughput or generic Vector/custom-operator coverage.",
+    "Concurrent-versus-solo differences use sequential reference measurements and do not identify the shared-resource bottleneck.",
+    "No native-relative overhead, exclusive partition, priority fairness or generic utilization-accuracy claim.",
+    "Solo profile gaps do not directly measure concurrent-process overlap."
+  ]
+}

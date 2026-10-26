@@ -2,10 +2,10 @@
 //!
 //! The manager daemon no longer runs as a separate binary. Instead every process
 //! that loads `libvnpu.so` spawns a lightweight supervisor thread (see the ctor in
-//! the `hook` crate). All supervisors in the same pod (same `NPU_LOCAL_SHM_PATH`)
+//! the `hook` crate). Supervisors in the same physical-card domain
 //! race to become the *single* manager via a CAS on `LocalContainerShmem::manager_pid`.
 //! The winner runs `ContainerManager::run()`; the losers stand by and watch, ready to
-//! take over if the current manager dies. This guarantees exactly one manager per pod
+//! take over if the current manager dies. This guarantees one manager per Pod/card
 //! while surviving crashes of whichever process happened to host it.
 
 use std::sync::atomic::Ordering;
@@ -17,7 +17,7 @@ use log::{info, warn};
 use crate::config::ManagerConfig;
 use crate::manager::ContainerManager;
 use crate::shmem::setup;
-use crate::shmem::{futex, GlobalRegistry, LocalContainerShmem, MAX_MANAGERS, STATE_IDLE};
+use crate::shmem::{GlobalRegistry, LocalContainerShmem, MAX_MANAGERS, STATE_IDLE, futex};
 use crate::worker::proc_alive;
 
 /// A manager is declared dead if its PID is gone OR its heartbeat is older than this.
@@ -38,12 +38,24 @@ const MANAGER_MIN_AGE_SECS: u64 = 3;
 /// (loops forever electing/watching); returns early only when this process cannot or
 /// should not host a manager, in which case the process runs worker-only.
 pub fn run() {
+    run_configured(None);
+}
+
+/// Supervise one physical card, independent of the calling process's logical IDs.
+pub fn run_for_device(physical_device_id: u32) {
+    run_configured(Some(physical_device_id));
+}
+
+fn run_configured(physical_device_id: Option<u32>) {
     block_all_signals();
 
     let my_pid = std::process::id() as i32;
 
     let cfg = match ManagerConfig::from_env() {
-        Ok(c) => c,
+        Ok(c) => match physical_device_id {
+            Some(device) => c.for_device(device),
+            None => c,
+        },
         Err(e) => {
             warn!("[Supervisor] {e}; manager disabled, running worker-only.");
             return;
@@ -65,7 +77,8 @@ pub fn run() {
 
         if let Some(old_pid) = try_become_manager(local, my_pid) {
             info!("[Supervisor PID:{}] won manager election", my_pid);
-            let g = *global.get_or_insert_with(|| setup::open_global_registry(&cfg.global_shm_path));
+            let g =
+                *global.get_or_insert_with(|| setup::open_global_registry(&cfg.global_shm_path));
 
             reclaim_stale_global_slot(g, local, old_pid);
             local.overdraft_pool.close();
@@ -74,12 +87,16 @@ pub fn run() {
 
             match ContainerManager::new(g, local, my_pid, cfg.clone()) {
                 Some(mut mgr) => mgr.run(),
-                None => warn!("[Supervisor PID:{}] global registry full; cannot manage.", my_pid),
+                None => warn!(
+                    "[Supervisor PID:{}] global registry full; cannot manage.",
+                    my_pid
+                ),
             }
 
-            let _ = local
-                .manager_pid
-                .compare_exchange(my_pid, 0, Ordering::AcqRel, Ordering::Relaxed);
+            let _ =
+                local
+                    .manager_pid
+                    .compare_exchange(my_pid, 0, Ordering::AcqRel, Ordering::Relaxed);
         } else {
             watch(local);
         }
@@ -97,7 +114,9 @@ fn try_become_manager(local: &LocalContainerShmem, my_pid: i32) -> Option<i32> {
         .compare_exchange(0, my_pid, Ordering::AcqRel, Ordering::Relaxed)
         .is_ok()
     {
-        local.manager_heartbeat.store(get_time_us(), Ordering::Release);
+        local
+            .manager_heartbeat
+            .store(get_time_us(), Ordering::Release);
         return Some(0);
     }
 
@@ -105,16 +124,21 @@ fn try_become_manager(local: &LocalContainerShmem, my_pid: i32) -> Option<i32> {
     if owner == my_pid {
         return Some(0);
     }
-    if owner != 0 && !manager_alive(local, owner) {
-        if local
+    if owner != 0
+        && !manager_alive(local, owner)
+        && local
             .manager_pid
             .compare_exchange(owner, my_pid, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
-        {
-            local.manager_heartbeat.store(get_time_us(), Ordering::Release);
-            warn!("[Supervisor PID:{}] took over from dead/stale manager {}", my_pid, owner);
-            return Some(owner);
-        }
+    {
+        local
+            .manager_heartbeat
+            .store(get_time_us(), Ordering::Release);
+        warn!(
+            "[Supervisor PID:{}] took over from dead/stale manager {}",
+            my_pid, owner
+        );
+        return Some(owner);
     }
     None
 }
@@ -160,7 +184,10 @@ fn reclaim_stale_global_slot(global: &GlobalRegistry, local: &LocalContainerShme
     let slot = &global.slots[idx as usize];
     if slot.pid.load(Ordering::Acquire) == old_pid {
         slot.is_active.store(0, Ordering::Release);
-        warn!("[Supervisor] cleared stale global slot {} of dead manager {}", idx, old_pid);
+        warn!(
+            "[Supervisor] cleared stale global slot {} of dead manager {}",
+            idx, old_pid
+        );
     }
 }
 
@@ -175,5 +202,8 @@ fn block_all_signals() {
 }
 
 fn get_time_us() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
 }

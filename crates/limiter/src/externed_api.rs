@@ -8,6 +8,8 @@ unsafe extern "C" {
     pub fn rtEventElapsedTime(time_interval: *mut f32, start_event: u64, end_event: u64) -> usize;
     pub fn rtSetDevice(device: i32) -> i32;
     pub fn rtGetDevice(device: *mut i32) -> i32;
+    pub fn rtGetDevicePhyIdByIndex(device: u32, physical: *mut u32) -> i32;
+    pub fn rtCtxGetCurrent(context: *mut u64) -> i32;
     pub fn rtDeviceSynchronize() -> i32;
     pub fn rtStreamGetCaptureInfo(stream: u64, status: *mut u32, model: *mut u64) -> i32;
 }

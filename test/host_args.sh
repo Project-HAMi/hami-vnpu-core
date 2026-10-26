@@ -15,8 +15,11 @@ if test -z "${HAMI_ARTIFACT_DIR:-}"; then
 fi
 artifacts="${HAMI_ARTIFACT_DIR:-${CARGO_TARGET_DIR:-$root/target}/debug}"
 for visibility in global local; do
-    env -u NPU_GLOBAL_SHM_PATH -u NPU_DCMI_HELPER_PROCESS \
+    env -u NPU_MEM_QUOTA -u NPU_PRIORITY -u NPU_FIXED_SHARE_RATIO \
+        -u NPU_OVERDRAFT_ENABLED -u NPU_DCMI_HELPER_PROCESS \
         LD_LIBRARY_PATH="$fixture/lib64:$fixture/lib64/driver${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         LD_PRELOAD="$artifacts/libvnpu.so" NPU_LOCAL_SHM_PATH="$fixture/$visibility.shm" \
+        NPU_GLOBAL_SHM_PATH="$fixture/$visibility.global" NPU_SCHED_POLICY=dynamic \
+        NPU_MEMORY_LIMIT_MB=0 NPU_COMPUTE_LIMIT=100 \
         timeout 15 "$fixture/probe" "$visibility"
 done
