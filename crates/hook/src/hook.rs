@@ -152,6 +152,10 @@ pub extern "C" fn rtMallocPhysical(handle: u64, size: u64, prop: u64, flags: u64
         (prefix[0] == 1)
             .then_some(prefix[1])
             .filter(|id| *id <= i32::MAX as u32)
+            .filter(|id| {
+                let mut physical = 0;
+                unsafe { limiter::externed_api::rtGetDevicePhyIdByIndex(*id, &mut physical) == 0 }
+            })
     } else {
         None
     };

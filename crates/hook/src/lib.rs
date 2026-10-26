@@ -91,7 +91,11 @@ pub fn npu_limiter() -> &'static SchedulerClient {
 /// Physical-memory properties can target a card other than the current card.
 /// Resolve the target without changing the application's current context.
 pub fn npu_limiter_for_device(logical: i32) -> &'static SchedulerClient {
-    spatial::ensure_device(logical);
+    // Physical memory can target a device before it has a compute context.
+    // Apply core budgets when the application selects that context or launches.
+    if spatial::enabled() {
+        spatial::mark_device_use();
+    }
     client_for_physical(physical_device(logical))
 }
 

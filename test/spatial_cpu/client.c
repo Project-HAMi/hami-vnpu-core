@@ -36,6 +36,7 @@ int aclrtResetStreamResLimit(void *);
 uint32_t fake_snapshot(int, int);
 uint32_t fake_stream_snapshot(void *, int);
 unsigned fake_get_calls(void);
+unsigned fake_reference_count(int);
 int fake_initializing(void);
 int fake_destroy_pending(void);
 void fake_continue_destroy(void);
@@ -48,6 +49,16 @@ static void show(int device) {
 }
 static void show_stream(void *stream) {
     printf("stream=%u/%u\n", fake_stream_snapshot(stream, 0), fake_stream_snapshot(stream, 1));
+}
+static int reset_selected(void) {
+    const char *api = getenv("FAKE_RESET_API");
+    if (!api || !strcmp(api, "acl")) return aclrtResetDevice(0);
+    if (!strcmp(api, "acl-force")) return aclrtResetDeviceForce(0);
+    if (!strcmp(api, "runtime")) return rtDeviceReset(0);
+    if (!strcmp(api, "ex")) return rtDeviceResetEx(0);
+    if (!strcmp(api, "without-tsd")) return rtDeviceResetWithoutTsd(0);
+    if (!strcmp(api, "force")) return rtDeviceResetForce(0);
+    abort();
 }
 static void *select_many(void *unused) {
     (void)unused;
@@ -111,6 +122,19 @@ int main(int argc, char **argv) {
         return (int)rtMalloc((uint64_t)(uintptr_t)&ptr, 1, 0, 0);
     }
     if (aclrtSetDevice(-1) != 123 || aclrtSetDevice(0)) return 1;
+    if (!strcmp(mode, "partial-stream-reset") || !strcmp(mode, "final-stream-reset")
+        || !strcmp(mode, "explicit-context-reset")) {
+        void *stream = 0, *context = 0;
+        if (!strcmp(mode, "partial-stream-reset") && aclrtSetDevice(0)) return 2;
+        if (!strcmp(mode, "explicit-context-reset") && aclrtCreateContext(&context, 0)) return 2;
+        if (aclrtCreateStream(&stream)) return 2;
+        int rc = reset_selected();
+        if (getenv("FAKE_FAIL_RESET")) { if (rc != 43) return 3; }
+        else if (rc) return 3;
+        printf("references=%u\n", fake_reference_count(0)); fflush(stdout);
+        if (aclrtSetStreamResLimit(stream, 0, 100) || aclrtSetStreamResLimit(stream, 1, 100)) return 4;
+        show_stream(stream); return 0;
+    }
     if (!strcmp(mode, "raw-switch-stream-set") || !strcmp(mode, "raw-switch-stream-reset")) {
         if (rtSetDevice(1)) return 2;
         if (aclrtSetDevice(0)) return 3;

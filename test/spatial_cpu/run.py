@@ -27,7 +27,11 @@ def main():
         backends = {}
         for variant, flags in [("full", []), ("missing-get", ["-DOMIT_GET"]),
                                ("missing-set", ["-DOMIT_SET"]),
-                               ("missing-stream-get", ["-DOMIT_STREAM_GET"])]:
+                               ("missing-stream-get", ["-DOMIT_STREAM_GET"]),
+                               ("acl-primary-state", ["-DOMIT_RUNTIME_PRIMARY_STATE"]),
+                               ("runtime-primary-state", ["-DOMIT_ACL_PRIMARY_STATE"]),
+                               ("missing-primary-state", ["-DOMIT_RUNTIME_PRIMARY_STATE", "-DOMIT_ACL_PRIMARY_STATE"]),
+                               ("missing-primary-handle", ["-DOMIT_PRIMARY_HANDLE"])]:
             target = work / variant
             target.mkdir()
             subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
@@ -116,6 +120,35 @@ def main():
         case("nonfinal-reset-does-not-rescale", mode="refcount-reset", expected=["7 14"] * 2)
         case("force-reset-does-not-rescale", mode="force-reset", expected=["7 14"])
         case("failed-reset-preserves-cap", mode="failed-reset", settings={"FAKE_FAIL_RESET": "1"}, expected=["7 14"])
+        for api in ["acl", "runtime", "ex", "without-tsd"]:
+            case(api + "-nonfinal-reset-keeps-stream-owner", mode="partial-stream-reset",
+                 settings={"FAKE_RESET_API": api}, expected=["references=1", "stream=7/14"])
+            case(api + "-final-reset-removes-primary-owner", mode="final-stream-reset",
+                 settings={"FAKE_RESET_API": api}, code=78, error="untracked stream")
+            case(api + "-failed-reset-keeps-stream-owner", mode="partial-stream-reset",
+                 settings={"FAKE_RESET_API": api, "FAKE_FAIL_RESET": "1"},
+                 expected=["references=2", "stream=7/14"])
+        for api in ["acl-force", "force"]:
+            case(api + "-reset-removes-primary-with-outstanding-reference", mode="partial-stream-reset",
+                 settings={"FAKE_RESET_API": api}, code=78, error="untracked stream")
+            case(api + "-reset-keeps-explicit-context-owner", mode="explicit-context-reset",
+                 settings={"FAKE_RESET_API": api}, expected=["references=0", "stream=7/14"])
+        for backend in ["acl-primary-state", "runtime-primary-state"]:
+            case(backend + "-nonfinal-reset-keeps-owner", mode="partial-stream-reset", backend=backend,
+                 expected=["references=1", "stream=7/14"])
+            case(backend + "-final-reset-removes-owner", mode="final-stream-reset", backend=backend,
+                 code=78, error="untracked stream")
+        for name, backend, settings in [
+                ("primary-state-missing", "missing-primary-state", {}),
+                ("primary-state-failed", "full", {"FAKE_FAIL_PRIMARY_STATE": "1"}),
+                ("primary-state-invalid", "full", {"FAKE_BAD_PRIMARY_STATE": "1"}),
+                ("primary-handle-missing", "missing-primary-handle", {}),
+                ("primary-handle-failed", "full", {"FAKE_FAIL_PRIMARY_HANDLE": "1"})]:
+            case(name + "-preserves-nonfinal-reset", mode="partial-stream-reset", backend=backend,
+                 settings=settings, expected=["references=1", "stream=7/14"])
+        case("runtime-only-reset-needs-no-acl-query", mode="partial-stream-reset", policy="overdraft",
+             backend="missing-primary-state", settings={"FAKE_RESET_API": "runtime"},
+             expected=["references=1", "stream=100/100"])
         case("stream-override-clamped", mode="stream-set", expected=["stream=7/14"])
         case("stream-reset-reapplied", mode="stream-reset", expected=["stream=7/14"])
         for name, backend, settings in [
@@ -161,8 +194,8 @@ def main():
                  code=78, error="untracked stream")
             case(api + "-destroyed-context-streams-removed", mode="lifecycle-" + api + "-context-destroy",
                  code=78, error="untracked stream")
-            case(api + "-reset-device-streams-removed", mode="lifecycle-" + api + "-reset",
-                 code=78, error="untracked stream")
+            case(api + "-force-reset-keeps-explicit-context-streams", mode="lifecycle-" + api + "-reset",
+                 expected=["stream=7/14"])
             for object_type in ["stream", "context"]:
                 case(api + "-failed-" + object_type + "-destroy-owner-retained",
                      mode="lifecycle-" + api + "-" + object_type + "-failed-destroy",

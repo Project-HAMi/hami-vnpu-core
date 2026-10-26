@@ -122,13 +122,18 @@ pub(crate) fn mark_device_use() {
 }
 
 unsafe fn symbol<T: Copy>(name: &CStr) -> T {
+    unsafe { optional_symbol(name) }
+        .unwrap_or_else(|| fatal(name.to_str().unwrap_or("missing CANN symbol")))
+}
+
+unsafe fn optional_symbol<T: Copy>(name: &CStr) -> Option<T> {
     let address = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
     if address.is_null() {
-        fatal(name.to_str().unwrap_or("missing CANN symbol"));
+        return None;
     }
     // Each call site supplies the exact function-pointer type from acl_rt.h.
     assert_eq!(std::mem::size_of::<T>(), std::mem::size_of_val(&address));
-    unsafe { std::mem::transmute_copy(&address) }
+    Some(unsafe { std::mem::transmute_copy(&address) })
 }
 
 type DeviceGet = unsafe extern "C" fn(i32, i32, *mut u32) -> i32;
@@ -243,18 +248,56 @@ pub(crate) fn runtime_selection(operation: impl FnOnce() -> i32) -> i32 {
     rc
 }
 
-/// Invalidate device-owned handles after a successful outer runtime reset. A
-/// reset may destroy the current context, so do not query it on the return path.
-pub(crate) fn runtime_reset(device: i32, operation: impl FnOnce() -> i32) -> i32 {
-    let nested = internal();
+fn primary_snapshot(device: i32) -> Option<crate::ownership::ContextSnapshot> {
+    type GetPrimary = unsafe extern "C" fn(i32, *mut *mut c_void) -> i32;
+    let get: GetPrimary = unsafe { optional_symbol(c"rtGetPriCtxByDeviceId") }?;
+    let mut context = std::ptr::null_mut();
+    if unsafe { get(device, &mut context) } != 0 || context.is_null() {
+        return None;
+    }
+    Some(crate::ownership::snapshot_context(context))
+}
+
+fn primary_inactive(device: i32) -> bool {
+    type GetState = unsafe extern "C" fn(i32, *mut u32, *mut i32) -> i32;
+    if let Some(get) = unsafe { optional_symbol::<GetState>(c"rtsGetPrimaryCtxState") } {
+        let mut flags = 0;
+        let mut active = -1;
+        if unsafe { get(device, &mut flags, &mut active) } == 0 {
+            return active == 0;
+        }
+    }
+    // Only use an ACL API already loaded by the application. Runtime-only users
+    // must not gain a libascendcl dependency just to release a reference.
+    if let Some(get) = unsafe { optional_symbol::<GetState>(c"aclrtGetPrimaryCtxState") } {
+        let mut active = -1;
+        // acl_rt.h reserves flags and requires nullptr, unlike the runtime API.
+        return unsafe { get(device, std::ptr::null_mut(), &mut active) } == 0 && active == 0;
+    }
+    false
+}
+
+/// A successful reference-counted reset need not destroy its primary context.
+/// Observe native lifetime without consulting the possibly destroyed current
+/// context or clearing unrelated explicitly created contexts on the same card.
+pub(crate) fn runtime_reset(device: i32, force: bool, operation: impl FnOnce() -> i32) -> i32 {
+    if internal() {
+        return operation();
+    }
     if enabled() {
         mark_device_use();
     }
     let guard = InternalGuard::enter();
+    let before = primary_snapshot(device);
     let rc = operation();
+    if rc == 0
+        && let Some(before) = before
+        && (force || primary_inactive(device))
+    {
+        crate::ownership::retire_context_snapshot(before);
+    }
     drop(guard);
-    if rc == 0 && !nested {
-        crate::ownership::forget_device(device);
+    if rc == 0 {
         let policy = policy();
         if policy.percent.is_some()
             && let Some(budget) = devices(policy).get_mut(&device)
@@ -316,31 +359,7 @@ pub fn reset_device(device: i32, force: bool) -> i32 {
             c"aclrtResetDevice"
         })
     };
-    if internal() {
-        return unsafe { real(device) };
-    }
-    if !enabled() {
-        let guard = InternalGuard::enter();
-        let rc = unsafe { real(device) };
-        drop(guard);
-        if rc == 0 {
-            crate::ownership::forget_device(device);
-        }
-        return rc;
-    }
-    let policy = policy();
-    let _internal = InternalGuard::enter();
-    let mut map = devices(policy);
-    let rc = unsafe { real(device) };
-    if rc == 0 {
-        crate::ownership::forget_device(device);
-    }
-    if rc == 0
-        && let Some(budget) = map.get_mut(&device)
-    {
-        budget.applied = false;
-    }
-    rc
+    runtime_reset(device, force, || unsafe { real(device) })
 }
 
 pub fn set_device_resource(device: i32, resource: i32, value: u32) -> i32 {

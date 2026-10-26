@@ -27,6 +27,12 @@ struct ContextRecord {
     generation: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ContextSnapshot {
+    context: usize,
+    record: Option<ContextRecord>,
+}
+
 #[derive(Default)]
 struct Records {
     streams: HashMap<usize, StreamRecord>,
@@ -61,7 +67,18 @@ impl Records {
 }
 
 static RECORDS: crate::process::ProcessLocal<Mutex<Records>> = crate::process::ProcessLocal::new();
+static CONTEXT_LIFECYCLE: crate::process::ProcessLocal<Mutex<()>> =
+    crate::process::ProcessLocal::new();
 thread_local! { static NATIVE_DEPTH: Cell<usize> = const { Cell::new(0) }; }
+
+// Serialize generation publication and timing retirement, without holding the
+// ownership lock while entering a worker or holding either lock across native calls.
+fn context_lifecycle() -> MutexGuard<'static, ()> {
+    CONTEXT_LIFECYCLE
+        .get_or_init(std::process::id(), || Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|_| crate::spatial::fatal("CANN context lifecycle lock is poisoned"))
+}
 
 fn records() -> MutexGuard<'static, Records> {
     RECORDS
@@ -105,27 +122,6 @@ pub(crate) fn owner_for_stream(stream: *mut c_void) -> Option<Owner> {
             .streams
             .get(&(stream as usize))
             .map(|record| record.owner)
-    }
-}
-
-pub(crate) fn forget_device(device: i32) {
-    let contexts: Vec<_> = {
-        let mut records = records();
-        let contexts = records
-            .contexts
-            .iter()
-            .filter_map(|(&context, record)| (record.device == device).then_some(context))
-            .collect();
-        records
-            .streams
-            .retain(|_, record| record.owner.device != device);
-        records.contexts.retain(|_, record| record.device != device);
-        contexts
-    };
-    // Retiring a worker takes its context lock; never hold ownership's lock while
-    // entering the worker because timing-stream creation follows the reverse path.
-    for context in contexts {
-        crate::retire_context(context as u64);
     }
 }
 
@@ -195,6 +191,11 @@ unsafe fn created_context(output: *mut *mut c_void, device: i32) {
         crate::spatial::fatal("successful context creation returned a null handle");
     }
     {
+        let _lifecycle = context_lifecycle();
+        // A successful create begins a new lifetime. Retire the former timing
+        // before publishing its replacement; a late old destroy cannot retire
+        // timing belonging to the new generation.
+        crate::retire_context(context as u64);
         let mut records = records();
         let generation = records.next_generation();
         records
@@ -212,7 +213,19 @@ fn context_record(context: *mut c_void) -> Option<ContextRecord> {
     records().contexts.get(&(context as usize)).copied()
 }
 
+pub(crate) fn snapshot_context(context: *mut c_void) -> ContextSnapshot {
+    ContextSnapshot {
+        context: context as usize,
+        record: context_record(context),
+    }
+}
+
+pub(crate) fn retire_context_snapshot(snapshot: ContextSnapshot) {
+    destroyed_context(snapshot.context as *mut c_void, snapshot.record);
+}
+
 fn destroyed_context(context: *mut c_void, before: Option<ContextRecord>) {
+    let _lifecycle = context_lifecycle();
     let retire = {
         let mut records = records();
         match before {
@@ -390,15 +403,15 @@ unsafe extern "C" fn rtCtxCreate(context: *mut *mut c_void, flags: u32, device: 
 destroy_context!(rtCtxDestroy, c"rtCtxDestroy");
 
 macro_rules! reset_device {
-    ($function:ident, $symbol:literal) => {
+    ($function:ident, $symbol:literal, $force:literal) => {
         #[unsafe(no_mangle)]
         unsafe extern "C" fn $function(device: i32) -> i32 {
             let real: unsafe extern "C" fn(i32) -> i32 = unsafe { symbol($symbol) };
-            crate::spatial::runtime_reset(device, || unsafe { real(device) })
+            crate::spatial::runtime_reset(device, $force, || unsafe { real(device) })
         }
     };
 }
-reset_device!(rtDeviceReset, c"rtDeviceReset");
-reset_device!(rtDeviceResetEx, c"rtDeviceResetEx");
-reset_device!(rtDeviceResetWithoutTsd, c"rtDeviceResetWithoutTsd");
-reset_device!(rtDeviceResetForce, c"rtDeviceResetForce");
+reset_device!(rtDeviceReset, c"rtDeviceReset", false);
+reset_device!(rtDeviceResetEx, c"rtDeviceResetEx", false);
+reset_device!(rtDeviceResetWithoutTsd, c"rtDeviceResetWithoutTsd", false);
+reset_device!(rtDeviceResetForce, c"rtDeviceResetForce", true);

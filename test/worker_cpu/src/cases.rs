@@ -439,3 +439,27 @@ fn physical_allocation_hook_charges_target_card_while_current_card_is_unchanged(
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/memory_hooks.rs"));
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime_memory_extra.rs"));
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime_memory_physical.rs"));
+
+#[test]
+fn physical_allocation_invalid_target_preserves_native_error_without_charging() {
+    let current = client(4, false);
+    current.inner.shmem.memory_limit.store(64, Ordering::Release);
+    current.inner.shmem.procs[0].pid.store(std::process::id() as i32, Ordering::Release);
+    current.inner.shmem.procs[0].is_active.store(1, Ordering::Release);
+    crate::CLIENT.set(current.clone()).unwrap();
+    assert!(crate::NATIVE_OVERRIDE.set(|name, _args| {
+        (name == "rtMallocPhysical").then_some(107001)
+    }).is_ok());
+    #[repr(C)]
+    struct Prop { side: u32, device: u32 }
+    for device in [2, i32::MAX as u32, u32::MAX] {
+        let prop = Prop { side: 1, device };
+        let mut output = 0xfeed_u64;
+        clear_calls();
+        assert_eq!(107001, crate::actual_hook::rtMallocPhysical(
+            &mut output as *mut u64 as u64, 17, &prop as *const Prop as u64, 0));
+        assert_eq!(output, 0xfeed);
+        assert_eq!(0, current.inner.shmem.memory_used.load(Ordering::Acquire));
+        assert_eq!(calls().iter().filter(|c| matches!(c, Call::Native("rtMallocPhysical", _, _))).count(), 1);
+    }
+}

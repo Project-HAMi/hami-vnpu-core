@@ -47,6 +47,7 @@ static void init(void) {
 }
 uint32_t fake_snapshot(int device, int type) { init(); return caps[device][type]; }
 unsigned fake_get_calls(void) { return gets; }
+unsigned fake_reference_count(int device) { init(); return references[device]; }
 int fake_initializing(void) { return atomic_load(&initializing); }
 int fake_destroy_pending(void) { return atomic_load(&destroy_pending); }
 void fake_continue_destroy(void) { atomic_store(&destroy_continue, 1); }
@@ -66,6 +67,32 @@ static int context_device(void *context) {
     return value >= 512 && value < 640 ? context_devices[value - 512] : -1;
 }
 uint32_t fake_stream_snapshot(void *stream, int type) { init(); return streams[stream_device(stream)][type]; }
+
+#ifndef OMIT_PRIMARY_HANDLE
+int rtGetPriCtxByDeviceId(int device, void **context) {
+    init();
+    if (device < 0 || device > 1 || getenv("FAKE_FAIL_PRIMARY_HANDLE")) return 51;
+    *context = references[device] ? (void *)(uintptr_t)(256 + device) : 0;
+    return 0;
+}
+#endif
+#ifndef OMIT_RUNTIME_PRIMARY_STATE
+int rtsGetPrimaryCtxState(int device, uint32_t *flags, int *active) {
+    init();
+    if (!flags || device < 0 || device > 1 || getenv("FAKE_FAIL_PRIMARY_STATE")) return 52;
+    *flags = 0;
+    *active = getenv("FAKE_BAD_PRIMARY_STATE") ? 2 : references[device] != 0;
+    return 0;
+}
+#endif
+#ifndef OMIT_ACL_PRIMARY_STATE
+int aclrtGetPrimaryCtxState(int device, uint32_t *flags, int *active) {
+    init();
+    if (flags || device < 0 || device > 1 || getenv("FAKE_FAIL_PRIMARY_STATE")) return 53;
+    *active = getenv("FAKE_BAD_PRIMARY_STATE") ? 2 : references[device] != 0;
+    return 0;
+}
+#endif
 
 int aclrtSetDevice(int device) {
     if (device < 0 || device > 1) return 123;
@@ -119,7 +146,9 @@ int aclrtGetStreamResLimit(void *stream, int type, uint32_t *value) {
 #endif
 int aclrtSetStreamResLimit(void *stream, int type, uint32_t value) {
     init(); if (getenv("FAKE_FAIL_STREAM_SET")) return 37;
-    if (!getenv("FAKE_IGNORE_STREAM_SET")) streams[stream_device(stream)][type] = value;
+    int device = stream_device(stream);
+    if (device < 0 || device > 1) return 123;
+    if (!getenv("FAKE_IGNORE_STREAM_SET")) streams[device][type] = value;
     return 0;
 }
 int aclrtResetStreamResLimit(void *stream) {
@@ -128,17 +157,25 @@ int aclrtResetStreamResLimit(void *stream) {
     for (int r = 0; r < 2; ++r) streams[device][r] = physical[device][r];
     return 0;
 }
+static void release_primary(int device) {
+    void *primary = (void *)(uintptr_t)(256 + device);
+    for (int r = 0; r < 2; ++r) caps[device][r] = streams[device][r] = physical[device][r];
+    pthread_mutex_lock(&lifecycle_lock);
+    for (unsigned i = 1; i < 128; ++i)
+        if (stream_contexts[i] == primary) stream_devices[i] = -1;
+    pthread_mutex_unlock(&lifecycle_lock);
+    if (current_context == primary) current_context = 0;
+}
 int aclrtResetDevice(int device) {
     init(); if (getenv("FAKE_FAIL_RESET")) return 43;
     if (references[device]) --references[device];
-    if (!references[device])
-        for (int r = 0; r < 2; ++r) caps[device][r] = streams[device][r] = physical[device][r];
+    if (!references[device]) release_primary(device);
     return 0;
 }
 int aclrtResetDeviceForce(int device) {
     init(); if (getenv("FAKE_FAIL_RESET")) return 43;
     references[device] = 0;
-    for (int r = 0; r < 2; ++r) caps[device][r] = streams[device][r] = physical[device][r];
+    release_primary(device);
     return 0;
 }
 
