@@ -7,7 +7,7 @@ fn quota_conversion_preserves_normal_values_and_never_wraps_to_unlimited() {
         let global = Box::leak(Box::new(unsafe { std::mem::zeroed::<GlobalRegistry>() }));
         let local = Box::leak(Box::new(unsafe { std::mem::zeroed::<LocalContainerShmem>() }));
         let config = ManagerConfig {
-            global_shm_path: String::new(), local_shm_path: String::new(),
+            physical_device_id: None, global_shm_path: String::new(), local_shm_path: String::new(),
             compute_limit: 50, memory_limit_mb: mb, sched_policy: SchedPolicy::Dynamic,
             overdraft: OverdraftConfig { limit: 10, timeout_us: 5000, poll_interval_us: 1000 },
         };

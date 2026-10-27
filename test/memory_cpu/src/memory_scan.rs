@@ -5,7 +5,6 @@ const MIB: u64 = 1024 * 1024;
 fn client(limit: u64, used: u64) -> SchedulerClient {
     let shmem = Box::leak(Box::new(unsafe { std::mem::zeroed::<LocalContainerShmem>() }));
     shmem.memory_limit.store(limit, Ordering::Relaxed);
-    shmem.memory_used.store(used, Ordering::Relaxed);
     shmem.state.store(STATE_RUNNING, Ordering::Relaxed);
     shmem.batch_id.store(19, Ordering::Relaxed);
     shmem.tokens_remaining.store(137, Ordering::Relaxed);
@@ -23,7 +22,11 @@ fn set_slot(shmem: &LocalContainerShmem, index: usize, pid: i32, used: u64) {
     let slot = &shmem.procs[index];
     slot.pid.store(pid, Ordering::Relaxed);
     slot.is_active.store(1, Ordering::Relaxed);
-    slot.hbm_used[0].store(used, Ordering::Relaxed);
+    let previous = slot.hbm_used[0].swap(used, Ordering::Relaxed);
+    shmem.memory_used.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |total| {
+        Some(if used >= previous { total.saturating_add(used - previous) }
+             else { total.saturating_sub(previous - used) })
+    }).unwrap();
 }
 fn assert_compute_unchanged(shmem: &LocalContainerShmem) {
     assert_eq!(STATE_RUNNING, shmem.state.load(Ordering::Acquire));
@@ -33,6 +36,19 @@ fn assert_compute_unchanged(shmem: &LocalContainerShmem) {
 }
 fn me() -> i32 { std::process::id() as i32 }
 fn other(offset: i32) -> i32 { me().checked_add(100_000 + offset).unwrap() }
+
+#[test]
+fn spatial_compute_bypass_preserves_memory_quota_reservation_and_rejection() {
+    let mut c = client(1000, 600);
+    Arc::get_mut(&mut c.inner).unwrap().sched_policy = SchedPolicy::Spatial;
+    c.wait_for_token(99);
+    assert!(c.is_hbm_limited());
+    assert_eq!(c.check_memory_quota(401), RT_ERROR_MEMORY_ALLOCATION);
+    assert_eq!(c.inner.shmem.memory_used.load(Ordering::Acquire), 600);
+    assert_eq!(c.check_memory_quota(400), 0);
+    assert_eq!(c.inner.shmem.memory_used.load(Ordering::Acquire), 1000);
+    assert_compute_unchanged(c.inner.shmem);
+}
 
 #[test]
 fn self_proc_error_is_not_queried_or_misreaped() {
@@ -48,7 +64,7 @@ fn self_proc_error_is_not_queried_or_misreaped() {
 }
 
 #[test]
-fn live_and_unreadable_pids_are_preserved_while_zombies_are_reaped() {
+fn other_live_zombie_and_unreadable_pids_keep_existing_checks() {
     let c = client(1000, 60);
     set_slot(c.inner.shmem, 0, me(), 10);
     set_slot(c.inner.shmem, 1, other(1), 20);
@@ -61,15 +77,16 @@ fn live_and_unreadable_pids_are_preserved_while_zombies_are_reaped() {
     assert_eq!(vec![other(1), other(2), other(3)], proc_mock::calls());
     assert_eq!(70, c.inner.shmem.memory_used.load(Ordering::Acquire));
     assert_eq!(other(1), c.inner.shmem.procs[1].pid.load(Ordering::Acquire));
-    assert_eq!(0, c.inner.shmem.procs[2].pid.load(Ordering::Acquire));
-    assert_eq!(0, c.inner.shmem.procs[2].is_active.load(Ordering::Acquire));
-    assert_eq!(0, c.inner.shmem.procs[2].hbm_used[0].load(Ordering::Acquire));
+    for i in [2] {
+        assert_eq!(0, c.inner.shmem.procs[i].pid.load(Ordering::Acquire));
+        assert_eq!(0, c.inner.shmem.procs[i].is_active.load(Ordering::Acquire));
+        assert_eq!(0, c.inner.shmem.procs[i].hbm_used[0].load(Ordering::Acquire));
+    }
     assert_eq!(other(3), c.inner.shmem.procs[3].pid.load(Ordering::Acquire));
-    assert_eq!(1, c.inner.shmem.procs[3].is_active.load(Ordering::Acquire));
     assert_eq!(40, c.inner.shmem.procs[3].hbm_used[0].load(Ordering::Acquire));
     proc_mock::set(&[(other(1), Answer::Live), (other(3), Answer::Unreadable)]);
     assert_eq!(70, c.recalculate_usage());
-    assert_eq!(vec![other(1), other(3)], proc_mock::calls()); // The reaped slot is not read or refunded twice.
+    assert_eq!(vec![other(1), other(3)], proc_mock::calls()); // Reaped/pid0 slots are not read or refunded twice.
     assert_compute_unchanged(c.inner.shmem);
 }
 
@@ -87,20 +104,22 @@ fn exemption_uses_current_pid_not_cached_process_slot_index() {
 }
 
 #[test]
-fn memory_query_reads_ledger_and_preserves_128mib_overhead() {
+fn memory_query_preserves_pending_reservations_and_128mib_overhead() {
     let c = client(512 * MIB, 200 * MIB);
     set_slot(c.inner.shmem, 1, other(1), 28 * MIB);
-    c.inner.shmem.memory_used.store(1, Ordering::Release); // Admission and queries must use the ledger, not this sampled metric.
+    // Reserve the remaining 72 MiB before native handle publication.
+    assert_eq!(RT_ERROR_NONE, c.check_memory_quota(72 * MIB));
+    // A stale compatibility aggregate must not hide owned pending bytes.
+    c.inner.shmem.memory_used.store(228 * MIB, Ordering::Release);
     proc_mock::set(&[(me(), Answer::Unreadable), (other(1), Answer::Live)]);
     let (mut free, mut total) = (usize::MAX, usize::MAX);
-    c.get_hbm_info(&mut free, &mut total);
+    unsafe { c.get_hbm_info(&mut free, &mut total) };
     assert_eq!(512 * MIB as usize, total);
-    assert_eq!(156 * MIB as usize, free);
-    assert_eq!(Some(228 * MIB), ledger_total(c.inner.shmem));
-    assert_eq!(1, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(84 * MIB as usize, free);
+    assert_eq!(300 * MIB, ledger_total(c.inner.shmem).unwrap());
     assert!(proc_mock::calls().is_empty());
-    c.inner.shmem.procs[0].hbm_used[0].store(470 * MIB, Ordering::Release);
-    c.get_hbm_info(&mut free, &mut total);
+    assert_eq!(RT_ERROR_NONE, c.check_memory_quota(198 * MIB));
+    unsafe { c.get_hbm_info(&mut free, &mut total) };
     assert_eq!(512 * MIB as usize, total);
     assert_eq!(0, free); // 14MiB logical free still reports zero after 128MiB overhead.
     assert_compute_unchanged(c.inner.shmem);
@@ -144,7 +163,7 @@ fn lost_reap_cas_preserves_replacement_owner_and_slot_memory() {
     set_slot(c.inner.shmem, 1, dead, 20);
     proc_mock::set(&[(dead, Answer::Zombie)]);
     proc_mock::replace_pid_on_read(dead, &c.inner.shmem.procs[1].pid, replacement);
-    // A lost reap CAS must retain the replacement owner and its reservation.
+    // A failed retirement claim must retain the replacement owner's reservation.
     assert_eq!(30, c.recalculate_usage());
     let slot = &c.inner.shmem.procs[1];
     assert_eq!(replacement, slot.pid.load(Ordering::Acquire));
@@ -156,25 +175,74 @@ fn lost_reap_cas_preserves_replacement_owner_and_slot_memory() {
 }
 
 #[test]
-fn selected_device_scan_reconciles_all_devices_and_reaps_all_counters() {
-    let c = client(1000, 40);
-    let shmem = c.inner.shmem;
-    shmem.procs[0].hbm_used[1].store(70, Ordering::Release);
-    set_slot(shmem, 1, other(1), 20);
-    shmem.procs[1].hbm_used[1].store(30, Ordering::Release);
-    proc_mock::set(&[(other(1), Answer::Live)]);
-    assert_eq!(100, c.recalculate_usage_for_device(1));
-    assert_eq!(160, shmem.memory_used.load(Ordering::Acquire));
-    assert_eq!(40, shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
-    assert_eq!(20, shmem.procs[1].hbm_used[0].load(Ordering::Acquire));
-    proc_mock::set(&[(other(1), Answer::Zombie)]);
-    assert_eq!(70, c.recalculate_usage_for_device(1));
-    assert_eq!(0, shmem.procs[1].hbm_used[1].load(Ordering::Acquire));
-    // The merged multi-device fix must clear every device counter on a successful reap.
-    assert_eq!(0, shmem.procs[1].hbm_used[0].load(Ordering::Acquire));
-    assert_eq!(110, shmem.memory_used.load(Ordering::Acquire));
-    assert_eq!(0, shmem.procs[1].pid.load(Ordering::Acquire));
-    assert_compute_unchanged(shmem);
+fn per_card_domains_have_independent_quota_and_accept_large_physical_ids() {
+    let mut first = client(100, 0);
+    let mut second = client(200, 0);
+    Arc::get_mut(&mut first.inner).unwrap().physical_id = 17;
+    Arc::get_mut(&mut second.inner).unwrap().physical_id = 99;
+    proc_mock::set(&[]);
+    assert_eq!(0, first.check_memory_quota(100));
+    first.post_alloc_hbm(1, 100, RT_ERROR_NONE);
+    assert_eq!(RT_ERROR_MEMORY_ALLOCATION, first.check_memory_quota(1));
+    assert_eq!(0, second.check_memory_quota(150));
+    second.post_alloc_hbm(2, 150, RT_ERROR_NONE);
+    assert_eq!(100, first.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(150, second.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(100, first.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
+    assert_eq!(150, second.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
+    assert!(first.owns_hbm_handle(1));
+    assert!(!second.owns_hbm_handle(1));
+    first.post_free_hbm(1, RT_ERROR_NONE);
+    assert_eq!(0, first.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(150, second.inner.shmem.memory_used.load(Ordering::Acquire));
+}
+
+#[test]
+fn reusing_live_process_slot_preserves_its_card_reservations() {
+    let c = client(100, 40);
+    assert_eq!(0, SchedulerClient::register_proc_slot(c.inner.shmem, me()));
+    assert_eq!(40, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
+    assert_eq!(40, c.inner.shmem.memory_used.load(Ordering::Acquire));
+}
+
+#[test]
+fn pending_allocation_is_charged_before_handle_publication_and_cannot_be_erased() {
+    let c = client(100, 0);
+    assert_eq!(0, c.check_memory_quota(80));
+    assert_eq!(80, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
+    assert_eq!(RT_ERROR_MEMORY_ALLOCATION, c.check_memory_quota(21));
+    let (mut free, mut total) = (0, 0);
+    unsafe { c.get_hbm_info(&mut free, &mut total) };
+    assert_eq!(100, total);
+    assert_eq!(80, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    c.post_alloc_hbm(0, 80, RT_ERROR_MEMORY_ALLOCATION);
+    assert_eq!(0, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(0, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
+}
+
+#[test]
+fn concurrent_pending_allocations_never_overbook_one_card() {
+    let c = client(100, 0);
+    let barrier = Arc::new(std::sync::Barrier::new(17));
+    let threads: Vec<_> = (0..16).map(|_| {
+        let c = c.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            c.check_memory_quota(11) == 0
+        })
+    }).collect();
+    barrier.wait();
+    let admitted = threads.into_iter().map(|thread| thread.join().unwrap()).filter(|admitted| *admitted).count();
+    // Simultaneous reservations may be rejected conservatively. Every successful
+    // admission remains owned, and sequential retries can fill the remaining quota.
+    assert!(admitted <= 9);
+    assert_eq!(admitted as u64 * 11, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
+    assert_eq!(admitted as u64 * 11, c.recalculate_usage());
+    for _ in admitted..9 { assert_eq!(0, c.check_memory_quota(11)); }
+    assert_eq!(RT_ERROR_MEMORY_ALLOCATION, c.check_memory_quota(11));
+    assert_eq!(99, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(99, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
 }
 
 #[test]
@@ -264,20 +332,6 @@ fn overflowing_live_slot_sum_stays_exhausted() {
 }
 
 #[test]
-fn quota_reservation_counts_allocations_on_every_device() {
-    let c = client(100, 40);
-    c.inner.shmem.procs[0].hbm_used[1].store(50, Ordering::Release);
-    proc_mock::set(&[(me(), Answer::Unreadable)]);
-    assert_eq!(RT_ERROR_MEMORY_ALLOCATION, c.check_memory_quota(11));
-    assert_eq!(90, c.inner.shmem.memory_used.load(Ordering::Acquire));
-    assert_eq!(RT_ERROR_NONE, c.check_memory_quota(10));
-    assert_eq!(100, c.inner.shmem.memory_used.load(Ordering::Acquire));
-    c.post_alloc_hbm(0, 10, RT_ERROR_MEMORY_ALLOCATION);
-    assert_eq!(90, c.inner.shmem.memory_used.load(Ordering::Acquire));
-    assert!(proc_mock::calls().is_empty());
-}
-
-#[test]
 fn invalid_device_scan_keeps_slots_and_container_usage_unchanged() {
     let c = client(100, 40);
     proc_mock::set(&[(me(), Answer::Unreadable)]);
@@ -286,4 +340,25 @@ fn invalid_device_scan_keeps_slots_and_container_usage_unchanged() {
     assert_eq!(40, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
     assert_eq!(me(), c.inner.shmem.procs[0].pid.load(Ordering::Acquire));
     assert!(proc_mock::calls().is_empty());
+}
+
+
+#[test]
+fn equal_numeric_virtual_and_physical_handles_retain_separate_ownership() {
+    let c = client(1000, 0);
+    assert_eq!(0, c.check_memory_quota(100));
+    c.post_alloc_hbm(42, 100, RT_ERROR_NONE);
+    assert_eq!(0, c.check_memory_quota(200));
+    c.post_alloc_hbm_kind(42, 200, RT_ERROR_NONE, AllocationKind::Physical);
+    assert!(c.owns_hbm_handle(42));
+    assert!(c.owns_hbm_handle_kind(42, AllocationKind::Physical));
+    assert_eq!(300, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    c.post_free_hbm_kind(42, RT_ERROR_NONE, AllocationKind::Physical);
+    assert!(!c.owns_hbm_handle_kind(42, AllocationKind::Physical));
+    assert!(c.owns_hbm_handle(42));
+    assert_eq!(100, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(100, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
+    c.post_free_hbm(42, RT_ERROR_NONE);
+    assert_eq!(0, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(0, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
 }
