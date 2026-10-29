@@ -47,6 +47,31 @@ fn reap_dead_slots(local: &LocalContainerShmem) {
     }
 }
 
+// A targeted helper emits device zero for the selected physical card. Hardware
+// samples are diagnostic: never overwrite a live or in-flight hook reservation.
+fn observe_snapshot(
+    local: &LocalContainerShmem,
+    physical: Option<u32>,
+    records: &[crate::dcmi_protocol::Record],
+) -> usize {
+    let mut matched = 0;
+    for record in records {
+        for slot in &local.procs {
+            if slot.pid.load(Ordering::Acquire) == record.pid {
+                debug!(
+                    "[DCMI physical:{physical:?} device:{} PID:{}] hardware={} hook={} bytes",
+                    record.device,
+                    record.pid,
+                    record.bytes,
+                    slot.hbm_used[record.device].load(Ordering::Acquire)
+                );
+                matched += 1;
+            }
+        }
+    }
+    matched
+}
+
 use crate::config::{ManagerConfig, SchedPolicy};
 use crate::shmem::{
     GlobalRegistry, LocalContainerShmem, MAX_MANAGERS, MAX_WORKERS, NPU_DEVICE_MAX, STATE_IDLE,
@@ -86,7 +111,8 @@ pub struct ContainerManager {
     global: &'static GlobalRegistry,
     local: &'static LocalContainerShmem,
     my_pid: i32,
-    my_global_idx: usize,
+    my_global_idx: Option<usize>,
+    physical_device_id: Option<u32>,
     current_avg_us: u64,
     compute_limit: f64,
     token_scale: f64,
@@ -108,7 +134,11 @@ impl ContainerManager {
         generation: u32,
     ) -> Option<Self> {
         // Caller holds the registry transaction across election and publication.
-        let idx = Self::register_global_slot(global, pid, generation)?;
+        let idx = if config.sched_policy.is_time_sliced() {
+            Some(Self::register_global_slot(global, pid, generation)?)
+        } else {
+            None
+        };
 
         // TODO: Refactor
         let token_scale = std::env::var("NPU_TOKEN_SCALE")
@@ -144,7 +174,7 @@ impl ContainerManager {
             .store(config.overdraft.poll_interval_us, Ordering::Relaxed);
 
         info!(
-            "[Manager] Registered as Global Manager #{} (PID: {}). Compute limit: {}, Memory limit: {}, Policy: {}",
+            "[Manager] Global compute slot: {:?} (PID: {}). Compute limit: {}%, Memory limit: {} MB, Policy: {}",
             idx,
             pid,
             compute_limit,
@@ -153,9 +183,16 @@ impl ContainerManager {
         );
 
         // Write our priority to the global slot so other pods can calculate compute share
-        global.slots[idx]
-            .compute_limit
-            .store(compute_limit as u64, Ordering::Release);
+        if let Some(idx) = idx {
+            global.slots[idx]
+                .compute_limit
+                .store(compute_limit as u64, Ordering::Release);
+        } else {
+            local.tokens_remaining.store(0, Ordering::Relaxed);
+            local.active_workers.store(0, Ordering::Relaxed);
+            local.reported_count.store(0, Ordering::Relaxed);
+            local.state.store(STATE_IDLE, Ordering::Release);
+        }
 
         let memory_limit_bytes = memory_limit.saturating_mul(MB_TO_BYTES);
 
@@ -170,7 +207,7 @@ impl ContainerManager {
             .store(compute_limit as u64, Ordering::Relaxed);
         local
             .manager_global_idx
-            .store(idx as i32, Ordering::Release);
+            .store(idx.map_or(-1, |idx| idx as i32), Ordering::Release);
         local.initialized.store(1, Ordering::Release);
 
         Some(Self {
@@ -178,6 +215,7 @@ impl ContainerManager {
             local,
             my_pid: pid,
             my_global_idx: idx,
+            physical_device_id: config.physical_device_id,
             current_avg_us: DEFAULT_AVG_US,
             compute_limit,
             token_scale,
@@ -220,9 +258,13 @@ impl ContainerManager {
     }
 
     fn is_current(&self) -> bool {
-        let slot = &self.global.slots[self.my_global_idx];
+        let Some(index) = self.my_global_idx else {
+            return self.owns_local_lease()
+                && self.local.manager_global_idx.load(Ordering::Acquire) == -1;
+        };
+        let slot = &self.global.slots[index];
         self.owns_local_lease()
-            && self.local.manager_global_idx.load(Ordering::Acquire) == self.my_global_idx as i32
+            && self.local.manager_global_idx.load(Ordering::Acquire) == index as i32
             && slot.is_active.load(Ordering::Acquire) != 0
             && slot.pid.load(Ordering::Acquire) == self.my_pid
             && slot.generation.load(Ordering::Acquire) == self.generation
@@ -234,13 +276,20 @@ impl ContainerManager {
     }
 
     fn has_turn(&self) -> bool {
-        self.global.lock_owner.load(Ordering::Acquire) == self.my_global_idx as u32
+        self.my_global_idx
+            .is_some_and(|index| self.global.lock_owner.load(Ordering::Acquire) == index as u32)
     }
 
     pub fn run(&mut self) {
         // Background collectors are stopped when this lease is replaced. Their
         // results must be revalidated under the same registry transaction.
         self.start_collectors();
+        if !self.sched_policy.is_time_sliced() {
+            while self.update_heartbeat() {
+                thread::sleep(Duration::from_millis(200));
+            }
+            return;
+        }
         while self.honor_fixed_rest_wait() && self.wait_for_global_turn() {
             let plan = self.calculate_fair_share();
             let (duration, tokens) = self.run_local_round(&plan);
@@ -278,6 +327,7 @@ impl ContainerManager {
         let local = self.local;
         let stopped = self.stopped.clone();
         let registry = self.registry.clone();
+        let physical_device_id = self.physical_device_id;
         let Some(helper) = crate::dcmi::helper_path().filter(|path| path.is_file()) else {
             warn!(
                 "[Manager] vnpu-dcmi helper unavailable; hardware refresh disabled, hook accounting remains active"
@@ -291,10 +341,11 @@ impl ContainerManager {
                 if stopped.load(Ordering::Acquire) {
                     break;
                 }
-                let snapshot = match collector.snapshot(
+                let snapshot = match collector.snapshot_for_device(
                     &helper,
                     Duration::from_secs(DCMI_QUERY_TIMEOUT_SECS),
                     &stopped,
+                    physical_device_id,
                 ) {
                     Ok(snapshot) => {
                         debug!(
@@ -317,18 +368,15 @@ impl ContainerManager {
                 {
                     break;
                 }
-                for record in snapshot {
-                    for slot in &local.procs {
-                        if slot.pid.load(Ordering::Acquire) == record.pid {
-                            slot.hbm_used[record.device].store(record.bytes, Ordering::Release);
-                        }
-                    }
-                }
+                observe_snapshot(local, physical_device_id, &snapshot);
             }
         });
     }
 
     fn wait_for_global_turn(&self) -> bool {
+        let Some(my_idx) = self.my_global_idx else {
+            return false;
+        };
         loop {
             let signal = {
                 let Some(_guard) = self.transaction() else {
@@ -352,7 +400,7 @@ impl ContainerManager {
                     }
                     self.global
                         .lock_owner
-                        .store(self.my_global_idx as u32, Ordering::Release);
+                        .store(my_idx as u32, Ordering::Release);
                     self.heartbeat_locked();
                     return true;
                 }
@@ -363,6 +411,9 @@ impl ContainerManager {
     }
 
     fn pass_baton(&self) -> bool {
+        let Some(my_idx) = self.my_global_idx else {
+            return false;
+        };
         let Some(_guard) = self.transaction() else {
             return false;
         };
@@ -372,7 +423,7 @@ impl ContainerManager {
         // A fixed-share rest never holds the global turn. State 2 means a live,
         // resting manager; waiting heartbeats keep that slot from being reclaimed.
         if self.next_run_not_before.is_some() {
-            self.global.slots[self.my_global_idx]
+            self.global.slots[my_idx]
                 .is_active
                 .store(2, Ordering::Release);
         }
@@ -381,7 +432,7 @@ impl ContainerManager {
         // Slots already form a bounded set: round-robin scanning needs no queue
         // entries that can be duplicated or left behind after manager takeover.
         for offset in 1..=MAX_MANAGERS {
-            let index = (self.my_global_idx + offset) % MAX_MANAGERS;
+            let index = (my_idx + offset) % MAX_MANAGERS;
             let slot = &self.global.slots[index];
             if slot.is_active.load(Ordering::Acquire) == 0 {
                 continue;
@@ -583,10 +634,10 @@ impl ContainerManager {
             return (0, 0);
         }
         self.local.state.store(STATE_IDLE, Ordering::Release);
-        if self.sched_policy == SchedPolicy::Overdraft {
-            if let Some(round) = overdraft_round {
-                self.local.overdraft_pool.open_idle(round);
-            }
+        if self.sched_policy == SchedPolicy::Overdraft
+            && let Some(round) = overdraft_round
+        {
+            self.local.overdraft_pool.open_idle(round);
         }
         futex::wake_all(&self.local.state);
         // Event endpoints are recorded by a later hook. A delayed report can
@@ -617,6 +668,9 @@ impl ContainerManager {
     }
 
     fn honor_fixed_rest_wait(&mut self) -> bool {
+        let Some(my_idx) = self.my_global_idx else {
+            return false;
+        };
         if let Some(deadline) = self.next_run_not_before.take() {
             while Instant::now() < deadline {
                 if !self.update_heartbeat() {
@@ -631,7 +685,7 @@ impl ContainerManager {
             let Some(_guard) = self.transaction() else {
                 return false;
             };
-            self.global.slots[self.my_global_idx]
+            self.global.slots[my_idx]
                 .is_active
                 .store(1, Ordering::Release);
             self.global.signal_counter.fetch_add(1, Ordering::Release);
@@ -668,11 +722,7 @@ impl ContainerManager {
         if participants == 0 {
             return (0, 0);
         }
-        let total_duration = if global_end > global_start {
-            global_end - global_start
-        } else {
-            0
-        };
+        let total_duration = global_end.saturating_sub(global_start);
         // Use the actual tokens consumed (post-scale) so averages are per real token.
         let tokens_used = tokens_for_stats;
 
@@ -689,6 +739,9 @@ impl ContainerManager {
     }
 
     fn update_local_stats(&mut self, duration_us: u64, tokens: u64) {
+        let Some(my_idx) = self.my_global_idx else {
+            return;
+        };
         if tokens == 0
             || duration_us == 0
             || duration_us > MAX_RUN_US + LOCAL_REPORT_GRACE_MS * 1000
@@ -711,10 +764,10 @@ impl ContainerManager {
         self.current_avg_us =
             ((self.current_avg_us as f64 * (1.0 - alpha)) + (clamped_avg as f64 * alpha)) as u64;
 
-        self.global.slots[self.my_global_idx]
+        self.global.slots[my_idx]
             .avg_kernel_time
             .store(self.current_avg_us, Ordering::Relaxed);
-        self.global.slots[self.my_global_idx]
+        self.global.slots[my_idx]
             .last_heartbeat
             .store(get_time_us(), Ordering::Relaxed);
     }
@@ -743,9 +796,11 @@ impl ContainerManager {
     // stay locally alive without extending the current global owner's lifetime.
     fn heartbeat_locked(&self) {
         let now = get_time_us();
-        self.global.slots[self.my_global_idx]
-            .last_heartbeat
-            .store(now, Ordering::Release);
+        if let Some(my_idx) = self.my_global_idx {
+            self.global.slots[my_idx]
+                .last_heartbeat
+                .store(now, Ordering::Release);
+        }
         self.local.manager_heartbeat.store(now, Ordering::Release);
         if self.has_turn() {
             self.global.lock_timestamp.store(now, Ordering::Release);
@@ -760,8 +815,10 @@ impl Drop for ContainerManager {
         let Ok(_guard) = registry.lock() else {
             return;
         };
-        if self.is_current() {
-            self.global.slots[self.my_global_idx]
+        if self.is_current()
+            && let Some(my_idx) = self.my_global_idx
+        {
+            self.global.slots[my_idx]
                 .is_active
                 .store(0, Ordering::Release);
             if self.has_turn() {
@@ -778,8 +835,10 @@ impl Drop for ContainerManager {
             self.local.state.store(STATE_IDLE, Ordering::Release);
             futex::wake_all(&self.local.state);
         }
-        self.global.signal_counter.fetch_add(1, Ordering::Release);
-        futex::wake_all(&self.global.signal_counter);
+        if self.my_global_idx.is_some() {
+            self.global.signal_counter.fetch_add(1, Ordering::Release);
+            futex::wake_all(&self.global.signal_counter);
+        }
     }
 }
 

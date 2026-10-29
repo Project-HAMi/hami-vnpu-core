@@ -38,8 +38,13 @@ def actor(index):
 
 
 def local_sample(path):
+    matches = list(path.parent.glob(path.name + ".device-*"))
+    if len(matches) > 1:
+        raise RuntimeError("single-device actor created multiple physical domains")
+    if not matches:
+        return None
     try:
-        data = path.read_bytes()
+        data = matches[0].read_bytes()
     except FileNotFoundError:
         return None
     if len(data) < 6256:

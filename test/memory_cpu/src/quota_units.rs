@@ -13,16 +13,9 @@ fn quota_conversion_preserves_normal_values_and_never_wraps_to_unlimited() {
             std::mem::zeroed::<LocalContainerShmem>()
         }));
         let config = ManagerConfig {
-            global_shm_path: String::new(),
-            local_shm_path: String::new(),
-            compute_limit: 50,
-            sched_policy: SchedPolicy::Dynamic,
-            overdraft: OverdraftConfig {
-                limit: 10,
-                timeout_us: 5000,
-                poll_interval_us: 1000,
-            },
-            memory_limit_mb: mb,
+            physical_device_id: None, global_shm_path: String::new(), local_shm_path: String::new(),
+            compute_limit: 50, memory_limit_mb: mb, sched_policy: SchedPolicy::Dynamic,
+            overdraft: OverdraftConfig { limit: 10, timeout_us: 5000, poll_interval_us: 1000 },
         };
         let path =
             std::env::temp_dir().join(format!("vnpu-quota-test-{}-{mb}", std::process::id()));

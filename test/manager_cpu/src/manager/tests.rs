@@ -36,7 +36,8 @@ fn manager(priority: f64, fixed: bool, average: u64) -> ContainerManager {
         global,
         local,
         my_pid: std::process::id() as i32,
-        my_global_idx: 0,
+        my_global_idx: Some(0),
+        physical_device_id: None,
         current_avg_us: average,
         compute_limit: priority,
         token_scale: 100.0,
@@ -412,4 +413,202 @@ fn manager_observation_gap_before_measuring_cannot_train_idle_time() {
         report(&m, 0, batch, get_time_us() - 40_000, 40_000);
         assert_eq!(run.join().unwrap(), (0, 0));
     });
+}
+
+fn new_leased_manager(global: &'static GlobalRegistry, local: &'static LocalContainerShmem,
+    pid: i32, config: ManagerConfig) -> Option<ContainerManager> {
+    let path = std::env::temp_dir().join(format!("vnpu-lease-fixture-{}-{:p}", std::process::id(), local));
+    std::fs::File::create(&path).unwrap();
+    let registry = Arc::new(RegistryLock::open(path.to_str().unwrap()).unwrap());
+    std::fs::remove_file(path).unwrap();
+    local.manager_pid.store(pid, Ordering::Release);
+    local.manager_generation.store(1, Ordering::Release);
+    let guard = registry.lock().unwrap();
+    let result = ContainerManager::new(global, local, pid, config, registry.clone(), 1);
+    drop(guard);
+    result
+}
+fn global_snapshot(global: &GlobalRegistry) -> Vec<u64> {
+    let mut values = vec![global.lock_owner.load(Ordering::Acquire) as u64,
+        global.lock_timestamp.load(Ordering::Acquire),
+        global.queue_head.load(Ordering::Acquire) as u64,
+        global.queue_tail.load(Ordering::Acquire) as u64,
+        global.signal_counter.load(Ordering::Acquire) as u64];
+    values.extend(global.queue.iter().map(|value| value.load(Ordering::Acquire) as u64));
+    for slot in &global.slots {
+        values.extend([slot.pid.load(Ordering::Acquire) as u64,
+            slot.avg_kernel_time.load(Ordering::Acquire), slot.last_heartbeat.load(Ordering::Acquire),
+            slot.is_active.load(Ordering::Acquire) as u64, slot.compute_limit.load(Ordering::Acquire)]);
+    }
+    values
+}
+
+#[test]
+fn spatial_memory_manager_does_not_register_or_change_another_pods_compute_turn() {
+    let global = Box::leak(Box::new(unsafe { std::mem::zeroed::<GlobalRegistry>() }));
+    let local = Box::leak(Box::new(unsafe { std::mem::zeroed::<LocalContainerShmem>() }));
+    // Even a full compute registry must not prevent spatial memory management.
+    for (index, slot) in global.slots.iter().enumerate() {
+        slot.is_active.store(1, Ordering::Relaxed);
+        slot.pid.store(index as i32 + 100, Ordering::Relaxed);
+        slot.avg_kernel_time.store(1000 + index as u64, Ordering::Relaxed);
+    }
+    global.lock_owner.store(5, Ordering::Relaxed);
+    global.lock_timestamp.store(123, Ordering::Relaxed);
+    global.queue_head.store(7, Ordering::Relaxed);
+    global.queue_tail.store(12, Ordering::Relaxed);
+    global.signal_counter.store(14, Ordering::Relaxed);
+    let before = global_snapshot(global);
+    local.initialized.store(1, Ordering::Relaxed);
+    local.memory_used.store(4096, Ordering::Relaxed);
+    local.manager_pid.store(std::process::id() as i32, Ordering::Relaxed);
+    let round = local.overdraft_pool.begin_round().unwrap();
+    assert!(local.overdraft_pool.open_idle(round));
+    let config = ManagerConfig { global_shm_path: String::new(), local_shm_path: String::new(),
+        compute_limit: 33, memory_limit_mb: 20480, sched_policy: SchedPolicy::Spatial,
+        physical_device_id: None,
+        overdraft: crate::config::OverdraftConfig { limit: 10, timeout_us: 5000, poll_interval_us: 1000 } };
+    let mut m = new_leased_manager(global, local, std::process::id() as i32, config).unwrap();
+    assert_eq!(m.my_global_idx, None);
+    assert_eq!(local.manager_global_idx.load(Ordering::Acquire), -1);
+    assert_eq!(local.memory_limit.load(Ordering::Acquire), 20480 * MB_TO_BYTES);
+    assert_eq!(local.memory_used.load(Ordering::Acquire), 4096);
+    assert_eq!(local.initialized.load(Ordering::Acquire), 1);
+    assert_eq!(local.overdraft_limit.load(Ordering::Acquire), 0);
+    assert!(!local.overdraft_pool.try_acquire(local.overdraft_pool.snapshot(), 10, true));
+    m.wait_for_global_turn();
+    m.pass_baton();
+    m.update_local_stats(1000, 1);
+    m.update_heartbeat();
+    assert!(local.manager_heartbeat.load(Ordering::Acquire) > 0);
+    assert_eq!(global_snapshot(global), before);
+    drop(m);
+    assert_eq!(global_snapshot(global), before, "memory-only Drop must not signal or clear compute slots");
+}
+
+#[test]
+fn spatial_and_dynamic_can_share_a_registry_without_spatial_joining_rotation() {
+    let global = Box::leak(Box::new(unsafe { std::mem::zeroed::<GlobalRegistry>() }));
+    let dynamic_local = Box::leak(Box::new(unsafe { std::mem::zeroed::<LocalContainerShmem>() }));
+    let spatial_local = Box::leak(Box::new(unsafe { std::mem::zeroed::<LocalContainerShmem>() }));
+    let config = ManagerConfig { global_shm_path: String::new(), local_shm_path: String::new(),
+        compute_limit: 33, memory_limit_mb: 20480, sched_policy: SchedPolicy::Dynamic,
+        physical_device_id: None,
+        overdraft: crate::config::OverdraftConfig { limit: 10, timeout_us: 5000, poll_interval_us: 1000 } };
+    let dynamic = new_leased_manager(global, dynamic_local, 1001, config.clone()).unwrap();
+    let spatial = new_leased_manager(global, spatial_local, 1002,
+        ManagerConfig { sched_policy: SchedPolicy::Spatial, ..config }).unwrap();
+    assert_eq!(dynamic.my_global_idx, Some(0));
+    assert_eq!(spatial.my_global_idx, None);
+    assert_eq!(global.slots.iter().filter(|slot| slot.is_active.load(Ordering::Acquire) == 1).count(), 1);
+    spatial.wait_for_global_turn();
+    spatial.pass_baton();
+    assert_eq!(global.queue_tail.load(Ordering::Acquire), 0);
+    dynamic.wait_for_global_turn();
+    dynamic.pass_baton();
+    assert_eq!(global.lock_owner.load(Ordering::Acquire), 0);
+    assert_eq!(global.queue_tail.load(Ordering::Acquire), 0);
+    let before = global_snapshot(global);
+    spatial.update_heartbeat();
+    drop(spatial);
+    assert_eq!(global_snapshot(global), before);
+    assert_eq!(global.slots[0].pid.load(Ordering::Acquire), 1001);
+    assert_eq!(global.slots[0].is_active.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn physical_card_domains_keep_registry_quota_and_allowance_independent() {
+    let directory = std::env::temp_dir().join(format!(
+        "vnpu-card-domains-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let base = ManagerConfig {
+        global_shm_path: directory.join("global").to_str().unwrap().to_owned(),
+        local_shm_path: directory.join("local").to_str().unwrap().to_owned(),
+        physical_device_id: None,
+        compute_limit: 30,
+        memory_limit_mb: 1024,
+        sched_policy: SchedPolicy::Overdraft,
+        overdraft: crate::config::OverdraftConfig {
+            limit: 10, timeout_us: 5000, poll_interval_us: 1000,
+        },
+    };
+    let a = base.for_device(7);
+    let b = base.for_device(3);
+    let global_a = crate::shmem::setup::open_global_registry(&a.global_shm_path);
+    let global_b = crate::shmem::setup::open_global_registry(&b.global_shm_path);
+    let local_a = crate::shmem::setup::create_shmem::<LocalContainerShmem>(&a.local_shm_path);
+    let local_b = crate::shmem::setup::create_shmem::<LocalContainerShmem>(&b.local_shm_path);
+    let pid = std::process::id() as i32;
+    let manager_a = new_leased_manager(global_a, local_a, pid, a.clone()).unwrap();
+    let manager_b = new_leased_manager(global_b, local_b, pid, b).unwrap();
+    assert_eq!(manager_a.my_global_idx, Some(0));
+    assert_eq!(manager_b.my_global_idx, Some(0));
+    assert_eq!(manager_a.physical_device_id, Some(7));
+    assert_eq!(manager_b.physical_device_id, Some(3));
+    assert_eq!(local_a.memory_limit.load(Ordering::Acquire), 1024 * MB_TO_BYTES);
+    assert_eq!(local_b.memory_limit.load(Ordering::Acquire), 1024 * MB_TO_BYTES);
+
+    let other_registry_before = global_snapshot(global_b);
+    local_a.memory_used.store(1024 * MB_TO_BYTES, Ordering::Release);
+    local_a.tokens_remaining.store(17, Ordering::Release);
+    local_a.state.store(STATE_RUNNING, Ordering::Release);
+    local_a.procs[0].pid.store(pid, Ordering::Release);
+    local_a.procs[0].hbm_used[0].store(1024 * MB_TO_BYTES, Ordering::Release);
+    let round = local_a.overdraft_pool.begin_round().unwrap();
+    assert!(local_a.overdraft_pool.open_idle(round));
+    manager_a.wait_for_global_turn();
+    manager_a.pass_baton();
+    assert_eq!(global_snapshot(global_b), other_registry_before);
+    assert_eq!(local_b.memory_used.load(Ordering::Acquire), 0);
+    assert_eq!(local_b.tokens_remaining.load(Ordering::Acquire), 0);
+    assert_eq!(local_b.state.load(Ordering::Acquire), STATE_IDLE);
+    assert!(!local_b.overdraft_pool.try_acquire(local_b.overdraft_pool.snapshot(), 10, true));
+
+    // A later client mapping the same card observes its live ledger; another card
+    // cannot reset it merely because both manager threads have the same PID.
+    let reopened = crate::shmem::setup::create_shmem::<LocalContainerShmem>(&a.local_shm_path);
+    assert_eq!(reopened.memory_used.load(Ordering::Acquire), 1024 * MB_TO_BYTES);
+    assert_eq!(reopened.procs[0].hbm_used[0].load(Ordering::Acquire), 1024 * MB_TO_BYTES);
+    assert_eq!(reopened.tokens_remaining.load(Ordering::Acquire), 17);
+    drop(manager_a);
+    assert_eq!(global_snapshot(global_b), other_registry_before);
+    assert_eq!(global_b.slots[0].is_active.load(Ordering::Acquire), 1);
+    drop(manager_b);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+
+#[test]
+fn isolated_dcmi_snapshot_cannot_overwrite_owned_or_pending_reservations() {
+    let local = unsafe { std::mem::zeroed::<LocalContainerShmem>() };
+    local.procs[0].pid.store(1234, Ordering::Release);
+    local.procs[0].hbm_used[0].store(80, Ordering::Release);
+    local.procs[0].hbm_used[1].store(12, Ordering::Release);
+    local.memory_used.store(137, Ordering::Release);
+    let rows = [
+        crate::dcmi_protocol::Record { device: 0, pid: 1234, bytes: 999 },
+        crate::dcmi_protocol::Record { device: 0, pid: 4321, bytes: 500 },
+    ];
+    assert_eq!(observe_snapshot(&local, Some(7), &rows), 1);
+    assert_eq!(local.memory_used.load(Ordering::Acquire), 137);
+    assert_eq!(local.procs[0].hbm_used[0].load(Ordering::Acquire), 80);
+    assert_eq!(local.procs[0].hbm_used[1].load(Ordering::Acquire), 12);
+}
+
+#[test]
+fn replaced_spatial_manager_cannot_refresh_or_clear_successors_state() {
+    let mut m = manager(30.0, false, 500);
+    m.my_global_idx = None;
+    m.sched_policy = SchedPolicy::Spatial;
+    let local = m.local;
+    local.manager_global_idx.store(-1, Ordering::Release);
+    assert!(m.update_heartbeat());
+    local.manager_generation.store(2, Ordering::Release);
+    local.manager_heartbeat.store(123, Ordering::Release);
+    assert!(!m.update_heartbeat());
+    drop(m);
+    assert_eq!(local.manager_pid.load(Ordering::Acquire), std::process::id() as i32);
+    assert_eq!(local.manager_heartbeat.load(Ordering::Acquire), 123);
 }

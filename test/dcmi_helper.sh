@@ -3,6 +3,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 artifacts="${HAMI_ARTIFACT_DIR:-$root/target/debug}"
+export NPU_COMPUTE_LIMIT=30 NPU_MEMORY_LIMIT_MB=4096 NPU_SCHED_POLICY=dynamic
 fixture="$(mktemp -d "${TMPDIR:-/tmp}/vnpu-dcmi-test.XXXXXX")"
 trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/lib64/driver"
@@ -11,6 +12,7 @@ cat > "$fixture/runtime.c" <<'C'
 #include <stdint.h>
 #include <stdlib.h>
 int rtGetDevice(int *device) { *device = 0; return 0; }
+int rtGetDevicePhyIdByIndex(unsigned device, unsigned *physical) { *physical = device; return 0; }
 int rtStreamCreate(uint64_t *stream, int priority) { (void)priority; *stream = 1; return 0; }
 size_t rtEventCreate(uint64_t *event) { *event = 1; return 0; }
 __attribute__((constructor)) static void init(void) {
@@ -53,7 +55,15 @@ int dcmi_get_card_list(int *count, int *cards, int capacity) {
     if (capacity < 1) return -1;
     cards[0] = 0; *count = getenv("VNPU_BAD_COUNT") ? 9 : 1; return 0;
 }
+int dcmi_get_card_id_device_id_from_phyid(int *card, int *dev, unsigned physical) {
+    if (physical == 0) { *card = 0; *dev = 0; return 0; }
+    if (physical == 7) { *card = 42; *dev = 2; return 0; }
+    return -1;
+}
 int dcmi_get_device_resource_info(int card, int dev, struct memory *out, int *count) {
+    if (card == 42 && dev == 2 && *count >= 1) {
+        out[0].pid = 123; out[0].bytes = 7007; *count = 1; return 0;
+    }
     if (card || dev || *count < 1) return -1;
     out[0].pid = 123; out[0].bytes = 4096; *count = 1; return 0;
 }
@@ -86,7 +96,9 @@ int main(void) {
     uint64_t (*info)(uint64_t, size_t *, size_t *) = dlsym(RTLD_DEFAULT, "rtMemGetInfoEx");
     if (!info) return 2;
     size_t free = 0, total = 0;
-    return info(0, &free, &total) || free != 4096 || total != 8192;
+    if (info(0, &free, &total)) return 3;
+    if (getenv("NPU_DCMI_HELPER_PROCESS")) return free != 4096 || total != 8192;
+    return total != (size_t)4096 * 1024 * 1024;
 }
 C
 cc -shared -fPIC "$fixture/runtime.c" -o "$fixture/libruntime.so"
@@ -110,6 +122,18 @@ if env LD_LIBRARY_PATH="$fixture${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     ASCEND_DRIVER_HOME="$fixture" VNPU_BAD_COUNT=1 \
     timeout 5 "$fixture/launch" "$artifacts/vnpu-dcmi" > /dev/null; then
     echo 'helper accepted an invalid driver count' >&2
+    exit 1
+fi
+
+# A physical ID is not the card-list position or the card/chip pair.
+env LD_LIBRARY_PATH="$fixture" LD_PRELOAD="$artifacts/libvnpu.so" \
+    NPU_DCMI_HELPER_PROCESS=1 NPU_DCMI_PHYSICAL_DEVICE=7 ASCEND_DRIVER_HOME="$fixture" \
+    VNPU_BAD_COUNT=1 timeout 5 "$fixture/launch" "$artifacts/vnpu-dcmi" > "$fixture/targeted"
+printf 'VNPU_DCMI_READY\nVNPU_DCMI_1\n0 123 7007\n' > "$fixture/targeted-expected"
+cmp "$fixture/targeted-expected" "$fixture/targeted"
+if env NPU_DCMI_HELPER_PROCESS=1 NPU_DCMI_PHYSICAL_DEVICE=8 ASCEND_DRIVER_HOME="$fixture" \
+    timeout 5 "$fixture/launch" "$artifacts/vnpu-dcmi" > /dev/null; then
+    echo 'missing physical device incorrectly fell back to card zero' >&2
     exit 1
 fi
 
@@ -142,8 +166,8 @@ done
 # the old worker-startup timeout to fall back to an unlimited stub.
 # Reject both the original queue protocol and the pre-overdraft fenced protocol.
 for marker in '\001\000\000\000' '\062\120\116\126'; do
-dd if=/dev/zero of="$fixture/legacy" bs=2848 count=1 status=none
-printf '%b' "$marker" | dd of="$fixture/legacy" bs=1 seek=16 conv=notrunc status=none
+dd if=/dev/zero of="$fixture/legacy.device-0" bs=2848 count=1 status=none
+printf '%b' "$marker" | dd of="$fixture/legacy.device-0" bs=1 seek=16 conv=notrunc status=none
 set +e
 env -u NPU_DCMI_HELPER_PROCESS LD_LIBRARY_PATH="$fixture${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     LD_PRELOAD="$artifacts/libvnpu.so" NPU_GLOBAL_SHM_PATH="$fixture/legacy" \
@@ -237,7 +261,7 @@ for alias in same symlink hardlink missing; do
     if test "$alias" = symlink; then local="$fixture/path-symlink"; ln -s "$global" "$local"; fi
     if test "$alias" = hardlink; then local="$fixture/path-hardlink"; ln "$global" "$local"; fi
     set +e
-    env -u NPU_DCMI_HELPER_PROCESS LD_PRELOAD="$artifacts/libvnpu.so" \
+    env -u NPU_DCMI_HELPER_PROCESS LD_LIBRARY_PATH="$fixture" LD_PRELOAD="$artifacts/libvnpu.so" \
         NPU_GLOBAL_SHM_PATH="$global" NPU_LOCAL_SHM_PATH="$local" \
         timeout 2 "$fixture/probe"
     status=$?
@@ -291,7 +315,7 @@ for mode in adjacent override; do
         env -u NPU_DCMI_HELPER_PROCESS -u NPU_DCMI_HELPER_PATH \
             LD_LIBRARY_PATH="$fixture" LD_PRELOAD=./relative/libvnpu.so \
             NPU_GLOBAL_SHM_PATH="$fixture/chdir-global-$mode" \
-            NPU_LOCAL_SHM_PATH="$fixture/chdir-local-$mode" NPU_MEMORY_LIMIT_MB=0 \
+            NPU_LOCAL_SHM_PATH="$fixture/chdir-local-$mode" NPU_MEMORY_LIMIT_MB=4096 \
             ASCEND_DRIVER_HOME="$fixture" RUST_LOG=limiter::manager=debug \
             "${extra[@]}" timeout 25 "$fixture/chdir-probe" "$fixture/chdir-log-$mode" \
             2> "$fixture/chdir-log-$mode"

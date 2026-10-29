@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+#[path = "../../../crates/limiter/src/dynamic.rs"]
+pub mod dynamic;
 #[path = "../../../crates/limiter/src/config.rs"]
 pub mod config;
 #[path = "../../../crates/limiter/src/overdraft.rs"]

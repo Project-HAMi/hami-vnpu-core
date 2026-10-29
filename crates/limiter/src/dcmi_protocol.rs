@@ -6,6 +6,8 @@ pub const MAX_OUTPUT: usize = 32 * 1024;
 pub const HEADER: &str = "VNPU_DCMI_1";
 pub const READY: &str = "VNPU_DCMI_READY\n";
 pub const HELPER_ENV: &str = "NPU_DCMI_HELPER_PROCESS";
+/// Internal query target, inherited only by the exec-isolated helper tree.
+pub const DEVICE_ENV: &str = "NPU_DCMI_PHYSICAL_DEVICE";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {

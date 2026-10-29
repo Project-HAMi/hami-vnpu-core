@@ -26,14 +26,14 @@ impl RegistryLock {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_lock(&file, libc::F_WRLCK.into(), libc::F_SETLKW)?;
+        set_lock(&file, libc::F_WRLCK as libc::c_short, libc::F_SETLKW)?;
         Ok(RegistryGuard(file))
     }
 }
 
-fn set_lock(file: &File, kind: i32, command: i32) -> io::Result<()> {
+fn set_lock(file: &File, kind: libc::c_short, command: i32) -> io::Result<()> {
     let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-    lock.l_type = kind as _;
+    lock.l_type = kind;
     lock.l_whence = libc::SEEK_SET as _;
     lock.l_len = 1;
     loop {
@@ -49,7 +49,7 @@ fn set_lock(file: &File, kind: i32, command: i32) -> io::Result<()> {
 
 impl Drop for RegistryGuard<'_> {
     fn drop(&mut self) {
-        if let Err(error) = set_lock(&self.0, libc::F_UNLCK.into(), libc::F_SETLK) {
+        if let Err(error) = set_lock(&self.0, libc::F_UNLCK as libc::c_short, libc::F_SETLK) {
             log::error!("cannot unlock scheduler registry: {error}");
         }
     }

@@ -58,6 +58,16 @@ impl Collector {
         timeout: Duration,
         stopped: &AtomicBool,
     ) -> io::Result<Vec<Record>> {
+        self.snapshot_for_device(path, timeout, stopped, None)
+    }
+
+    pub fn snapshot_for_device(
+        &mut self,
+        path: &Path,
+        timeout: Duration,
+        stopped: &AtomicBool,
+        physical_device_id: Option<u32>,
+    ) -> io::Result<Vec<Record>> {
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
                 Ok(None) => return Err(io::Error::other("previous DCMI helper has not exited")),
@@ -69,7 +79,13 @@ impl Collector {
             }
             self.child = None;
         }
-        let child = Command::new(path)
+        let mut command = Command::new(path);
+        if let Some(physical) = physical_device_id {
+            command.env(dcmi_protocol::DEVICE_ENV, physical.to_string());
+        } else {
+            command.env_remove(dcmi_protocol::DEVICE_ENV);
+        }
+        let child = command
             .arg(std::process::id().to_string())
             .env(HELPER_ENV, "1")
             .env_remove("LD_PRELOAD")

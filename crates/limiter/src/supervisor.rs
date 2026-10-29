@@ -1,11 +1,10 @@
 //! In-process manager supervisor.
 //!
-//! The manager daemon no longer runs as a separate binary. Instead every process
-//! that loads `libvnpu.so` spawns a lightweight supervisor thread (see the ctor in
-//! the `hook` crate). All supervisors in the same pod (same `NPU_LOCAL_SHM_PATH`)
+//! A process starts a lightweight supervisor on its first intercepted NPU use,
+//! after leaving the dynamic loader. Supervisors in the same physical-card domain
 //! race to become the *single* manager via a CAS on `LocalContainerShmem::manager_pid`.
 //! The winner runs `ContainerManager::run()`; the losers stand by and watch, ready to
-//! take over if the current manager dies. This guarantees exactly one manager per pod
+//! take over if the current manager dies. This guarantees one manager per Pod/card
 //! while surviving crashes of whichever process happened to host it.
 
 use std::sync::atomic::Ordering;
@@ -40,12 +39,31 @@ const MANAGER_MIN_AGE_SECS: u64 = 3;
 /// (loops forever electing/watching); returns early only when this process cannot or
 /// should not host a manager, in which case the process runs worker-only.
 pub fn run() {
+    run_configured(None);
+}
+
+/// Supervise one physical card, independent of the calling process's logical IDs.
+pub fn run_for_device(physical_device_id: u32) {
+    run_configured(Some(physical_device_id));
+}
+
+fn run_configured(physical_device_id: Option<u32>) {
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .try_init();
     block_all_signals();
 
     let my_pid = std::process::id() as i32;
 
     let cfg = match ManagerConfig::from_env() {
-        Ok(c) => c,
+        Ok(c) => {
+            crate::config::require_distinct_shmem_paths(&c.global_shm_path, &c.local_shm_path);
+            match physical_device_id {
+                Some(device) => c.for_device(device),
+                None => c,
+            }
+        }
         Err(e) => {
             warn!("[Supervisor] {e}; manager disabled, running worker-only.");
             return;
@@ -169,21 +187,21 @@ fn try_become_manager(local: &LocalContainerShmem, my_pid: i32) -> Option<i32> {
     if owner == my_pid {
         return Some(0);
     }
-    if owner != 0 && !manager_alive(local, owner) {
-        if local
+    if owner != 0
+        && !manager_alive(local, owner)
+        && local
             .manager_pid
             .compare_exchange(owner, my_pid, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
-        {
-            local
-                .manager_heartbeat
-                .store(get_time_us(), Ordering::Release);
-            warn!(
-                "[Supervisor PID:{}] took over from dead/stale manager {}",
-                my_pid, owner
-            );
-            return Some(owner);
-        }
+    {
+        local
+            .manager_heartbeat
+            .store(get_time_us(), Ordering::Release);
+        warn!(
+            "[Supervisor PID:{}] took over from dead/stale manager {}",
+            my_pid, owner
+        );
+        return Some(owner);
     }
     None
 }

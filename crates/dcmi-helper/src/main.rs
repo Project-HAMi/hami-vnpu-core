@@ -93,28 +93,47 @@ fn snapshot() -> io::Result<Vec<protocol::Record>> {
         }
         // Keep the handle until _exit: do not run vendor library destructors.
         let init: unsafe extern "C" fn() -> i32 = symbol(handle, c"dcmi_init")?;
-        let cards: unsafe extern "C" fn(*mut i32, *mut i32, i32) -> i32 =
-            symbol(handle, c"dcmi_get_card_list")?;
         let memory: unsafe extern "C" fn(i32, i32, *mut ProcessMemory, *mut i32) -> i32 =
             symbol(handle, c"dcmi_get_device_resource_info")?;
         if init() != 0 {
             return Err(io::Error::other("dcmi_init failed"));
         }
-        let mut count = 0;
-        let mut ids = [0; protocol::MAX_DEVICES];
-        if cards(&mut count, ids.as_mut_ptr(), ids.len() as i32) != 0
-            || count < 0
-            || count as usize > ids.len()
-        {
-            return Err(io::Error::other("invalid DCMI card list"));
-        }
+        let locations = if let Some(value) = std::env::var_os(protocol::DEVICE_ENV) {
+            let physical = value
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                .ok_or_else(|| io::Error::other("invalid physical device ID"))?;
+            let locate: unsafe extern "C" fn(*mut i32, *mut i32, u32) -> i32 =
+                symbol(handle, c"dcmi_get_card_id_device_id_from_phyid")?;
+            let (mut card, mut chip) = (-1, -1);
+            if locate(&mut card, &mut chip, physical) != 0 || card < 0 || chip < 0 {
+                return Err(io::Error::other("cannot locate physical device"));
+            }
+            // This snapshot belongs only to the selected card's local domain.
+            vec![(card, chip)]
+        } else {
+            let cards: unsafe extern "C" fn(*mut i32, *mut i32, i32) -> i32 =
+                symbol(handle, c"dcmi_get_card_list")?;
+            let mut count = 0;
+            let mut ids = [0; protocol::MAX_DEVICES];
+            if cards(&mut count, ids.as_mut_ptr(), ids.len() as i32) != 0
+                || count < 0
+                || count as usize > ids.len()
+            {
+                return Err(io::Error::other("invalid DCMI card list"));
+            }
+            ids[..count as usize]
+                .iter()
+                .map(|&card| (card, 0))
+                .collect()
+        };
         let mut records = Vec::new();
-        for (device, &card) in ids[..count as usize].iter().enumerate() {
+        for (device, (card, chip)) in locations.into_iter().enumerate() {
             let mut processes = [ProcessMemory { pid: 0, bytes: 0 }; protocol::MAX_PROCESSES];
             let mut count = processes.len() as i32;
-            // Preserve the existing one-device-per-card query and index mapping.
-            if memory(card, 0, processes.as_mut_ptr(), &mut count) != 0 {
-                continue;
+            // A failed query never falls back to another physical card.
+            if memory(card, chip, processes.as_mut_ptr(), &mut count) != 0 {
+                return Err(io::Error::other("DCMI process query failed"));
             }
             if count < 0 || count as usize > processes.len() {
                 return Err(io::Error::other("invalid DCMI process count"));
@@ -301,6 +320,20 @@ fn child_pids(proc_root: &std::path::Path, parent: u32) -> io::Result<Vec<i32>> 
     Ok(children)
 }
 
+fn main() {
+    let code = match run() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("vnpu-dcmi: {error}");
+            1
+        }
+    };
+    // Do not enter CANN/driver atexit handlers, including when initialization failed.
+    unsafe {
+        libc::_exit(code);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -323,19 +356,5 @@ mod tests {
         std::fs::write(task.join("children"), "101 104 ").unwrap();
         assert_eq!(super::child_pids(&root, 42).unwrap(), vec![101, 104]);
         std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-fn main() {
-    let code = match run() {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("vnpu-dcmi: {error}");
-            1
-        }
-    };
-    // Do not enter CANN/driver atexit handlers, including when initialization failed.
-    unsafe {
-        libc::_exit(code);
     }
 }
