@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::LazyLock;
+use std::sync::atomic::AtomicPtr;
 
 thread_local! {
     // PID rather than a boolean: a fork child must not inherit an admission bypass.
@@ -51,25 +51,16 @@ type HostArgsFn = unsafe extern "C" fn(
     usize,
 ) -> i32;
 
-static REAL: LazyLock<HostArgsFn> = LazyLock::new(|| unsafe {
-    let name = c"aclrtLaunchKernelWithHostArgs";
-    let mut symbol = libc::dlsym(libc::RTLD_NEXT, name.as_ptr());
-    if symbol.is_null() {
-        // Frameworks can load ACL with RTLD_LOCAL. Resolve its public entry point
-        // explicitly in that case and retain the handle for the process lifetime.
-        let handle = libc::dlopen(
-            c"libascendcl.so".as_ptr(),
-            libc::RTLD_NOW | libc::RTLD_LOCAL,
-        );
-        assert!(!handle.is_null(), "cannot load CANN libascendcl.so");
-        symbol = libc::dlsym(handle, name.as_ptr());
-    }
+fn real() -> HostArgsFn {
+    static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    let symbol = limiter::dynamic::resolve_sdk_symbol(&REAL, c"aclrtLaunchKernelWithHostArgs")
+        .expect("cannot resolve CANN aclrtLaunchKernelWithHostArgs");
     assert!(
-        !symbol.is_null() && symbol != aclrtLaunchKernelWithHostArgs as *const () as *mut c_void,
+        symbol != aclrtLaunchKernelWithHostArgs as *const () as *mut c_void,
         "cannot resolve CANN aclrtLaunchKernelWithHostArgs"
     );
-    std::mem::transmute(symbol)
-});
+    unsafe { std::mem::transmute(symbol) }
+}
 
 // CANN acl_rt.h ABI: aclError is a signed C int; argument sizes/counts are size_t.
 // Opaque pointers are forwarded without inspecting their pointed-to layouts.
@@ -85,7 +76,7 @@ pub unsafe extern "C" fn aclrtLaunchKernelWithHostArgs(
     placeholders: *mut c_void,
     placeholder_count: usize,
 ) -> i32 {
-    let real = *REAL;
+    let real = real();
     let scope = HostArgsScope::enter();
     if scope.outermost {
         let mut capture_status = 0;

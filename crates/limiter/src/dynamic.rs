@@ -62,6 +62,23 @@ pub fn sdk_symbol(name: &CStr) -> Option<*mut c_void> {
     }
 }
 
+/// Take a reference to the actual backend before caching one of its addresses.
+/// `RTLD_NEXT` itself does not keep an application's dlopen handle alive.
+fn retain_symbol_library(address: *mut c_void) -> *mut c_void {
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(address, &mut info) } == 0 || info.dli_fname.is_null() {
+        return ptr::null_mut();
+    }
+    // NOLOAD avoids initializing another SDK or selecting a different backend.
+    // A main-executable symbol needs no extra reference and may return null here.
+    unsafe {
+        libc::dlopen(
+            info.dli_fname,
+            libc::RTLD_LAZY | libc::RTLD_LOCAL | libc::RTLD_NOLOAD,
+        )
+    }
+}
+
 fn cached_symbol(
     cache: &AtomicPtr<c_void>,
     resolve: impl FnOnce() -> Option<*mut c_void>,
@@ -72,6 +89,7 @@ fn cached_symbol(
     }
     // Do not cache a miss: a later dlopen can make an optional symbol available.
     let address = resolve()?;
+    let retained = retain_symbol_library(address);
     Some(
         match cache.compare_exchange(
             ptr::null_mut(),
@@ -80,12 +98,18 @@ fn cached_symbol(
             Ordering::Acquire,
         ) {
             Ok(_) => address,
-            Err(existing) => existing,
+            Err(existing) => {
+                if !retained.is_null() {
+                    unsafe { libc::dlclose(retained) };
+                }
+                existing
+            }
         },
     )
 }
 
-/// Cache successful SDK lookups only; retry a missing backend on the next call.
+/// Cache successful SDK lookups and retain their backend for the process lifetime.
+/// Retry a missing backend on the next call.
 pub fn resolve_sdk_symbol(cache: &AtomicPtr<c_void>, name: &CStr) -> Option<*mut c_void> {
     cached_symbol(cache, || sdk_symbol(name))
 }

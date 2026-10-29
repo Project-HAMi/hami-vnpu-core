@@ -122,9 +122,10 @@ fake SDKs. These CPU artifacts have not passed real-SDK release verification.
 | `test/manager_cpu` | Production manager arithmetic, fixed rest calculation, report aggregation and spatial exclusion from time rotation. The unused process scan is a panic-on-call test double. |
 | `test/memory_cpu` | Production memory scan/quota paths, rollback, shared-memory ABI and bounded fork cleanup. Procfs reads and CANN calls use explicit test doubles; Linux futexes are real. |
 | `test/worker_cpu/run.py` | Source-linked worker and hook admission cases with observed lock/futex boundaries; Cached/configured/DVPP/physical allocation admission, failure rollback, allocation/free alias deduplication, physical retain lifetimes, concurrent free/address reuse, per-card ownership, threads and fork. Each case runs in a separate process with a timeout. |
-| `test/preload/run.py` | No eager SDK dependencies; ordinary shell/tool startup without CANN, preserved signal handlers, no preload-time supervisor, passive hooks and successful retry after global/local `dlopen`. |
+| `test/preload/run.py` | No eager SDK dependencies; ordinary shell/tool startup without CANN, preserved signal handlers, no preload-time supervisor, passive hooks, successful retry after global/local `dlopen`, and cached calls surviving the application's `dlclose`. |
 | `test/process_local.sh` | Actual per-process cache, concurrent initialization and real fork cases. |
 | `test/spatial_cpu/run.py` | Actual built Rust hook library preloaded into a C client with fake ACL: ceil budgets, resets, API failures, device/context switching and fork handling. |
+| `test/host_args.sh` | HostArgs ABI, capture, admission, nested delegation, per-card routing, threads/fork, and cached launch calls after the application releases its ACL handle. |
 | Documentation links | Local Markdown link destinations in the root READMEs and `docs/`; no external requests or rendered-anchor checks. |
 
 The [workflow](../.github/workflows/ci.yml) runs on pull requests, pushes to `main`
@@ -246,10 +247,11 @@ CPU 脚本在临时目录构建，退出时清理，不替换已安装的库。�
   明确的测试替身，Linux futex 使用真实实现。
 - Worker：源码链接的准入与 hook 路径，观测锁和 futex 边界；覆盖 Cached/配置/DVPP/物理分配的准入、失败回滚、分配及释放转调去重、物理句柄 retain 生命周期、并发释放时地址复用、每卡归属、线程及 fork。每个用例独立进程并限制超时。
 - Preload：无 SDK 硬依赖、无 CANN 的普通命令启动、保留信号处理器、加载期无 supervisor、
-  未配置时透传，以及 global/local `dlopen` 后的符号重试。
+  未配置时透传、global/local `dlopen` 后的符号重试，以及应用 `dlclose` 后缓存调用仍有效。
 - Process-local：真实缓存实现的并发初始化和 fork。
 - Spatial：预加载实际构建的 Rust 库，通过 fake ACL 验证向上取整、重置、API 错误、
   设备/上下文切换及 fork 行为。
+- HostArgs：ABI、capture、准入、嵌套转调、按卡路由、线程/fork，以及应用释放 ACL 句柄后的缓存调用。
 - 文档：检查根目录 README 与 `docs/` 的本地 Markdown 链接目标；不访问外部链接，
   不检查渲染后的锚点。
 

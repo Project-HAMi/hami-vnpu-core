@@ -59,9 +59,8 @@ A successful build does not establish the minimum supported CANN version or
 hardware support for every policy. See [testing and CI](docs/testing.md) for
 artifact provenance, verification and hardware-validation scope.
 
-To build directly on a Linux host with Rust 1.94.0, a C compiler and real Ascend
-CANN/DCMI development libraries, initialize the installed CANN environment and
-run `cargo build --release --workspace --locked`. The library is then at
+To build directly on a Linux host with Rust 1.94.0 and a C compiler, run
+`cargo build --release --workspace --locked`. The library is then at
 `target/release/libvnpu.so`. Nonstandard SDK paths are covered in the
 [configuration reference](docs/configuration.md).
 

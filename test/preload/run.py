@@ -25,7 +25,7 @@ def main():
         work = Path(directory)
         probe = work / "probe"
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
-                        str(source / "probe.c"), "-ldl", "-o", str(probe)], check=True)
+                        str(source / "probe.c"), "-ldl", "-pthread", "-o", str(probe)], check=True)
         headers = subprocess.check_output(["readelf", "-lW", str(probe)], text=True,
                                           env=dict(os.environ, LC_ALL="C"))
         interpreter = re.search(r"Requesting program interpreter: ([^\]]+)\]", headers)
@@ -71,7 +71,7 @@ def main():
                 case(label + "-" + name, command, settings)
         case("missing-optional-runtime", [*isolated_probe, "missing"])
         for visibility in ("global", "local"):
-            case("retry-after-" + visibility + "-dlopen",
+            case("retry-after-" + visibility + "-dlopen-and-close",
                  [*isolated_probe, "late", visibility, str(backend)])
         case("configured-missing-runtime-fails-closed", [*isolated_probe, "missing"], {
             "NPU_GLOBAL_SHM_PATH": str(work / "global.shm"),

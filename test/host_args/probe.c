@@ -102,6 +102,10 @@ int main(int argc, char **argv) {
     usleep(50000); assert(!atomic_load(&completed));
     atomic_store(tokens, 1);
     assert(!pthread_join(threads[0], NULL)); assert(atomic_load(&completed) && atomic_load(tokens) == 0);
-    printf("PASS %s: ABI, capture, errors, nested delegation, replay, per-card streams, threads, fork, quota wait\n", argv[1]);
+    // Releasing the application's ACL handle must not invalidate the cached launch.
+    mode(0); capture(1, 0);
+    assert(dlclose(acl) == 0);
+    call();
+    printf("PASS %s: ABI, capture, errors, nested delegation, replay, per-card streams, threads, fork, quota wait, SDK lifetime\n", argv[1]);
     return 0;
 }
