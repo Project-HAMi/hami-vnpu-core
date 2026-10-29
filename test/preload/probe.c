@@ -50,6 +50,9 @@ static void wait_for_worker_cleanup(pid_t tid) {
         assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
         if (now.tv_sec > deadline.tv_sec ||
             (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            if (access(path, F_OK) != 0) {
+                break;
+            }
             fprintf(stderr, "joined worker %ld is still visible in procfs\n", (long)tid);
             assert(0);
         }
