@@ -70,8 +70,9 @@ See the [coordinated scheduler upgrade](docs/scheduler-upgrade.md) before replac
 
 First prepare an NPU-enabled Linux container with the Ascend devices and runtime
 libraries available. Mount a writable host directory at `/hami-shared-region` in
-each participating container on the node, and mount the built library at
-`/usr/local/lib/libvnpu.so`.
+each participating container on the node. Mount the built library at
+`/usr/local/lib/libvnpu.so` and its matching executable helper at
+`/usr/local/lib/vnpu-dcmi` (mode `0755`).
 
 Mount a container-specific file at `/etc/ld.so.preload` with this content:
 

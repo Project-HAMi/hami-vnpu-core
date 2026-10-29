@@ -58,7 +58,8 @@ HDK 驱动用户态库版本只说明构建环境，宿主机驱动应与业务 
 
 先准备能正常使用 NPU 的 Linux 容器，确保设备和昇腾运行时库可用。
 将同一个可写的宿主机共享目录挂载到参与容器的 `/hami-shared-region`，
-将构建的库挂载到 `/usr/local/lib/libvnpu.so`。
+将构建的库挂载到 `/usr/local/lib/libvnpu.so`，并将配套的可执行 helper 挂载到
+`/usr/local/lib/vnpu-dcmi`（权限 `0755`）。
 
 将仅用于该业务容器的预加载文件挂载到 `/etc/ld.so.preload`，内容为：
 
