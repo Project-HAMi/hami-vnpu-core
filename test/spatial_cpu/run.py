@@ -2,8 +2,7 @@
 """Exercise the actual built Rust libvnpu.so against a fake ACL, with no NPU.
 
 Usage: python3 test/spatial_cpu/run.py target/release/libvnpu.so
-The library's normal runtime/DCMI dependencies must be resolvable in the build
-environment; no CANN resource call reaches those libraries in these tests.
+No CANN runtime or DCMI library is required; calls resolve from the fake backend.
 """
 import json
 import os

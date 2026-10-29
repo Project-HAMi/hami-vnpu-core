@@ -71,12 +71,14 @@ The virtual HBM free-memory report reserves 128 MiB of overhead. This internal c
 
 | Variable | Scope | Meaning |
 | --- | --- | --- |
-| `LD_PRELOAD` | Application's Linux dynamic loader | Absolute path to `libvnpu.so`, for example `/opt/hami/libvnpu.so`. Set it when launching every participating application process. |
+| `LD_PRELOAD` | Application's Linux dynamic loader | Optional alternative to a container-specific `/etc/ld.so.preload` file. Use the absolute path to `libvnpu.so`, for example `/opt/hami/libvnpu.so`. |
 | `LD_LIBRARY_PATH` | Application/build loader | Normal Linux dependency search path. Make the matching CANN runtime and Ascend driver libraries available; this is a loader setting rather than a quota control. |
-| `ASCEND_TOOLKIT_HOME` | Build only | Toolkit root, default `/usr/local/Ascend/ascend-toolkit/latest`; the build adds `<root>/lib64` as a native library search path. |
-| `ASCEND_DRIVER_HOME` | Build only | Driver root, default `/usr/local/Ascend/driver`; the build adds `<root>/lib64/driver` and links `dcmi`. |
+| `ASCEND_TOOLKIT_HOME` | Release verification | Toolkit root, default `/usr/local/Ascend/ascend-toolkit/latest`; verification inspects `<root>/lib64`. |
+| `ASCEND_DRIVER_HOME` | Release verification | Driver root, default `/usr/local/Ascend/driver`; verification inspects `<root>/lib64/driver`. |
 
-The library also links the CANN `runtime` library. Build against the intended Linux architecture and install compatible runtime/driver dependencies in the deployment. Setting the two build roots does not install those dependencies or configure the application's runtime library lookup.
+`libvnpu.so` has no link-time CANN/runtime/DCMI dependency. It looks up SDK symbols only when used, including SDKs loaded with `RTLD_LOCAL`; missing optional symbols are retried after a later `dlopen`. Without resource configuration, preloading stays passive and runtime hooks pass through. Explicit resource settings still require valid manager configuration.
+
+Mount a container-specific `/etc/ld.so.preload` containing the absolute library path to inject it into child processes without changing framework commands. Keep this mount within workload containers. Prepare compatible CANN/driver libraries and their search paths before launching NPU applications. Setting the two verification roots does not install dependencies or configure runtime lookup.
 
 ## Migration from older variables
 
@@ -98,4 +100,4 @@ Remove the old variables completely, even if set to an empty string or alongside
 file path to select the local accounting group; setting only a name does not
 override `/tmp/vnpu_local_shmem`.
 
-Sources: [resource parser](../crates/limiter/src/config.rs), [manager tuning](../crates/limiter/src/manager.rs), [supervisor](../crates/limiter/src/supervisor.rs), [worker and HBM accounting](../crates/limiter/src/worker.rs), [logger](../crates/limiter/src/lib.rs), [build paths](../crates/limiter/build.rs).
+Sources: [resource parser](../crates/limiter/src/config.rs), [manager tuning](../crates/limiter/src/manager.rs), [supervisor](../crates/limiter/src/supervisor.rs), [worker and HBM accounting](../crates/limiter/src/worker.rs), [logger](../crates/limiter/src/supervisor.rs), [lazy loading](../crates/limiter/src/dynamic.rs).

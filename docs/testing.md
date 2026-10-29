@@ -5,7 +5,7 @@
 ### Build the release library
 
 The [release jobs](../.github/workflows/ci.yml) build the complete Rust workspace
-with real CANN runtime and DCMI libraries. They use the same
+and verify SDK exports against real CANN runtime and DCMI libraries. They use the same
 [Dockerfile](../dockerfiles/Dockerfile) and [Make target](../Makefile) as local
 builds, following the container-build approach used by
 [HAMi-core](https://github.com/Project-HAMi/HAMi-core/blob/main/.github/workflows/build-src.yml).
@@ -57,8 +57,8 @@ It does not install a kernel driver. HDK 25.5.x is listed in the
 
 The build uses real CANN libraries under `/usr/local/Ascend/cann-8.5.2/lib64`
 and DCMI under `/usr/local/Ascend/driver/lib64/driver`, with driver dependencies
-under `lib64/driver` and `lib64/common`. Release verification checks that the
-selected real libraries are resolved. The driver version above describes the
+under `lib64/driver` and `lib64/common`. Release verification checks the selected real SDK exports and rejects
+eager CANN/runtime/DCMI dependencies in `libvnpu.so`. The driver version above describes the
 user libraries present at build time; choose the deployed host driver according
 to the workload's CANN and hardware compatibility requirements. Set `OUT_DIR`
 to change the export location, for example `make build-in-docker OUT_DIR=out`.
@@ -73,7 +73,8 @@ The exported directory contains:
 
 Before export, [release verification](../scripts/ci/verify-release.py) checks the
 ELF architecture and shared-object type, required hook and SDK exports, and
-`ldd -r` resolution against the selected real runtime/DCMI libraries. It requires
+`ldd -r` resolution of system dependencies. CANN/runtime/DCMI symbols are
+resolved lazily and must not appear in `DT_NEEDED`. It requires
 and records the spatial-policy APIs, because spatial is the default policy.
 These checks do not initialize CANN or DCMI and do not execute NPU kernels.
 
@@ -103,17 +104,16 @@ python3 scripts/ci/check-doc-links.py
 ```
 
 Formatting checks the root workspace's two production crates and does not need
-Linux or the SDK. The CPU script prepares test-only link dependencies, then runs
+Linux or the SDK. The CPU script needs no SDK/driver link stubs and runs
 `cargo clippy --workspace --all-targets --locked -- -D warnings` for the root
 workspace, including its test targets. The standalone CPU test workspaces are
 run separately below; they are not included in `--workspace`.
 
 The CPU script builds in a temporary directory and removes it on exit. It never
-replaces an installed library. Its `libvnpu.so` is linked against test-only
-runtime/DCMI dependencies and must not be deployed. Any unexpected call into
-those link dependencies aborts; the spatial runner supplies its own fake ACL
-backend for the calls under test. Clippy uses this test link environment; it does
-not build or validate the deployable release artifact.
+replaces an installed library. Preload tests start ordinary commands without
+CANN, verify signal handlers and thread counts, and exercise missing-symbol
+retry with global/local backends. Other integration runners supply their own
+fake SDKs. These CPU artifacts have not passed real-SDK release verification.
 
 | Check | Coverage |
 | --- | --- |
@@ -122,8 +122,10 @@ not build or validate the deployable release artifact.
 | `test/manager_cpu` | Production manager arithmetic, fixed rest calculation, report aggregation and spatial exclusion from time rotation. The unused process scan is a panic-on-call test double. |
 | `test/memory_cpu` | Production memory scan/quota paths, rollback, shared-memory ABI and bounded fork cleanup. Procfs reads and CANN calls use explicit test doubles; Linux futexes are real. |
 | `test/worker_cpu/run.py` | Source-linked worker and hook admission cases with observed lock/futex boundaries; Cached/configured/DVPP/physical allocation admission, failure rollback, allocation/free alias deduplication, physical retain lifetimes, concurrent free/address reuse, per-card ownership, threads and fork. Each case runs in a separate process with a timeout. |
+| `test/preload/run.py` | No eager SDK dependencies; ordinary shell/tool startup without CANN, preserved signal handlers, no preload-time supervisor, passive hooks, successful retry after global/local `dlopen`, and cached calls surviving the application's `dlclose`. |
 | `test/process_local.sh` | Actual per-process cache, concurrent initialization and real fork cases. |
 | `test/spatial_cpu/run.py` | Actual built Rust hook library preloaded into a C client with fake ACL: ceil budgets, resets, API failures, device/context switching and fork handling. |
+| `test/host_args.sh` | HostArgs ABI, capture, admission, nested delegation, per-card routing, threads/fork, and cached launch calls after the application releases its ACL handle. |
 | Documentation links | Local Markdown link destinations in the root READMEs and `docs/`; no external requests or rendered-anchor checks. |
 
 The [workflow](../.github/workflows/ci.yml) runs on pull requests, pushes to `main`
@@ -188,7 +190,7 @@ Dockerfile 下载匹配目标架构的官方 HDK 包，并核对其中固定的�
 不安装内核驱动；官方配套表包含 CANN 8.5.2 与 HDK 25.5.x，镜像源码、下载地址及
 配套表链接见英文部分。构建使用 `/usr/local/Ascend/cann-8.5.2/lib64` 下的真实
 runtime 库，以及 `/usr/local/Ascend/driver/lib64/driver` 下的 DCMI 库和依赖，
-产物检查会核对实际解析路径。这里的驱动版本只说明构建时的用户态库；宿主机驱动
+产物检查会核对真实 SDK 导出，并拒绝 `libvnpu.so` 的 CANN/runtime/DCMI 硬依赖。这里的驱动版本只说明构建时的用户态库；宿主机驱动
 应与业务 CANN 和硬件配套。通过 `make build-in-docker OUT_DIR=out` 可修改导出目录。
 
 导出产物包括：
@@ -200,7 +202,8 @@ runtime 库，以及 `/usr/local/Ascend/driver/lib64/driver` 下的 DCMI 库和�
 | `dist/SHA256SUMS` | 库和构建信息的校验和。 |
 
 导出前，[产物检查脚本](../scripts/ci/verify-release.py) 核对 ELF 架构与共享库类型、
-hook 与 SDK 导出符号，以及 `ldd -r` 是否正确解析到指定的真实 runtime/DCMI 库，
+hook 与 SDK 导出符号，以及 `ldd -r` 是否能解析系统依赖；CANN/runtime/DCMI
+按需解析，不能出现在 `DT_NEEDED` 中，
 要求并记录 CANN 提供空分所需 API，因为空分已是默认策略。
 这些检查不会初始化 CANN/DCMI 或执行 NPU 算子。
 
@@ -227,15 +230,14 @@ python3 scripts/ci/check-doc-links.py
 ```
 
 这些检查无需 CANN SDK、Ascend 驱动、NPU、Docker 服务或集群凭据。
-格式检查覆盖根工作区的两个生产 crate，不依赖 Linux 或 SDK。CPU 脚本先准备测试
-链接库，再执行 `cargo clippy --workspace --all-targets --locked -- -D warnings`，
+格式检查覆盖根工作区的两个生产 crate，不依赖 Linux 或 SDK。CPU 脚本无需 SDK/driver
+链接桩，直接执行 `cargo clippy --workspace --all-targets --locked -- -D warnings`，
 覆盖根工作区及其测试目标，警告作为错误。独立 CPU 测试工作区在后续步骤运行，
 不属于这里的 `--workspace` 范围。
 
-CPU 脚本在临时目录构建，退出时清理，不替换已安装的库。脚本生成的 `libvnpu.so`
-依赖测试用 runtime/DCMI 链接库，不能部署到业务环境；意外进入这些链接桩函数会
-立即中止测试。空分测试使用独立的 fake ACL 后端。
-Clippy 使用这套测试链接环境，不构建或验证可部署的发布产物。
+CPU 脚本在临时目录构建，退出时清理，不替换已安装的库。预加载测试在没有 CANN
+时启动普通命令，核对信号处理器和线程数，并用 global/local 后端验证缺失符号的
+重试。其他集成测试提供独立的 fake SDK。这些 CPU 构建产物未通过真实 SDK 发布校验。
 
 - 格式检查：`cargo fmt --all -- --check` 检查根工作区的两个生产 crate。
 - 工作区 Clippy 和单元测试：对两个 crate 的所有目标运行 Clippy，将警告视为错误；
@@ -244,9 +246,12 @@ Clippy 使用这套测试链接环境，不构建或验证可部署的发布产�
 - Memory：内存扫描、配额、回滚、共享内存 ABI、带超时的 fork 清理；procfs 和 CANN 使用
   明确的测试替身，Linux futex 使用真实实现。
 - Worker：源码链接的准入与 hook 路径，观测锁和 futex 边界；覆盖 Cached/配置/DVPP/物理分配的准入、失败回滚、分配及释放转调去重、物理句柄 retain 生命周期、并发释放时地址复用、每卡归属、线程及 fork。每个用例独立进程并限制超时。
+- Preload：无 SDK 硬依赖、无 CANN 的普通命令启动、保留信号处理器、加载期无 supervisor、
+  未配置时透传、global/local `dlopen` 后的符号重试，以及应用 `dlclose` 后缓存调用仍有效。
 - Process-local：真实缓存实现的并发初始化和 fork。
 - Spatial：预加载实际构建的 Rust 库，通过 fake ACL 验证向上取整、重置、API 错误、
   设备/上下文切换及 fork 行为。
+- HostArgs：ABI、capture、准入、嵌套转调、按卡路由、线程/fork，以及应用释放 ACL 句柄后的缓存调用。
 - 文档：检查根目录 README 与 `docs/` 的本地 Markdown 链接目标；不访问外部链接，
   不检查渲染后的锚点。
 

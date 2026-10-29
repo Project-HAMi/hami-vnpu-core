@@ -213,9 +213,12 @@ impl ManagerConfig {
     }
 }
 
-/// Validate explicit resource settings before a worker can enter the stub path.
-pub fn validate_requested_limits() -> Result<(), String> {
-    let requested = [
+/// System preload alone does not opt an unrelated process into NPU control.
+/// Explicit settings, including invalid or legacy values, must still fail closed.
+pub fn vnpu_configuration_requested() -> bool {
+    [
+        ENV_GLOBAL_SHM_PATH,
+        ENV_LOCAL_SHM_PATH,
         ENV_MEMORY_LIMIT_MB,
         ENV_COMPUTE_LIMIT,
         ENV_SCHED_POLICY,
@@ -225,8 +228,12 @@ pub fn validate_requested_limits() -> Result<(), String> {
         "NPU_OVERDRAFT_ENABLED",
     ]
     .iter()
-    .any(|name| std::env::var_os(name).is_some());
-    if requested {
+    .any(|name| std::env::var_os(name).is_some())
+}
+
+/// Validate explicit resource settings before a worker can enter the stub path.
+pub fn validate_requested_limits() -> Result<(), String> {
+    if vnpu_configuration_requested() {
         ManagerConfig::from_env().map(|_| ())
     } else {
         Ok(())

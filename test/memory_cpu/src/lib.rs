@@ -1,4 +1,6 @@
 #![allow(dead_code, non_snake_case)]
+#[path = "../../../crates/limiter/src/dynamic.rs"]
+pub mod dynamic;
 include!(concat!(env!("OUT_DIR"), "/source.rs"));
 pub mod shmem { include!(concat!(env!("OUT_DIR"), "/shared.rs")); }
 #[macro_export]

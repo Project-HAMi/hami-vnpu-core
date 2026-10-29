@@ -18,6 +18,7 @@ struct Clients {
 // PID-aware storage avoids inherited locks after fork. Each physical card owns
 // its own quota, manager election, timing contexts and allocation handles.
 static CLIENTS: process::ProcessLocal<Clients> = process::ProcessLocal::new();
+static STUB: process::ProcessLocal<SchedulerClient> = process::ProcessLocal::new();
 
 fn fatal(reason: &str) -> ! {
     eprintln!("[hami-vnpu-core] {reason}");
@@ -83,6 +84,9 @@ fn ensure_supervisor(entry: &DeviceClient, physical: u32) {
 }
 
 pub fn npu_limiter() -> &'static SchedulerClient {
+    if !limiter::config::vnpu_configuration_requested() {
+        return STUB.get_or_init(std::process::id(), SchedulerClient::stub);
+    }
     // Apply spatial budgets before resource creation or operator submission.
     spatial::ensure_current_device();
     client_for_physical(current_physical_device())
@@ -91,6 +95,9 @@ pub fn npu_limiter() -> &'static SchedulerClient {
 /// Physical-memory properties can target a card other than the current card.
 /// Resolve the target without changing the application's current context.
 pub fn npu_limiter_for_device(logical: i32) -> &'static SchedulerClient {
+    if !limiter::config::vnpu_configuration_requested() {
+        return STUB.get_or_init(std::process::id(), SchedulerClient::stub);
+    }
     // Physical memory can target a device before it has a compute context.
     // Apply core budgets when the application selects that context or launches.
     if spatial::enabled() {
@@ -163,19 +170,29 @@ pub(crate) fn retire_context(context: u64) {
     }
 }
 
+fn missing_runtime_symbol(name: &str) -> u64 {
+    if limiter::config::vnpu_configuration_requested() {
+        fatal(&format!("cannot find original function: {name}"));
+    }
+    log::debug!("optional Ascend runtime symbol `{name}` is unavailable");
+    u64::MAX
+}
+
 macro_rules! passthrough {
     ($name:expr, ($($sig:tt)*), $($arg:expr),*) => {
         {
-            static REAL: ::std::sync::LazyLock<extern "C" fn($($sig)*) -> u64> =
-                ::std::sync::LazyLock::new(|| unsafe {
-                    let ptr = libc::dlsym(libc::RTLD_NEXT, concat!($name, "\0").as_ptr() as *const libc::c_char);
-                    if ptr.is_null() {
-                        panic!("cannot find original function: {}", $name);
-                    }
-                    std::mem::transmute(ptr)
-                });
-            // println!("in func {:?}", $name);
-            (*REAL)($($arg),*)
+            type Real = unsafe extern "C" fn($($sig)*) -> u64;
+            static REAL: ::std::sync::atomic::AtomicPtr<libc::c_void> =
+                ::std::sync::atomic::AtomicPtr::new(::std::ptr::null_mut());
+            let name = ::std::ffi::CStr::from_bytes_with_nul(concat!($name, "\0").as_bytes())
+                .expect("static hook symbol");
+            match limiter::dynamic::resolve_sdk_symbol(&REAL, name) {
+                Some(address) => {
+                    let real: Real = unsafe { ::std::mem::transmute(address) };
+                    unsafe { real($($arg),*) }
+                }
+                None => crate::missing_runtime_symbol($name),
+            }
         }
     };
 }
@@ -187,5 +204,4 @@ mod memory_extra;
 mod memory_physical;
 mod ownership;
 mod process;
-mod signal_compat;
 pub mod spatial;

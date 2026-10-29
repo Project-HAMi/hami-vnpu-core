@@ -30,11 +30,11 @@ make build-in-docker
 cd dist && sha256sum -c SHA256SUMS
 ```
 
-该流程使用真实的 CANN runtime/DCMI 库完整构建 release 版本，导出
+该流程完整构建 release 版本，并对照真实 CANN runtime/DCMI 库验证 API，导出
 `dist/libvnpu.so`、`dist/build-info.json` 和 `dist/SHA256SUMS`。
 Dockerfile 使用官方 `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11`
 镜像并固定摘要，Rust 固定为 **1.94.0**；下载官方 **HDK 25.5.1** 包并验证 SHA256，
-只提取真实驱动用户态库用于链接，不安装内核驱动。
+只提取真实驱动用户态库用于 API 校验，不安装内核驱动。
 构建环境为 **CANN 8.5.2、Ubuntu 22.04**，支持 **Linux AMD64 和 ARM64**，Make
 默认选择当前主机架构。构建两种架构时，显式选择目标并使用不同的产物目录：
 
@@ -50,8 +50,7 @@ HDK 驱动用户态库版本只说明构建环境，宿主机驱动应与业务 
 编译成功不能直接确定最低兼容 CANN 版本，也不能代替各策略的真机验证。
 产物来源、检查内容和验证范围见[测试与 CI](docs/testing.md)。
 
-如需在已安装真实 CANN/DCMI 开发库的 Linux 主机上直接构建，准备 Rust 1.94.0
-和 C 编译器，按安装包说明初始化 CANN 环境后执行
+也可在 Linux 主机上直接构建，准备 Rust 1.94.0 和 C 编译器后执行
 `cargo build --release --workspace --locked`，产物为 `target/release/libvnpu.so`。
 非标准 SDK 路径见[配置参考](docs/configuration.zh-CN.md)。
 
@@ -61,7 +60,17 @@ HDK 驱动用户态库版本只说明构建环境，宿主机驱动应与业务 
 将同一个可写的宿主机共享目录挂载到参与容器的 `/hami-shared-region`，
 将构建的库挂载到 `/usr/local/lib/libvnpu.so`。
 
-在业务容器内执行：
+将仅用于该业务容器的预加载文件挂载到 `/etc/ld.so.preload`，内容为：
+
+```text
+/usr/local/lib/libvnpu.so
+```
+
+此文件只挂载到业务容器。库在首次 NPU 使用时按需解析 CANN runtime 和 DCMI，
+因此 `bash`、`ls` 等普通命令可以在 CANN 环境准备好之前启动；NPU 应用仍需提供
+兼容的 runtime/driver 库。supervisor 和 logger 也在首次 NPU 使用时启动。
+
+在业务容器内使用框架原有命令启动：
 
 ```sh
 # 同一物理卡 7 上需要协调的负载共享此文件，其他物理卡使用不同文件。
@@ -71,8 +80,11 @@ export NPU_LOCAL_SHM_PATH=/tmp/vnpu-local
 export NPU_MEMORY_LIMIT_MB=10240
 export NPU_COMPUTE_LIMIT=30
 export NPU_SCHED_POLICY=spatial # 默认策略，此处显式写出。
-LD_PRELOAD=/usr/local/lib/libvnpu.so python3 your_model.py
+python3 your_model.py
 ```
+
+本地排障也可以使用 `LD_PRELOAD=/usr/local/lib/libvnpu.so python3 your_model.py`；
+使用容器预加载文件时无需设置该变量。
 
 文件名中的卡号表示物理设备协调范围；业务仍选择容器内的逻辑设备，通常为 `0`。
 包括默认空分策略在内，manager 配置仍要求设置 `NPU_GLOBAL_SHM_PATH`。
