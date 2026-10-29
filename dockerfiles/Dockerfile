@@ -20,7 +20,7 @@ RUN case "${TARGETARCH}/$(uname -m)" in \
     && apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev python3 binutils \
     && rm -rf /var/lib/apt/lists/*
 
-# Extract only real HDK user libraries for linking. No kernel driver is installed.
+# Extract only real HDK user libraries for API verification. No kernel driver is installed.
 # Official download reference: Ascend/docs, _static/package_info.js.
 RUN case "${TARGETARCH}" in \
       amd64) driver_arch=x86-64; driver_sha256=f64012342cdf72d44f527efdef1304af41aedc73b202bf0d91243d21765555f7 ;; \

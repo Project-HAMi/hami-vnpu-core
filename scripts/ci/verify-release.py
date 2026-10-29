@@ -140,12 +140,16 @@ def validate(args):
 
     dynamic = run("readelf", "--dynamic", "--wide", str(library), env=env)
     needed = re.findall(r"\(NEEDED\).*?\[(.*?)\]", dynamic)
-    missing = {"libruntime.so", "libdcmi.so", "libc.so.6"} - set(needed)
+    missing = {"libc.so.6"} - set(needed)
     if missing:
         raise ValueError("missing real SDK/system dependencies: " + ", ".join(sorted(missing)))
     sonames = re.findall(r"\(SONAME\).*?\[(.*?)\]", dynamic)
     if sonames and sonames != ["libvnpu.so"]:
         raise ValueError("unexpected SONAME: " + ", ".join(sonames))
+    # Ordinary processes must start even when CANN/driver libraries are absent.
+    eager = {"libruntime.so", "libascendcl.so", "libdcmi.so"}.intersection(needed)
+    if eager:
+        raise ValueError("unexpected eager SDK dependencies: " + ", ".join(sorted(eager)))
     require_symbols(library, RUNTIME_HOOKS | ACL_HOOKS, env)
     require_symbols(runtime, RUNTIME_LINK_APIS | {
         "rtCtxSetCurrent", "rtStreamCreateWithFlags",
@@ -162,13 +166,6 @@ def validate(args):
     linkage = run("ldd", "-r", str(library), env=env)
     if re.search(r"not found|undefined symbol|symbol lookup error", linkage, re.I):
         raise ValueError("unresolved release dependencies:\n" + linkage)
-    # Ensure ldd actually loaded the SDK selected above, rather than another SDK
-    # or the CPU suite's link stubs earlier in the inherited search path.
-    for name, expected in {"libruntime.so": runtime, "libdcmi.so": dcmi}.items():
-        match = re.search(r"^\s*" + re.escape(name) + r"\s+=>\s+(\S+)", linkage, re.M)
-        if not match or Path(match.group(1)).resolve() != expected:
-            raise ValueError("ldd did not resolve {} to {}".format(name, expected))
-
     return {
         "schema_version": 1,
         "architecture": args.arch,
@@ -189,7 +186,7 @@ def validate(args):
                       "cargo": run("cargo", "--version", env=env).strip()},
         "source_commit": args.source_commit or run("git", "rev-parse", "HEAD", env=env).strip(),
         "dynamic_linkage": linkage,
-        "validation": "ELF, SDK exports and dynamic relocations; no NPU initialized",
+        "validation": "ELF, SDK exports and dynamic relocations; lazy CANN/DCMI resolution; no NPU initialized",
     }
 
 

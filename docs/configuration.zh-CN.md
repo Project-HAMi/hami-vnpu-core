@@ -72,12 +72,14 @@ SHM 字段偏移保持不变，但文件名现在表示物理卡域。监控程�
 
 | 环境变量 | 生效范围 | 含义 |
 | --- | --- | --- |
-| `LD_PRELOAD` | 应用的 Linux 动态加载器 | `libvnpu.so` 的绝对路径，例如 `/opt/hami/libvnpu.so`。启动每个参与控制的应用进程时设置。 |
+| `LD_PRELOAD` | 应用的 Linux 动态加载器 | 容器专用 `/etc/ld.so.preload` 文件的可选替代方式；指定 `libvnpu.so` 的绝对路径，例如 `/opt/hami/libvnpu.so`。 |
 | `LD_LIBRARY_PATH` | 应用/构建加载器 | Linux 通用依赖搜索路径。需能找到匹配的 CANN runtime 和 Ascend driver 库；它是加载器配置，不是配额控制。 |
-| `ASCEND_TOOLKIT_HOME` | 仅构建时 | Toolkit 根目录，默认 `/usr/local/Ascend/ascend-toolkit/latest`；构建添加 `<root>/lib64` 原生库搜索路径。 |
-| `ASCEND_DRIVER_HOME` | 仅构建时 | Driver 根目录，默认 `/usr/local/Ascend/driver`；构建添加 `<root>/lib64/driver` 并链接 `dcmi`。 |
+| `ASCEND_TOOLKIT_HOME` | 发布产物校验 | Toolkit 根目录，默认 `/usr/local/Ascend/ascend-toolkit/latest`；校验读取 `<root>/lib64`。 |
+| `ASCEND_DRIVER_HOME` | 发布产物校验 | Driver 根目录，默认 `/usr/local/Ascend/driver`；校验读取 `<root>/lib64/driver`。 |
 
-库还会链接 CANN `runtime`。请面向目标 Linux 架构构建，并在部署中提供兼容的 runtime/driver 依赖。设置两个构建目录变量不会自动安装这些依赖，也不会设置应用的运行时库搜索路径。
+库不在链接时依赖 CANN runtime/DCMI，只在实际使用时解析 SDK 符号，也支持通过 `RTLD_LOCAL` 加载的 SDK；可选符号缺失后，后续 `dlopen` 成功可再次查找。未配置资源时，预加载保持被动、runtime hook 透传；显式资源配置仍要求有效的 manager 配置。
+
+在业务容器内挂载专用的 `/etc/ld.so.preload` 文件，内容为库的绝对路径，即可让子进程继承注入，无需修改框架启动命令。挂载范围仅限业务容器。启动 NPU 应用前仍需准备兼容的 CANN/driver 库及其搜索路径。上述两个校验目录变量不会安装依赖或设置应用运行时搜索路径。
 
 ## 旧变量迁移
 
@@ -97,4 +99,4 @@ SHM 字段偏移保持不变，但文件名现在表示物理卡域。监控程�
 库不会读取 `NPU_LOCAL_SHM_NAME`。应通过 `NPU_LOCAL_SHM_PATH` 指定文件路径，
 选择本地记账组；只设置名称不会覆盖默认的 `/tmp/vnpu_local_shmem`。
 
-实现来源：[资源解析](../crates/limiter/src/config.rs)、[manager 参数](../crates/limiter/src/manager.rs)、[supervisor](../crates/limiter/src/supervisor.rs)、[worker 与 HBM 记账](../crates/limiter/src/worker.rs)、[日志](../crates/limiter/src/lib.rs)、[构建路径](../crates/limiter/build.rs)。
+实现来源：[资源解析](../crates/limiter/src/config.rs)、[manager 参数](../crates/limiter/src/manager.rs)、[supervisor](../crates/limiter/src/supervisor.rs)、[worker 与 HBM 记账](../crates/limiter/src/worker.rs)、[日志](../crates/limiter/src/supervisor.rs)、[懒加载](../crates/limiter/src/dynamic.rs)。

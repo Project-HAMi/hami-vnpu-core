@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,20 +18,27 @@ struct DcmiProcMemInfo {
     proc_mem_usage: u64,
 }
 
-unsafe extern "C" {
-    fn dcmi_init() -> i32;
-    fn dcmi_get_card_list(card_num: *mut i32, card_list: *mut i32, list_len: i32) -> i32;
-    fn dcmi_get_card_id_device_id_from_phyid(
-        card_id: *mut i32,
-        device_id: *mut i32,
-        physical_device_id: u32,
-    ) -> i32;
-    fn dcmi_get_device_resource_info(
-        card_id: i32,
-        device_id: i32,
-        proc_info: *mut DcmiProcMemInfo,
-        proc_num: *mut i32,
-    ) -> i32;
+macro_rules! dcmi_apis {
+    ($($name:ident($($arg:ident: $ty:ty),*);)+) => {$(
+        unsafe fn $name($($arg: $ty),*) -> i32 {
+            type Real = unsafe extern "C" fn($($ty),*) -> i32;
+            static REAL: AtomicPtr<libc::c_void> = AtomicPtr::new(std::ptr::null_mut());
+            let name = std::ffi::CStr::from_bytes_with_nul(concat!(stringify!($name), "\0").as_bytes())
+                .expect("static DCMI symbol");
+            let Some(address) = crate::dynamic::resolve_dcmi_symbol(&REAL, name) else {
+                return -1;
+            };
+            let real: Real = unsafe { std::mem::transmute(address) };
+            unsafe { real($($arg),*) }
+        }
+    )+};
+}
+
+dcmi_apis! {
+    dcmi_init();
+    dcmi_get_card_list(card_num: *mut i32, card_list: *mut i32, list_len: i32);
+    dcmi_get_card_id_device_id_from_phyid(card_id: *mut i32, device_id: *mut i32, physical_device_id: u32);
+    dcmi_get_device_resource_info(card_id: i32, device_id: i32, proc_info: *mut DcmiProcMemInfo, proc_num: *mut i32);
 }
 
 fn physical_device_location(physical_device_id: u32) -> Option<(i32, i32)> {
@@ -95,13 +102,13 @@ fn observe_physical_device(
 
 /// Discover (card_id, device_id) pairs for all present NPU logic devices.
 fn discover_npu_devices() -> Vec<(i32, i32)> {
-    unsafe {
-        dcmi_init();
+    if unsafe { dcmi_init() } != 0 {
+        return Vec::new();
     }
     let mut card_num: i32 = 0;
     let mut card_list: [i32; 8] = [0; 8];
-    unsafe {
-        dcmi_get_card_list(&mut card_num, card_list.as_mut_ptr(), 8);
+    if unsafe { dcmi_get_card_list(&mut card_num, card_list.as_mut_ptr(), 8) } != 0 {
+        return Vec::new();
     }
     if card_num <= 0 || card_num > 8 {
         return Vec::new();

@@ -1,20 +1,11 @@
 pub mod config;
+pub mod dynamic;
 pub mod externed_api;
 pub mod manager;
 pub mod overdraft;
 pub mod shmem;
 pub mod supervisor;
 pub mod worker;
-
-use ctor::ctor;
-
-#[ctor]
-fn init_logger() {
-    let _ = env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .parse_default_env()
-        .try_init();
-}
 
 #[macro_export]
 macro_rules! check_rts {

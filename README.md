@@ -33,12 +33,12 @@ make build-in-docker
 cd dist && sha256sum -c SHA256SUMS
 ```
 
-This builds the complete release library against real CANN runtime/DCMI libraries
-and exports `dist/libvnpu.so`, `dist/build-info.json` and `dist/SHA256SUMS`.
+This builds the complete release library, verifies its APIs against real CANN
+runtime/DCMI libraries, and exports `dist/libvnpu.so`, `dist/build-info.json` and `dist/SHA256SUMS`.
 The Dockerfile uses the official `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11`
 image, pinned by digest, and Rust **1.94.0**. It downloads the official **HDK 25.5.1**
 package, verifies its SHA256 and extracts the real driver user libraries for
-linking; it does not install a kernel driver. The build environment is
+API verification; it does not install a kernel driver. The build environment is
 **CANN 8.5.2 on Ubuntu 22.04** and supports **Linux AMD64 and ARM64**. The Make
 target selects the host architecture by default. Select a target and separate
 output directories explicitly when building both:
@@ -72,7 +72,18 @@ libraries available. Mount a writable host directory at `/hami-shared-region` in
 each participating container on the node, and mount the built library at
 `/usr/local/lib/libvnpu.so`.
 
-Inside the workload container:
+Mount a container-specific file at `/etc/ld.so.preload` with this content:
+
+```text
+/usr/local/lib/libvnpu.so
+```
+
+Mount this file only into workload containers. The library resolves CANN/runtime
+and DCMI on first NPU use, so ordinary commands such as `bash` and `ls` can start
+before the CANN environment is prepared. NPU applications still need compatible
+runtime/driver libraries. The supervisor and logger also start on first NPU use.
+
+Inside the workload container, launch the framework with its normal command:
 
 ```sh
 # Shared file for workloads coordinating on physical card 7; use a different file for another card.
@@ -82,8 +93,11 @@ export NPU_LOCAL_SHM_PATH=/tmp/vnpu-local
 export NPU_MEMORY_LIMIT_MB=10240
 export NPU_COMPUTE_LIMIT=30
 export NPU_SCHED_POLICY=spatial # Default policy; shown explicitly for clarity.
-LD_PRELOAD=/usr/local/lib/libvnpu.so python3 your_model.py
+python3 your_model.py
 ```
+
+For local diagnostics, `LD_PRELOAD=/usr/local/lib/libvnpu.so python3 your_model.py`
+is also supported; it is not required with the container preload file.
 
 The card number identifies the physical coordination domain; the application
 still selects its container-local logical device, commonly `0`.

@@ -1,6 +1,8 @@
 #![allow(dead_code, non_snake_case)]
 mod wait_observer;
 extern crate self as limiter;
+#[path = "../../../crates/limiter/src/dynamic.rs"]
+pub mod dynamic;
 #[macro_export]
 macro_rules! check_rts { ($call:expr) => {{ ($call) as u32 }}; }
 macro_rules! passthrough {

@@ -47,8 +47,9 @@ fn policy() -> &'static Policy {
     let pid = std::process::id();
     let policy = POLICY.get_or_init(pid, || {
         // Other policies must not require any of the optional resource APIs.
-        let spatial =
-            SchedPolicy::from_env().unwrap_or_else(|error| fatal(&error)) == SchedPolicy::Spatial;
+        let spatial = limiter::config::vnpu_configuration_requested()
+            && SchedPolicy::from_env().unwrap_or_else(|error| fatal(&error))
+                == SchedPolicy::Spatial;
         let percent = if spatial {
             let cfg = ManagerConfig::from_env().unwrap_or_else(|error| fatal(&error));
             if cfg.sched_policy != SchedPolicy::Spatial {
@@ -127,10 +128,7 @@ unsafe fn symbol<T: Copy>(name: &CStr) -> T {
 }
 
 unsafe fn optional_symbol<T: Copy>(name: &CStr) -> Option<T> {
-    let address = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
-    if address.is_null() {
-        return None;
-    }
+    let address = limiter::dynamic::sdk_symbol(name)?;
     // Each call site supplies the exact function-pointer type from acl_rt.h.
     assert_eq!(std::mem::size_of::<T>(), std::mem::size_of_val(&address));
     Some(unsafe { std::mem::transmute_copy(&address) })

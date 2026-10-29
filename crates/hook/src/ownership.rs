@@ -88,10 +88,8 @@ fn records() -> MutexGuard<'static, Records> {
 }
 
 unsafe fn symbol<T: Copy>(name: &CStr) -> T {
-    let address = unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr()) };
-    if address.is_null() {
-        crate::spatial::fatal(name.to_str().unwrap_or("missing CANN lifecycle API"));
-    }
+    let address = limiter::dynamic::sdk_symbol(name)
+        .unwrap_or_else(|| crate::spatial::fatal(name.to_str().unwrap_or("missing CANN symbol")));
     assert_eq!(std::mem::size_of::<T>(), std::mem::size_of_val(&address));
     unsafe { std::mem::transmute_copy(&address) }
 }

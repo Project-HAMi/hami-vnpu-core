@@ -1,8 +1,7 @@
 //! In-process manager supervisor.
 //!
-//! The manager daemon no longer runs as a separate binary. Instead every process
-//! that loads `libvnpu.so` spawns a lightweight supervisor thread (see the ctor in
-//! the `hook` crate). Supervisors in the same physical-card domain
+//! A process starts a lightweight supervisor on its first intercepted NPU use,
+//! after leaving the dynamic loader. Supervisors in the same physical-card domain
 //! race to become the *single* manager via a CAS on `LocalContainerShmem::manager_pid`.
 //! The winner runs `ContainerManager::run()`; the losers stand by and watch, ready to
 //! take over if the current manager dies. This guarantees one manager per Pod/card
@@ -47,6 +46,10 @@ pub fn run_for_device(physical_device_id: u32) {
 }
 
 fn run_configured(physical_device_id: Option<u32>) {
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .try_init();
     block_all_signals();
 
     let my_pid = std::process::id() as i32;
