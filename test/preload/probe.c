@@ -2,11 +2,15 @@
 #include <assert.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
 
 static volatile sig_atomic_t delivered;
 
@@ -16,11 +20,42 @@ struct ConcurrentCall {
     pthread_barrier_t barrier;
 };
 
+struct ConcurrentWorker {
+    struct ConcurrentCall *call;
+    pid_t tid;
+};
+
 static void *concurrent_free(void *argument) {
-    struct ConcurrentCall *call = argument;
+    struct ConcurrentWorker *worker = argument;
+    worker->tid = (pid_t)syscall(SYS_gettid);
+    assert(worker->tid > 0);
+    struct ConcurrentCall *call = worker->call;
     pthread_barrier_wait(&call->barrier);
     assert(call->release(0) == 73);
     return NULL;
+}
+
+static void wait_for_worker_cleanup(pid_t tid) {
+    char path[64];
+    int length = snprintf(path, sizeof(path), "/proc/self/task/%ld", (long)tid);
+    assert(length > 0 && (size_t)length < sizeof(path));
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_MONOTONIC, &deadline) == 0);
+    deadline.tv_sec++;
+    const struct timespec pause = {.tv_nsec = 1000000};
+    // pthread_join can return before the kernel removes the worker from procfs.
+    // Wait only for our own workers; unexpected SDK threads must still fail below.
+    while (access(path, F_OK) == 0) {
+        struct timespec now;
+        assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            fprintf(stderr, "joined worker %ld is still visible in procfs\n", (long)tid);
+            assert(0);
+        }
+        nanosleep(&pause, NULL);
+    }
+    assert(errno == ENOENT);
 }
 
 static void handler(int signal) {
@@ -74,12 +109,15 @@ int main(int argc, char **argv) {
     // Race first resolution so losing cache publishers also release their references.
     struct ConcurrentCall call = {.release = release};
     pthread_t threads[8];
+    struct ConcurrentWorker workers[8];
     assert(pthread_barrier_init(&call.barrier, NULL, 8) == 0);
     for (unsigned index = 0; index < 8; index++) {
-        assert(pthread_create(&threads[index], NULL, concurrent_free, &call) == 0);
+        workers[index].call = &call;
+        assert(pthread_create(&threads[index], NULL, concurrent_free, &workers[index]) == 0);
     }
     for (unsigned index = 0; index < 8; index++) {
         assert(pthread_join(threads[index], NULL) == 0);
+        wait_for_worker_cleanup(workers[index].tid);
     }
     assert(pthread_barrier_destroy(&call.barrier) == 0);
     assert(release(0) == 73);
