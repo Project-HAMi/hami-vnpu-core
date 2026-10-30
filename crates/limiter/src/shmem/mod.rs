@@ -106,16 +106,36 @@ pub struct LocalContainerShmem {
     pub overdraft_limit: AtomicU32,
     pub overdraft_timeout_us: AtomicU64,
     pub overdraft_poll_interval_us: AtomicU64,
+
+    // Append only: keep report/process/overdraft offsets used by monitors stable.
+    // A worker writes its monotonic entry timestamp before device synchronization;
+    // the report's release-store of batch_id publishes it with the completed report.
+    pub measurement_started_us: [AtomicU64; MAX_WORKERS],
 }
 
 const _: () = {
     assert!(std::mem::size_of::<GlobalManagerSlot>() == 40);
     assert!(std::mem::size_of::<GlobalRegistry>() == 2848);
-    assert!(std::mem::size_of::<LocalContainerShmem>() == 6256);
+    assert!(std::mem::size_of::<LocalContainerShmem>() == 6512);
     assert!(std::mem::offset_of!(GlobalManagerSlot, compute_limit) == 32);
     assert!(std::mem::offset_of!(LocalContainerShmem, compute_limit) == 16);
     assert!(std::mem::offset_of!(LocalContainerShmem, reports) == 56);
     assert!(std::mem::offset_of!(LocalContainerShmem, overdraft_pool) == 6224);
     assert!(std::mem::offset_of!(LocalContainerShmem, procs) == 1080);
     assert!(std::mem::offset_of!(LocalContainerShmem, manager_generation) == 6204);
+    assert!(std::mem::offset_of!(LocalContainerShmem, measurement_started_us) == 6256);
 };
+
+/// Comparable across processes on the same host, unaffected by wall-clock changes.
+/// Zero means no usable timestamp; callers must reject that timing sample.
+pub fn monotonic_time_us() -> u64 {
+    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return 0;
+    }
+    u64::try_from(time.tv_sec)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000))
+        .and_then(|micros| micros.checked_add(time.tv_nsec as u64 / 1000))
+        .unwrap_or(0)
+}

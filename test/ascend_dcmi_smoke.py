@@ -47,7 +47,7 @@ def local_sample(path):
         data = matches[0].read_bytes()
     except FileNotFoundError:
         return None
-    if len(data) < 6256:
+    if len(data) < 6512:
         return None
     return {"state": struct.unpack_from("<I", data, 24)[0],
             "batch": struct.unpack_from("<Q", data, 32)[0],

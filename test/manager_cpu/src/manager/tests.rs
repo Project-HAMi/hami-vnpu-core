@@ -132,9 +132,17 @@ fn saturated_run_budget_is_bounded_instead_of_waiting_for_hours() {
 
 fn report(m: &ContainerManager, index: usize, batch: u64, start: u64, duration: u64) {
     let slot = &m.local.reports[index];
+    if m.local.measurement_started_us[index].load(Ordering::Acquire) == 0 {
+        begin_measurement(m, index);
+    }
     slot.cpu_start_us.store(start, Ordering::Relaxed);
     slot.duration_us.store(duration, Ordering::Relaxed);
     slot.batch_id.store(batch, Ordering::Release);
+}
+
+fn begin_measurement(m: &ContainerManager, index: usize) {
+    m.local.measurement_started_us[index]
+        .store(crate::shmem::monotonic_time_us(), Ordering::Release);
 }
 
 #[test]
@@ -225,14 +233,44 @@ fn completed_reported_batch_still_updates_execution_statistics() {
         let batch = m.local.batch_id.load(Ordering::Acquire);
         m.local.active_workers.store(1, Ordering::Release);
         m.local.reports[0].occupied.store(1, Ordering::Release);
+        m.local.tokens_remaining.store(0, Ordering::Release);
+        wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
         report(&m, 0, batch, get_time_us(), 2500);
         m.local.reported_count.store(1, Ordering::Release);
-        m.local.tokens_remaining.store(0, Ordering::Release);
         run.join().unwrap()
     });
     assert_eq!(result, (2500, plan.tokens));
     m.update_local_stats(result.0, result.1);
     assert!(m.current_avg_us < 500);
+}
+
+#[test]
+fn timely_measurement_with_slow_device_drain_updates_execution_statistics() {
+    let mut m = manager(20.0, false, 500);
+    let plan = SharePlan {
+        tokens: 1,
+        time_limit_us: MAX_RUN_US,
+        expected_run_us: 500,
+        rest_wait_us: 0,
+        anchor_speed_us: 500,
+    };
+    let result = thread::scope(|scope| {
+        let run = scope.spawn(|| m.run_local_round(&plan));
+        wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_RUNNING);
+        let batch = m.local.batch_id.load(Ordering::Acquire);
+        m.local.active_workers.store(1, Ordering::Release);
+        m.local.reports[0].occupied.store(1, Ordering::Release);
+        m.local.tokens_remaining.store(0, Ordering::Release);
+        wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
+        // Measurement begins promptly, but synchronization drains 40ms of device work.
+        begin_measurement(&m, 0);
+        thread::sleep(Duration::from_millis(40));
+        report(&m, 0, batch, get_time_us() - 40_000, 40_000);
+        run.join().unwrap()
+    });
+    assert_eq!(result, (40_000, 1));
+    m.update_local_stats(result.0, result.1);
+    assert!(m.current_avg_us > 500, "valid device time must train the average");
 }
 
 #[test]
@@ -379,9 +417,10 @@ fn mixed_timed_and_untimed_workers_do_not_train_a_partial_average() {
         for slot in &m.local.reports[..2] {
             slot.occupied.store(1, Ordering::Release);
         }
+        m.local.tokens_remaining.store(0, Ordering::Release);
+        wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
         report(&m, 0, batch, get_time_us(), 2500);
         report(&m, 1, batch, get_time_us(), 0);
-        m.local.tokens_remaining.store(0, Ordering::Release);
         assert_eq!(run.join().unwrap(), (0, 0));
     });
 }
@@ -611,4 +650,47 @@ fn replaced_spatial_manager_cannot_refresh_or_clear_successors_state() {
     drop(m);
     assert_eq!(local.manager_pid.load(Ordering::Acquire), std::process::id() as i32);
     assert_eq!(local.manager_heartbeat.load(Ordering::Acquire), 123);
+}
+
+#[test]
+fn measurement_entry_validation_rejects_missing_stale_and_late_timestamps() {
+    let m = manager(20.0, false, 500);
+    m.local.reports[0].occupied.store(1, Ordering::Release);
+    report(&m, 0, 42, 1, 40_000);
+    for (entry, accepted) in [(0, false), (999, false), (1000, true),
+                              (1000 + NO_PROGRESS_US, true),
+                              (1001 + NO_PROGRESS_US, false)] {
+        m.local.measurement_started_us[0].store(entry, Ordering::Release);
+        assert_eq!(m.measurements_started_promptly(42, 1000), accepted, "entry={entry}");
+    }
+    assert!(!m.measurements_started_promptly(42, 0));
+    // Another context in the same batch must not hide a missing or late entry.
+    m.local.measurement_started_us[0].store(1000, Ordering::Release);
+    m.local.reports[1].occupied.store(1, Ordering::Release);
+    report(&m, 1, 42, 1, 40_000);
+    m.local.measurement_started_us[1].store(0, Ordering::Release);
+    assert!(!m.measurements_started_promptly(42, 1000));
+    m.local.measurement_started_us[1].store(1001 + NO_PROGRESS_US, Ordering::Release);
+    assert!(!m.measurements_started_promptly(42, 1000));
+}
+
+#[test]
+fn timely_entry_without_device_completion_still_has_a_bounded_report_wait() {
+    let m = manager(20.0, false, 500);
+    let plan = SharePlan { tokens: 1, time_limit_us: MAX_RUN_US,
+        expected_run_us: 500, rest_wait_us: 0, anchor_speed_us: 500 };
+    thread::scope(|scope| {
+        let run = scope.spawn(|| m.run_local_round(&plan));
+        wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_RUNNING);
+        m.local.active_workers.store(1, Ordering::Release);
+        m.local.reports[0].occupied.store(1, Ordering::Release);
+        m.local.tokens_remaining.store(0, Ordering::Release);
+        wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
+        begin_measurement(&m, 0);
+        let started = Instant::now();
+        assert_eq!(run.join().unwrap(), (0, 0));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    });
+    assert_eq!(m.local.state.load(Ordering::Acquire), STATE_IDLE);
+    assert_eq!(m.current_avg_us, DEFAULT_AVG_US);
 }

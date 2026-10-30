@@ -17,15 +17,20 @@ managers, including when `/etc/ld.so.preload` injects the library into the helpe
 Time-sliced admission rounds have a five-second upper bound and completion-report
 waits are capped at 500 ms. Losing progress after work starts releases the turn;
 idle, incomplete, untimed or delayed reports do not train execution-time estimates.
+The five-millisecond reporting-delay check measures each worker's entry into
+measurement, before any SDK synchronization. Device-drain time after entry may
+exceed five milliseconds without losing the sample, but must still complete
+within the 500 ms report wait. Missing or stale entry timestamps reject the sample.
 Waiting managers refresh their own liveness without extending another owner's
 heartbeat. Generation checks fence replaced managers and reused slots. Spatial
 managers maintain memory state without joining compute rotation. These deadlines
 do not preempt a kernel already submitted to the device.
 
-An upgrade from the original queue protocol or fenced protocol 2 requires a
-coordinated restart. Protocol 3 preserves the 2848-byte global layout and the
-device-plugin process-memory offsets. Local mappings contain the appended
-overdraft fields (6256 bytes). Equal file sizes do not imply protocol compatibility.
+An upgrade from the original queue protocol or fenced protocols 2/3 requires a
+coordinated restart. Protocol 4 preserves the 2848-byte global layout and the
+device-plugin process-memory offsets. Local mappings are 6512 bytes: the previous
+6256-byte prefix is unchanged, followed by 32 per-worker measurement-entry timestamps.
+Equal file sizes do not imply protocol compatibility.
 An incompatible registry exits with code 78 instead of starting an unlimited
 worker; repeatedly restarting a Pod cannot repair that registry.
 
@@ -63,9 +68,12 @@ DCMI 查询在全新进程中执行，由独立 subreaper 超时终止并回收�
 空闲、不完整、未计时及延迟报告不更新执行时间估计。等待中的 manager 单独维持心跳，
 代次校验防止被替换的 manager 修改继任者状态。spatial manager 只维护内存状态，
 不参与计算轮转。这些期限不会抢占已提交的设备算子。
+五毫秒延迟判断只计算 worker 进入测量前的等待；进入测量后的设备同步即使超过五毫秒，
+仍可在 500 毫秒报告期限内提交有效样本。缺失或过期的测量入口时间戳会使样本失效。
 
-旧队列协议及协议 2 升级到协议 3 必须协调停机。全局结构仍为 2848 字节，
-本地结构含 overdraft 字段，为 6256 字节；文件大小相同不代表协议兼容。
+旧队列协议及协议 2/3 升级到协议 4 必须协调停机。全局结构仍为 2848 字节，
+本地结构为 6512 字节，保留原有 6256 字节前缀，尾部追加 32 个 worker 的测量入口时间戳。
+文件大小相同不代表协议兼容。
 不兼容时进程以 78 退出，单独反复重启 Pod 无法恢复。
 
 按上述步骤备份配置、暂停同卡全部服务、确认映射退出，再安装成对产物并归档旧共享状态。

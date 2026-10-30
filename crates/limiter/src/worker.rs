@@ -436,6 +436,7 @@ impl SchedulerClient {
                 report.batch_id.store(0, Ordering::Relaxed);
                 report.cpu_start_us.store(0, Ordering::Relaxed);
                 report.duration_us.store(0, Ordering::Relaxed);
+                shmem.measurement_started_us[timing.my_slot_idx].store(0, Ordering::Relaxed);
             }
             report.pid.store(0, Ordering::Release);
             // Preserve a completed report until its manager has consumed this round.
@@ -478,6 +479,7 @@ impl SchedulerClient {
                 slot.batch_id.store(0, Ordering::Relaxed);
                 slot.duration_us.store(0, Ordering::Relaxed);
                 slot.cpu_start_us.store(0, Ordering::Relaxed);
+                shmem.measurement_started_us[i].store(0, Ordering::Relaxed);
                 slot.pid.store(pid, Ordering::Release);
                 return i;
             }
@@ -487,6 +489,7 @@ impl SchedulerClient {
                     .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed)
                     .is_ok()
                 {
+                    shmem.measurement_started_us[i].store(0, Ordering::Relaxed);
                     slot.pid.store(pid, Ordering::Relaxed);
                     return i;
                 }
@@ -500,6 +503,7 @@ impl SchedulerClient {
                     slot.batch_id.store(0, Ordering::Relaxed);
                     slot.cpu_start_us.store(0, Ordering::Relaxed);
                     slot.duration_us.store(0, Ordering::Relaxed);
+                    shmem.measurement_started_us[i].store(0, Ordering::Relaxed);
                     return i;
                 }
                 // Lost the race — slot_pid already changed, continue searching
@@ -696,6 +700,8 @@ impl SchedulerClient {
 
                             lock.current_batch_id = global_batch;
                             lock.batch_active = true;
+                            self.inner.shmem.measurement_started_us[timing.my_slot_idx]
+                                .store(0, Ordering::Relaxed);
 
                             // Notify Manager
                             self.inner
@@ -788,6 +794,10 @@ impl SchedulerClient {
     }
 
     fn measure_and_report_batch(&self, timing: &ContextTiming, lock: &mut InnerLock) {
+        // Capture before any SDK call can wait for the device. Completion of the
+        // report later publishes this timestamp through its batch_id release-store.
+        self.inner.shmem.measurement_started_us[timing.my_slot_idx]
+            .store(shmem::monotonic_time_us(), Ordering::Release);
         let mut duration_us: u64 = 0;
         let mut untimed_drain = false;
 

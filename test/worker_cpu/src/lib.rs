@@ -79,6 +79,7 @@ pub mod externed_api {
         }
     }
     static NEXT: AtomicU64 = AtomicU64::new(100);
+    pub static SYNC_OBSERVER: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
     pub static CAPTURE_STATUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     pub const RT_ERROR_NONE: u64 = 0;
     pub const RT_ERROR_MEMORY_ALLOCATION: u64 = 207001;
@@ -86,7 +87,7 @@ pub mod externed_api {
     pub unsafe fn rtEventCreate(out: *mut u64) -> usize { unsafe { *out = NEXT.fetch_add(1,Ordering::Relaxed); } track_resource(unsafe { *out }); trace(Call::EventCreate(CONTEXT.get())); 0 }
     pub unsafe fn rtEventRecord(event: u64, stream: u64) -> usize { check_resource(event); check_resource(stream); trace(Call::Record(event,stream)); 0 }
     pub unsafe fn rtStreamWaitEvent(stream: u64, event: u64) -> usize { check_resource(stream); check_resource(event); trace(Call::Wait(stream,event)); 0 }
-    pub unsafe fn rtStreamSynchronize(stream: u64) -> i32 { check_resource(stream); trace(Call::StreamSync(stream)); 0 }
+    pub unsafe fn rtStreamSynchronize(stream: u64) -> i32 { check_resource(stream); trace(Call::StreamSync(stream)); if let Some(observe) = SYNC_OBSERVER.get() { observe(); } 0 }
     pub unsafe fn rtDeviceSynchronize() -> i32 { trace(Call::DeviceSync); 0 }
     pub unsafe fn rtEventElapsedTime(out: *mut f32, first: u64,last:u64) -> usize { check_resource(first); check_resource(last); trace(Call::Elapsed(first,last)); unsafe { *out = 2.5; } 0 }
     std::thread_local! { static CONTEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }

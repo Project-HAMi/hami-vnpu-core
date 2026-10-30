@@ -85,7 +85,7 @@ const STALE_MANAGER_US: u64 = 3_000_000;
 // Cap a complete run/rest period without changing ordinary 500us seed budgets.
 const MAX_RUN_US: u64 = 5_000_000;
 const NO_PROGRESS_US: u64 = 5_000;
-pub(crate) const REGISTRY_PROTOCOL: u32 = 0x564e_5033;
+pub(crate) const REGISTRY_PROTOCOL: u32 = 0x564e_5034;
 // How long the manager waits in MEASURING for workers to report.
 // Was 50ms, which was too short when kernels take hundreds of ms; make it longer
 // and also extend dynamically in the run loop.
@@ -589,7 +589,7 @@ impl ContainerManager {
             }
             thread::sleep(Duration::from_micros(200));
         };
-        let consumed = {
+        let (consumed, measurement_start_us) = {
             let Some(_guard) = self.transaction() else {
                 return (0, 0);
             };
@@ -597,9 +597,12 @@ impl ContainerManager {
                 return (0, 0);
             }
             let remaining = self.local.tokens_remaining.swap(0, Ordering::AcqRel);
+            // Capture before publishing MEASURING: a worker may enter as soon as
+            // it observes that state, before this manager resumes polling.
+            let measurement_start_us = crate::shmem::monotonic_time_us();
             self.local.state.store(STATE_MEASURING, Ordering::Release);
             futex::wake_all(&self.local.state);
-            plan.tokens.saturating_sub(remaining)
+            (plan.tokens.saturating_sub(remaining), measurement_start_us)
         };
         // A worker may be inside CANN or idle between requests, unable to report.
         // Bound this wait; do not turn missing/late reports into a timing sample.
@@ -633,6 +636,23 @@ impl ContainerManager {
         if !self.has_turn() {
             return (0, 0);
         }
+        // Read the completed reports before publishing IDLE, which permits
+        // retired contexts to release/reuse their report slots and entry stamps.
+        // Only pre-entry delay is idle time; the bounded device drain is valid.
+        let measured = if timely_observations
+            && complete
+            && all_reported
+            && self.measurements_started_promptly(batch, measurement_start_us)
+            && !self.local.reports.iter().any(|report| {
+                report.occupied.load(Ordering::Acquire) != 0
+                    && report.batch_id.load(Ordering::Acquire) == batch
+                    && report.duration_us.load(Ordering::Relaxed) == 0
+            }) {
+            self.aggregate_local_times(batch, consumed)
+        } else {
+            // Missing or untimed completions cannot train a partial average.
+            (0, 0)
+        };
         self.local.state.store(STATE_IDLE, Ordering::Release);
         if self.sched_policy == SchedPolicy::Overdraft
             && let Some(round) = overdraft_round
@@ -640,31 +660,32 @@ impl ContainerManager {
             self.local.overdraft_pool.open_idle(round);
         }
         futex::wake_all(&self.local.state);
-        // Event endpoints are recorded by a later hook. A delayed report can
-        // include idle time after the final launch, even if all tokens were used.
-        // Conservatively keep the previous estimate when completion reporting
-        // was not prompt; device draining/report completion still happened.
-        if !timely_observations
-            || !complete
-            || !all_reported
-            || report_start.elapsed().as_micros() > NO_PROGRESS_US as u128
-        {
-            return (0, 0);
-        }
-        // The token total includes every participant. An untimed completion
-        // would make a partial duration look like the cost of all those tokens.
-        if self.local.reports.iter().any(|report| {
-            report.occupied.load(Ordering::Acquire) != 0
-                && report.batch_id.load(Ordering::Acquire) == batch
-                && report.duration_us.load(Ordering::Relaxed) == 0
-        }) {
-            return (0, 0);
-        }
-        let measured = self.aggregate_local_times(batch, consumed);
         if measured.0 > MAX_RUN_US + LOCAL_REPORT_GRACE_MS * 1000 {
             return (0, 0);
         }
         measured
+    }
+
+    fn measurements_started_promptly(&self, batch: u64, phase_start_us: u64) -> bool {
+        phase_start_us != 0
+            && self
+                .local
+                .reports
+                .iter()
+                .enumerate()
+                .all(|(index, report)| {
+                    if report.occupied.load(Ordering::Acquire) == 0
+                        || report.batch_id.load(Ordering::Acquire) != batch
+                    {
+                        return true;
+                    }
+                    // Acquiring the completed batch also publishes its entry stamp.
+                    let entry = self.local.measurement_started_us[index].load(Ordering::Relaxed);
+                    entry != 0
+                        && entry
+                            .checked_sub(phase_start_us)
+                            .is_some_and(|delay| delay <= NO_PROGRESS_US)
+                })
     }
 
     fn honor_fixed_rest_wait(&mut self) -> bool {
