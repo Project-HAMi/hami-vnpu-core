@@ -255,6 +255,7 @@ CPU 脚本在临时目录构建，退出时清理，不替换已安装的库。�
 - Spatial：预加载实际构建的 Rust 库，通过 fake ACL 验证向上取整、重置、API 错误、
   设备/上下文切换及 fork 行为。
 - HostArgs：ABI、capture、准入、嵌套转调、按卡路由、线程/fork，以及应用释放 ACL 句柄后的缓存调用。
+- DCMI helper：使用 fake DCMI 驱动运行实际 helper/拦截库，覆盖物理卡/芯片选择、错误、超时、子孙进程回收、helper 旁路、旧协议拒绝、SHM 别名，以及 chdir 后的相对路径。
 - 文档：检查根目录 README 与 `docs/` 的本地 Markdown 链接目标；不访问外部链接，
   不检查渲染后的锚点。
 
@@ -275,4 +276,4 @@ Core 发布前，应在目标 CANN/驱动环境核对实际选卡和核心预算
 并在完整预热后测量业务负载。验证所选策略和资源配置，将结果与 CI 分开记录。
 [已有空分验证](spatial-policy.md) 单独说明了其硬件与负载范围。
 
-See [scheduler upgrade and hardware validation](scheduler-upgrade.md) before deploying the paired artifacts.
+部署配套产物前，请参阅[调度升级与真机验证](scheduler-upgrade.md)。
