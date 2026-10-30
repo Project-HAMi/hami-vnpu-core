@@ -15,10 +15,13 @@ pub mod registry_lock;
 pub mod shmem;
 #[path = "../../../crates/limiter/src/supervisor.rs"]
 pub mod supervisor;
-// The manager tests do not run the periodic process reaper.
+// These tests do not run periodic process scanning or slot reclamation.
 pub mod worker {
     pub fn proc_alive(_: i32) -> bool {
         panic!("unexpected process scan");
+    }
+    pub fn reclaim_dead_process_slots(_: &crate::shmem::LocalContainerShmem) {
+        panic!("unexpected process reclamation");
     }
 }
 pub mod manager {

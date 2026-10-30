@@ -73,18 +73,20 @@ fn other_live_zombie_and_unreadable_pids_keep_existing_checks() {
     c.inner.shmem.memory_used.store(100, Ordering::Release);
     proc_mock::set(&[(me(), Answer::Unreadable), (other(1), Answer::Live),
                     (other(2), Answer::Zombie), (other(3), Answer::Unreadable)]);
-    assert_eq!(30, c.recalculate_usage());
+    assert_eq!(70, c.recalculate_usage());
     assert_eq!(vec![other(1), other(2), other(3)], proc_mock::calls());
-    assert_eq!(30, c.inner.shmem.memory_used.load(Ordering::Acquire));
+    assert_eq!(70, c.inner.shmem.memory_used.load(Ordering::Acquire));
     assert_eq!(other(1), c.inner.shmem.procs[1].pid.load(Ordering::Acquire));
-    for i in [2, 3] {
+    for i in [2] {
         assert_eq!(0, c.inner.shmem.procs[i].pid.load(Ordering::Acquire));
         assert_eq!(0, c.inner.shmem.procs[i].is_active.load(Ordering::Acquire));
         assert_eq!(0, c.inner.shmem.procs[i].hbm_used[0].load(Ordering::Acquire));
     }
-    proc_mock::set(&[(other(1), Answer::Live)]);
-    assert_eq!(30, c.recalculate_usage());
-    assert_eq!(vec![other(1)], proc_mock::calls()); // Reaped/pid0 slots are not read or refunded twice.
+    assert_eq!(other(3), c.inner.shmem.procs[3].pid.load(Ordering::Acquire));
+    assert_eq!(40, c.inner.shmem.procs[3].hbm_used[0].load(Ordering::Acquire));
+    proc_mock::set(&[(other(1), Answer::Live), (other(3), Answer::Unreadable)]);
+    assert_eq!(70, c.recalculate_usage());
+    assert_eq!(vec![other(1), other(3)], proc_mock::calls()); // Reaped/pid0 slots are not read or refunded twice.
     assert_compute_unchanged(c.inner.shmem);
 }
 
@@ -105,15 +107,18 @@ fn exemption_uses_current_pid_not_cached_process_slot_index() {
 fn memory_query_preserves_pending_reservations_and_128mib_overhead() {
     let c = client(512 * MIB, 200 * MIB);
     set_slot(c.inner.shmem, 1, other(1), 28 * MIB);
-    c.inner.shmem.memory_used.store(300 * MIB, Ordering::Release); // Includes pending allocations absent from handles.
+    // Reserve the remaining 72 MiB before native handle publication.
+    assert_eq!(RT_ERROR_NONE, c.check_memory_quota(72 * MIB));
+    // A stale compatibility aggregate must not hide owned pending bytes.
+    c.inner.shmem.memory_used.store(228 * MIB, Ordering::Release);
     proc_mock::set(&[(me(), Answer::Unreadable), (other(1), Answer::Live)]);
     let (mut free, mut total) = (usize::MAX, usize::MAX);
     unsafe { c.get_hbm_info(&mut free, &mut total) };
     assert_eq!(512 * MIB as usize, total);
     assert_eq!(84 * MIB as usize, free);
-    assert_eq!(300 * MIB, c.inner.shmem.memory_used.load(Ordering::Acquire));
-    assert_eq!(vec![other(1)], proc_mock::calls());
-    c.inner.shmem.memory_used.store(498 * MIB, Ordering::Release);
+    assert_eq!(300 * MIB, ledger_total(c.inner.shmem).unwrap());
+    assert!(proc_mock::calls().is_empty());
+    assert_eq!(RT_ERROR_NONE, c.check_memory_quota(198 * MIB));
     unsafe { c.get_hbm_info(&mut free, &mut total) };
     assert_eq!(512 * MIB as usize, total);
     assert_eq!(0, free); // 14MiB logical free still reports zero after 128MiB overhead.
@@ -158,7 +163,7 @@ fn lost_reap_cas_preserves_replacement_owner_and_slot_memory() {
     set_slot(c.inner.shmem, 1, dead, 20);
     proc_mock::set(&[(dead, Answer::Zombie)]);
     proc_mock::replace_pid_on_read(dead, &c.inner.shmem.procs[1].pid, replacement);
-    // Main skips this racing slot during this scan after losing its CAS.
+    // A failed retirement claim must retain the replacement owner's reservation.
     assert_eq!(30, c.recalculate_usage());
     let slot = &c.inner.shmem.procs[1];
     assert_eq!(replacement, slot.pid.load(Ordering::Acquire));
@@ -229,7 +234,13 @@ fn concurrent_pending_allocations_never_overbook_one_card() {
     }).collect();
     barrier.wait();
     let admitted = threads.into_iter().map(|thread| thread.join().unwrap()).filter(|admitted| *admitted).count();
-    assert_eq!(9, admitted);
+    // Simultaneous reservations may be rejected conservatively. Every successful
+    // admission remains owned, and sequential retries can fill the remaining quota.
+    assert!(admitted <= 9);
+    assert_eq!(admitted as u64 * 11, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
+    assert_eq!(admitted as u64 * 11, c.recalculate_usage());
+    for _ in admitted..9 { assert_eq!(0, c.check_memory_quota(11)); }
+    assert_eq!(RT_ERROR_MEMORY_ALLOCATION, c.check_memory_quota(11));
     assert_eq!(99, c.inner.shmem.memory_used.load(Ordering::Acquire));
     assert_eq!(99, c.inner.shmem.procs[0].hbm_used[0].load(Ordering::Acquire));
 }

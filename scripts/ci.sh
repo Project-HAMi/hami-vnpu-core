@@ -22,6 +22,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo test --manifest-path test/manager_cpu/Cargo.toml --locked
 cargo test --manifest-path test/memory_cpu/Cargo.toml --locked -- --test-threads=1
+cargo test --manifest-path test/memory_ledger/Cargo.toml --locked -- --test-threads=1
 python3 test/worker_cpu/run.py
 bash test/process_local.sh
 cargo build --release --locked --workspace

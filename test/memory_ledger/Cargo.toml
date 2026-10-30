@@ -1,0 +1,10 @@
+[package]
+name = "memory-ledger-tests"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+libc = "=0.2.186"
+log = "=0.4.32"

@@ -30,6 +30,60 @@ fn atomic_saturating_sub(a: &std::sync::atomic::AtomicU64, v: u64) -> bool {
     .unwrap_or(false)
 }
 
+/// Authoritative per-card ledger: counter zero in each process slot includes
+/// pending reservations and allocations. Other entries remain for ABI compatibility.
+/// SeqCst publication before admission ensures the last concurrent reservation
+/// observes all still-live earlier reservations. Contention may reject both
+/// callers conservatively, but cannot admit more than the limit.
+fn ledger_total(shmem: &LocalContainerShmem) -> Option<u64> {
+    shmem
+        .procs
+        .iter()
+        .map(|slot| &slot.hbm_used[0])
+        .try_fold(0u64, |sum, used| {
+            sum.checked_add(used.load(Ordering::SeqCst))
+        })
+}
+
+/// Publish a sampled compatibility metric; admission uses the per-slot ledger.
+fn publish_usage(shmem: &LocalContainerShmem) {
+    // Compatibility telemetry only. Never use this sampled aggregate for admission.
+    shmem
+        .memory_used
+        .store(ledger_total(shmem).unwrap_or(u64::MAX), Ordering::Release);
+}
+
+/// Negative PID holds a slot while it is being retired or initialized. If the
+/// owner dies mid-cleanup, a subsequent reaper can claim and finish the cleanup.
+fn retire_slot(slot: &shmem::ProcessSlot, observed_pid: i32) -> bool {
+    let owner = -(std::process::id() as i32);
+    if slot
+        .pid
+        .compare_exchange(observed_pid, owner, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    for used in &slot.hbm_used {
+        used.store(0, Ordering::SeqCst);
+    }
+    slot.is_active.store(0, Ordering::Release);
+    slot.pid.store(0, Ordering::SeqCst);
+    true
+}
+
+/// Retire exited owners, including abandoned negative-PID cleanup claims.
+/// The sampled aggregate is telemetry; admission reads the owned reservations.
+pub(crate) fn reclaim_dead_process_slots(shmem: &LocalContainerShmem) {
+    for slot in &shmem.procs {
+        let pid = slot.pid.load(Ordering::SeqCst);
+        if pid != 0 && !proc_alive(pid.saturating_abs()) {
+            retire_slot(slot, pid);
+        }
+    }
+    publish_usage(shmem);
+}
+
 #[derive(Debug, Default)]
 struct InnerLock {
     internal_stream: u64,
@@ -516,40 +570,26 @@ impl SchedulerClient {
         );
     }
 
+    /// Claim a process slot without clearing an existing same-process ledger.
     fn register_proc_slot(shmem: &'static LocalContainerShmem, pid: i32) -> usize {
+        reclaim_dead_process_slots(shmem);
         for (i, slot) in shmem.procs.iter().enumerate() {
-            if slot.is_active.load(Ordering::Acquire) == 1
-                && slot.pid.load(Ordering::Acquire) == pid
-            {
+            if slot.pid.load(Ordering::SeqCst) == pid {
                 return i;
             }
         }
-
         for (i, slot) in shmem.procs.iter().enumerate() {
             if slot
-                .is_active
-                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed)
+                .pid
+                .compare_exchange(0, -pid, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                slot.pid.store(pid, Ordering::Relaxed);
-                for dev in 0..shmem::NPU_DEVICE_MAX {
-                    slot.hbm_used[dev].store(0, Ordering::Relaxed);
-                }
-                return i;
-            }
-            let spid = slot.pid.load(Ordering::Acquire);
-            if spid != 0
-                && !proc_alive(spid)
-                && slot
-                    .pid
-                    .compare_exchange(spid, pid, Ordering::SeqCst, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let mut released = 0u64;
                 for used in &slot.hbm_used {
-                    released = released.saturating_add(used.swap(0, Ordering::AcqRel));
+                    used.store(0, Ordering::SeqCst);
                 }
-                let _ = atomic_saturating_sub(&shmem.memory_used, released);
+                slot.is_active.store(1, Ordering::Release);
+                slot.pid.store(pid, Ordering::SeqCst);
+                publish_usage(shmem);
                 return i;
             }
         }
@@ -856,60 +896,38 @@ impl SchedulerClient {
 
 // Limit HBM
 impl SchedulerClient {
+    /// Publish an owned reservation, then conservatively check all process slots.
     pub fn check_memory_quota(&self, size: u64) -> u64 {
         if self.inner.is_stub {
-            return 0;
+            return RT_ERROR_NONE;
         }
         let shmem = self.inner.shmem;
-        let limit = shmem.memory_limit.load(Ordering::Relaxed);
-
-        // if no limit
+        let limit = shmem.memory_limit.load(Ordering::Acquire);
         if limit == 0 {
-            return 0;
+            return RT_ERROR_NONE;
         }
-
-        // Reap only dead owners. Never replace the ledger from a snapshot: other
-        // threads/processes may have reserved bytes while their allocation is pending.
-        let _ = self.recalculate_usage();
-
-        let mut current_used = shmem.memory_used.load(Ordering::Acquire);
-
-        loop {
-            let Some(new_used) = current_used.checked_add(size) else {
-                return RT_ERROR_MEMORY_ALLOCATION;
-            };
-
-            if new_used > limit {
-                warn!(
-                    "[Worker PID:{}] Memory Quota Exceeded! Request: {} MB, Used: {} MB, Limit: {} MB",
-                    std::process::id(),
-                    size / 1024 / 1024,
-                    current_used / 1024 / 1024,
-                    limit / 1024 / 1024
-                );
+        let used = &shmem.procs[self.inner.my_proc_idx].hbm_used[0];
+        // Publish ownership BEFORE admission and BEFORE the native allocator.
+        // An exited process's pending allocation is now reclaimable too.
+        if used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(size)
+            })
+            .is_err()
+        {
+            return RT_ERROR_MEMORY_ALLOCATION;
+        }
+        let fits = |total: Option<u64>| total.is_some_and(|total| total <= limit);
+        if !fits(ledger_total(shmem)) {
+            reclaim_dead_process_slots(shmem);
+            if !fits(ledger_total(shmem)) {
+                atomic_saturating_sub(used, size);
+                publish_usage(shmem);
                 return RT_ERROR_MEMORY_ALLOCATION;
             }
-
-            match shmem.memory_used.compare_exchange(
-                current_used,
-                new_used,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.inner.shmem.procs[self.inner.my_proc_idx].hbm_used[0]
-                        .fetch_add(size, Ordering::Release);
-                    debug!(
-                        "[Worker] Memory Quota Reserved: {} bytes. Total used: {} bytes",
-                        size, new_used
-                    );
-                    return 0;
-                }
-                Err(actual) => {
-                    current_used = actual;
-                }
-            }
         }
+        publish_usage(shmem);
+        RT_ERROR_NONE
     }
 
     pub fn post_alloc_hbm(&self, p: u64, size: u64, rts_return: u64) {
@@ -917,6 +935,9 @@ impl SchedulerClient {
     }
 
     pub fn post_alloc_hbm_kind(&self, p: u64, size: u64, rts_return: u64, kind: AllocationKind) {
+        if self.inner.is_stub {
+            return;
+        }
         if rts_return == RT_ERROR_NONE {
             // Global scope -> card map -> record is the only retain lock order.
             // No one holds any of these guards while executing native code.
@@ -946,15 +967,7 @@ impl SchedulerClient {
             map.insert((kind, p), record);
             // Reservation already charged this card's process and quota ledgers.
         } else {
-            let slot = &self.inner.shmem.procs[self.inner.my_proc_idx];
-            let _ = atomic_saturating_sub(&slot.hbm_used[0], size);
-            if atomic_saturating_sub(&self.inner.shmem.memory_used, size) {
-                warn!(
-                    "[Worker PID:{}] memory_used underflow on alloc-rollback",
-                    std::process::id()
-                );
-                let _ = self.recalculate_usage();
-            }
+            self.refund_hbm(size);
         }
     }
 
@@ -989,15 +1002,8 @@ impl SchedulerClient {
 
     fn refund_hbm(&self, size: u64) {
         let slot = &self.inner.shmem.procs[self.inner.my_proc_idx];
-        let slot_underflow = atomic_saturating_sub(&slot.hbm_used[0], size);
-        let global_underflow = atomic_saturating_sub(&self.inner.shmem.memory_used, size);
-        if slot_underflow || global_underflow {
-            warn!(
-                "[Worker PID:{}] memory_used underflow on free",
-                std::process::id()
-            );
-            let _ = self.recalculate_usage();
-        }
+        atomic_saturating_sub(&slot.hbm_used[0], size);
+        publish_usage(self.inner.shmem);
     }
 
     // Compatibility for callers that already completed a synchronous operation.
@@ -1026,31 +1032,12 @@ impl SchedulerClient {
     }
 
     pub fn recalculate_usage_for_device(&self, device: usize) -> u64 {
-        let shmem = self.inner.shmem;
-        // Each physical card has its own SHM domain; its ABI counter is index zero.
+        // Each physical card owns a separate domain whose counter is index zero.
         if device != 0 {
             return 0;
         }
-        let current_pid = std::process::id() as i32;
-        for slot in &shmem.procs {
-            let pid = slot.pid.load(Ordering::Acquire);
-            if pid == 0 || pid == current_pid || proc_alive(pid) {
-                continue;
-            }
-            if slot
-                .pid
-                .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                let mut released = 0u64;
-                for used in &slot.hbm_used {
-                    released = released.saturating_add(used.swap(0, Ordering::AcqRel));
-                }
-                slot.is_active.store(0, Ordering::Release);
-                let _ = atomic_saturating_sub(&shmem.memory_used, released);
-            }
-        }
-        shmem.memory_used.load(Ordering::Acquire)
+        reclaim_dead_process_slots(self.inner.shmem);
+        ledger_total(self.inner.shmem).unwrap_or(u64::MAX)
     }
 
     /// Write the quota-adjusted free and total HBM sizes to the output pointers.
@@ -1062,7 +1049,7 @@ impl SchedulerClient {
         let shmem = self.inner.shmem;
 
         let quota = shmem.memory_limit.load(Ordering::Relaxed) as usize;
-        let used = self.recalculate_usage_for_device(0) as usize;
+        let used = ledger_total(shmem).unwrap_or(u64::MAX) as usize;
         let overhead_bytes = VIRTUAL_OVERHEAD_MB * 1024 * 1024;
 
         let logical_free = quota.saturating_sub(used);
@@ -1109,6 +1096,9 @@ impl SchedulerClient {
 }
 
 pub(crate) fn proc_alive(pid: i32) -> bool {
+    if pid == std::process::id() as i32 {
+        return true;
+    }
     match fs::read_to_string(format!("/proc/{}/stat", pid)) {
         Ok(stat) => {
             // Extract the process state character (3rd field, after pid and comm)
@@ -1121,7 +1111,7 @@ pub(crate) fn proc_alive(pid: i32) -> bool {
             }
             true // If we can't parse, assume alive
         }
-        Err(_) => false, // /proc/pid/stat doesn't exist → process is dead
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound, // retain unreadable owners
     }
 }
 
@@ -1133,15 +1123,224 @@ fn get_time_us() -> u64 {
         .as_micros() as u64
 }
 
-impl Drop for SchedulerClientInner {
-    fn drop(&mut self) {
-        let slot = &self.shmem.procs[self.my_proc_idx];
-        let mut released = 0u64;
-        for used in &slot.hbm_used {
-            released = released.saturating_add(used.swap(0, Ordering::AcqRel));
+#[cfg(test)]
+mod tests {
+    use super::{SchedulerClient, SchedulerClientInner, ledger_total, retire_slot};
+    use crate::externed_api::{RT_ERROR_MEMORY_ALLOCATION, RT_ERROR_NONE};
+    use crate::{config::SchedPolicy, shmem::LocalContainerShmem};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    fn test_client(shmem: &'static LocalContainerShmem) -> SchedulerClient {
+        test_client_on_device(shmem, 0)
+    }
+
+    fn test_client_on_device(
+        shmem: &'static LocalContainerShmem,
+        physical_id: u32,
+    ) -> SchedulerClient {
+        SchedulerClient {
+            inner: Arc::new(SchedulerClientInner {
+                shmem,
+                my_proc_idx: 0,
+                physical_id,
+                contexts: Mutex::new(HashMap::new()),
+                hbm_handle_map: Mutex::new(HashMap::new()),
+                is_stub: false,
+                sched_policy: SchedPolicy::Dynamic,
+            }),
         }
-        let _ = atomic_saturating_sub(&self.shmem.memory_used, released);
-        slot.pid.store(0, Ordering::Release);
-        slot.is_active.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn quota_reservation_rollback_and_free_preserve_ledger() {
+        let shmem: &'static LocalContainerShmem =
+            Box::leak(Box::new(unsafe { std::mem::zeroed() }));
+        shmem.memory_limit.store(10, Ordering::Release);
+        shmem.procs[0]
+            .pid
+            .store(std::process::id() as i32, Ordering::Release);
+        shmem.procs[0].is_active.store(1, Ordering::Release);
+        let client = test_client(shmem);
+
+        assert_eq!(client.check_memory_quota(8), 0);
+        assert_eq!(ledger_total(shmem), Some(8));
+        assert_ne!(client.check_memory_quota(3), 0);
+        assert_eq!(ledger_total(shmem), Some(8));
+
+        client.post_alloc_hbm(0x11, 8, 1);
+        assert_eq!(ledger_total(shmem), Some(0));
+        assert_eq!(client.check_memory_quota(6), 0);
+        client.post_alloc_hbm(0x22, 6, 0);
+        client.post_free_hbm(0x22, 0);
+        assert_eq!(ledger_total(shmem), Some(0));
+    }
+
+    /// An orphaned aggregate update cannot strand quota without an owning slot.
+    #[test]
+    fn stale_aggregate_cannot_hold_or_erase_owned_reservations() {
+        let shmem = Box::leak(Box::new(unsafe {
+            std::mem::zeroed::<LocalContainerShmem>()
+        }));
+        shmem.memory_limit.store(10, Ordering::Release);
+        shmem.procs[0]
+            .pid
+            .store(std::process::id() as i32, Ordering::Release);
+        // A legacy process may exit after updating this aggregate but before
+        // publishing ownership. This value alone must not reserve nine bytes.
+        shmem.memory_used.store(9, Ordering::Release);
+        let client = test_client(shmem);
+        assert_eq!(client.check_memory_quota(8), RT_ERROR_NONE);
+        assert_eq!(ledger_total(shmem), Some(8));
+        // Conversely, stale low telemetry cannot admit beyond the owned quota.
+        shmem.memory_used.store(0, Ordering::Release);
+        assert_eq!(client.check_memory_quota(3), RT_ERROR_MEMORY_ALLOCATION);
+        assert_eq!(ledger_total(shmem), Some(8));
+    }
+
+    #[test]
+    fn reclaim_dead_processes_preserves_in_flight_reservations() {
+        let shmem: &'static LocalContainerShmem =
+            Box::leak(Box::new(unsafe { std::mem::zeroed() }));
+        let dead_slot = &shmem.procs[0];
+        dead_slot.pid.store(4242, Ordering::Release);
+        dead_slot.hbm_used[0].store(4, Ordering::Release);
+        dead_slot.hbm_used[1].store(2, Ordering::Release);
+        dead_slot.is_active.store(1, Ordering::Release);
+        shmem.memory_used.store(12, Ordering::Release);
+
+        let reserved = Arc::new(Barrier::new(2));
+        let finished = Arc::new(Barrier::new(2));
+        let reserve_barrier = Arc::clone(&reserved);
+        let finish_barrier = Arc::clone(&finished);
+        let reserve_thread = thread::spawn(move || {
+            shmem.procs[1].hbm_used[0].store(3, Ordering::SeqCst);
+            reserve_barrier.wait();
+            finish_barrier.wait();
+        });
+
+        // Claim and clear the dead slot while another process publishes a
+        // reservation. The live reservation must survive the cleanup.
+        reserved.wait();
+        assert!(retire_slot(dead_slot, 4242));
+        finished.wait();
+        reserve_thread.join().unwrap();
+
+        assert_eq!(ledger_total(shmem), Some(3));
+        assert_eq!(dead_slot.pid.load(Ordering::Acquire), 0);
+        assert_eq!(dead_slot.hbm_used[0].load(Ordering::Acquire), 0);
+        assert_eq!(dead_slot.hbm_used[1].load(Ordering::Acquire), 0);
+        assert_eq!(dead_slot.is_active.load(Ordering::Acquire), 0);
+    }
+    /// Dropping one independently constructed client must retain its sibling's quota.
+    #[test]
+    fn dropping_client_preserves_shared_process_slot() {
+        let shmem = Box::leak(Box::new(unsafe {
+            std::mem::zeroed::<LocalContainerShmem>()
+        }));
+        let pid = std::process::id() as i32;
+        shmem.procs[0].pid.store(pid, Ordering::SeqCst);
+        shmem.procs[0].is_active.store(1, Ordering::Release);
+        shmem.memory_limit.store(10, Ordering::Release);
+        let first = test_client(shmem);
+        let second = test_client(shmem);
+        assert_eq!(first.check_memory_quota(8), 0);
+        drop(first);
+        assert_eq!(shmem.procs[0].pid.load(Ordering::Acquire), pid);
+        assert_eq!(ledger_total(shmem), Some(8));
+        assert_ne!(second.check_memory_quota(3), 0);
+        drop(second);
+        assert_eq!(ledger_total(shmem), Some(8));
+    }
+
+    /// Per-card queries include pending bytes and cannot affect another card.
+    #[test]
+    fn query_preserves_pending_usage_in_independent_card_domains() {
+        let first = Box::leak(Box::new(unsafe {
+            std::mem::zeroed::<LocalContainerShmem>()
+        }));
+        let second = Box::leak(Box::new(unsafe {
+            std::mem::zeroed::<LocalContainerShmem>()
+        }));
+        let mib = 1024 * 1024;
+        for shmem in [&*first, &*second] {
+            shmem.memory_limit.store(1024 * mib, Ordering::Release);
+            shmem.procs[0]
+                .pid
+                .store(std::process::id() as i32, Ordering::SeqCst);
+        }
+        let client = test_client_on_device(first, 0);
+        let other = test_client_on_device(second, 7);
+        assert_eq!(client.check_memory_quota(256 * mib), 0);
+        assert_eq!(other.check_memory_quota(512 * mib), 0);
+        let (mut free, mut total) = (0usize, 0usize);
+        unsafe {
+            client.get_hbm_info(&mut free, &mut total);
+        }
+        assert_eq!(total as u64, 1024 * mib);
+        assert_eq!(free as u64, (1024 - 256 - 128) * mib);
+        assert_eq!(ledger_total(first), Some(256 * mib));
+        assert_eq!(ledger_total(second), Some(512 * mib));
+        client.post_alloc_hbm(0, 256 * mib, 1);
+        assert_eq!(ledger_total(first), Some(0));
+        assert_eq!(ledger_total(second), Some(512 * mib));
+    }
+
+    /// Both per-slot overflow and cross-slot sum overflow reject without credit.
+    #[test]
+    fn overflowing_reservations_do_not_wrap() {
+        let shmem = Box::leak(Box::new(unsafe {
+            std::mem::zeroed::<LocalContainerShmem>()
+        }));
+        shmem.memory_limit.store(u64::MAX, Ordering::Release);
+        shmem.procs[0]
+            .pid
+            .store(std::process::id() as i32, Ordering::SeqCst);
+        shmem.procs[0].hbm_used[0].store(u64::MAX, Ordering::SeqCst);
+        let client = test_client(shmem);
+        assert_ne!(client.check_memory_quota(1), 0);
+        assert_eq!(ledger_total(shmem), Some(u64::MAX));
+        shmem.procs[0].hbm_used[0].store(0, Ordering::SeqCst);
+        shmem.procs[1].hbm_used[0].store(u64::MAX, Ordering::SeqCst);
+        assert_ne!(client.check_memory_quota(1), 0);
+        assert_eq!(ledger_total(shmem), Some(u64::MAX));
+    }
+
+    /// Native free failure keeps its handle and reservation until a successful retry.
+    #[test]
+    fn failed_free_keeps_reservation_and_duplicate_free_is_idempotent() {
+        let shmem = Box::leak(Box::new(unsafe {
+            std::mem::zeroed::<LocalContainerShmem>()
+        }));
+        shmem.memory_limit.store(10, Ordering::Release);
+        let client = test_client(shmem);
+        assert_eq!(client.check_memory_quota(6), 0);
+        client.post_alloc_hbm(1, 6, 0);
+        client.post_free_hbm(1, 1);
+        assert_eq!(ledger_total(shmem), Some(6));
+        client.post_free_hbm(1, 0);
+        client.post_free_hbm(1, 0);
+        assert_eq!(ledger_total(shmem), Some(0));
+    }
+
+    /// A dead process's slot owns reservations even before post_alloc_hbm runs.
+    #[test]
+    fn process_death_before_native_completion_is_reclaimable() {
+        let shmem = Box::leak(Box::new(unsafe {
+            std::mem::zeroed::<LocalContainerShmem>()
+        }));
+        shmem.memory_limit.store(10, Ordering::Release);
+        shmem.procs[0].pid.store(4242, Ordering::SeqCst);
+        let client = test_client(shmem);
+        assert_eq!(client.check_memory_quota(7), 0);
+        assert_eq!(ledger_total(shmem), Some(7));
+        assert!(retire_slot(&shmem.procs[0], 4242));
+        assert_eq!(ledger_total(shmem), Some(0));
+        assert_eq!(
+            SchedulerClient::register_proc_slot(shmem, std::process::id() as i32),
+            0
+        );
     }
 }

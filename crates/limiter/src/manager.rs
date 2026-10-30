@@ -10,41 +10,9 @@ const DCMI_UPDATE_INTERVAL_SECS: u64 = 5;
 const DCMI_QUERY_TIMEOUT_SECS: u64 = 2;
 const REAP_INTERVAL_SECS: u64 = 2;
 
-/// Reap dead process slots and release their memory. Runs on its own fast cadence (see
-/// REAP_INTERVAL_SECS) so an abnormal exit (crash/kill-9/OOM/zombie) is reflected within
-/// one interval, regardless of the app's allocations.
-///
-/// Only SUBTRACTS the dead slot's own bytes — it never re-derives the whole counter from
-/// the slots, which would clobber the worker-maintained `memory_used` of live processes.
+/// Use the same process-slot retirement protocol as quota admission.
 fn reap_dead_slots(local: &LocalContainerShmem) {
-    for slot in &local.procs {
-        let pid = slot.pid.load(Ordering::Relaxed);
-        if pid == 0 || proc_alive(pid) {
-            continue;
-        }
-        if slot
-            .pid
-            .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            continue;
-        }
-        let mut leaked = 0u64;
-        for d in 0..NPU_DEVICE_MAX {
-            leaked += slot.hbm_used[d].swap(0, Ordering::AcqRel);
-        }
-        slot.is_active.store(0, Ordering::Release);
-        let _ = local
-            .memory_used
-            .fetch_update(Ordering::SeqCst, Ordering::Acquire, |cur| {
-                Some(cur.saturating_sub(leaked))
-            });
-        debug!(
-            "[Reap] cleared dead slot pid={} released {} MB",
-            pid,
-            leaked / 1024 / 1024
-        );
-    }
+    crate::worker::reclaim_dead_process_slots(local);
 }
 
 // A targeted helper emits device zero for the selected physical card. Hardware
@@ -74,10 +42,9 @@ fn observe_snapshot(
 
 use crate::config::{ManagerConfig, SchedPolicy};
 use crate::shmem::{
-    GlobalRegistry, LocalContainerShmem, MAX_MANAGERS, MAX_WORKERS, NPU_DEVICE_MAX, STATE_IDLE,
-    STATE_MEASURING, STATE_RUNNING, futex,
+    GlobalRegistry, LocalContainerShmem, MAX_MANAGERS, MAX_WORKERS, STATE_IDLE, STATE_MEASURING,
+    STATE_RUNNING, futex,
 };
-use crate::worker::proc_alive;
 
 const GLOBAL_WATCHDOG_TIMEOUT_US: u64 = 1_000_000;
 const GLOBAL_WAIT_POLL_US: u64 = 10_000;
