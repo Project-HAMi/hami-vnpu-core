@@ -12,6 +12,9 @@ pub const MAX_MANAGERS: usize = 64;
 #[repr(C)]
 pub struct GlobalManagerSlot {
     pub pid: AtomicI32,
+    // Uses the former alignment padding; published with is_active under the
+    // registry transaction lock. Distinguishes a reused global slot.
+    pub generation: AtomicU32,
     pub avg_kernel_time: AtomicU64,
     pub last_heartbeat: AtomicU64,
     pub is_active: AtomicU32,
@@ -93,23 +96,46 @@ pub struct LocalContainerShmem {
     pub procs: [ProcessSlot; MAX_PROCESSES],
 
     pub manager_pid: AtomicI32, // elected manager's container PID; 0 = none
+    pub manager_generation: AtomicU32, // former padding; fences a replaced manager
     pub manager_heartbeat: AtomicU64, // manager heartbeat (us); stale => eligible for takeover
     pub manager_global_idx: AtomicI32, // global slot the manager holds (for takeover reclaim)
-    pub initialized: AtomicU32, // 1 once manager published resource configuration; workers wait on it
+    pub initialized: AtomicU32, // manager published resource configuration
 
     // Append only: the monitor's existing reports/procs offsets remain stable.
     pub overdraft_pool: crate::overdraft::OverdraftPool,
     pub overdraft_limit: AtomicU32,
     pub overdraft_timeout_us: AtomicU64,
     pub overdraft_poll_interval_us: AtomicU64,
+
+    // Append only: keep report/process/overdraft offsets used by monitors stable.
+    // A worker writes its monotonic entry timestamp before device synchronization;
+    // the report's release-store of batch_id publishes it with the completed report.
+    pub measurement_started_us: [AtomicU64; MAX_WORKERS],
 }
 
-// Keep offsets consumed by the device-plugin monitor unchanged.
 const _: () = {
     assert!(std::mem::size_of::<GlobalManagerSlot>() == 40);
+    assert!(std::mem::size_of::<GlobalRegistry>() == 2848);
+    assert!(std::mem::size_of::<LocalContainerShmem>() == 6512);
     assert!(std::mem::offset_of!(GlobalManagerSlot, compute_limit) == 32);
     assert!(std::mem::offset_of!(LocalContainerShmem, compute_limit) == 16);
     assert!(std::mem::offset_of!(LocalContainerShmem, reports) == 56);
-    assert!(std::mem::offset_of!(LocalContainerShmem, procs) == 1080);
     assert!(std::mem::offset_of!(LocalContainerShmem, overdraft_pool) == 6224);
+    assert!(std::mem::offset_of!(LocalContainerShmem, procs) == 1080);
+    assert!(std::mem::offset_of!(LocalContainerShmem, manager_generation) == 6204);
+    assert!(std::mem::offset_of!(LocalContainerShmem, measurement_started_us) == 6256);
 };
+
+/// Comparable across processes on the same host, unaffected by wall-clock changes.
+/// Zero means no usable timestamp; callers must reject that timing sample.
+pub fn monotonic_time_us() -> u64 {
+    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return 0;
+    }
+    u64::try_from(time.tv_sec)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000))
+        .and_then(|micros| micros.checked_add(time.tv_nsec as u64 / 1000))
+        .unwrap_or(0)
+}

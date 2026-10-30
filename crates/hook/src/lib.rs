@@ -67,9 +67,9 @@ fn ensure_supervisor(entry: &DeviceClient, physical: u32) {
     {
         return;
     }
-    if let Err(error) = limiter::config::ManagerConfig::from_env() {
-        fatal(&format!("invalid resource configuration: {error}"));
-    }
+    let config = limiter::config::ManagerConfig::from_env()
+        .unwrap_or_else(|error| fatal(&format!("invalid resource configuration: {error}")));
+    limiter::config::require_distinct_shmem_paths(&config.global_shm_path, &config.local_shm_path);
     let spawned = std::thread::Builder::new()
         .name(format!("vnpu-device-{physical}"))
         .spawn(move || {

@@ -36,7 +36,7 @@ A supervisor for each physical card starts lazily on its first intercepted NPU u
 
 All processes sharing a local file must have matching policy, quotas, global registry path, and PID namespace, with readable `/proc/<pid>/stat` entries for each other. The library uses these PIDs for election and dead-process accounting. Configuration consistency is a deployment requirement; the SHM file does not validate a configuration fingerprint. If a group spans isolation boundaries such as containers, arrange both shared file access and the shared PID namespace explicitly.
 
-When upgrading the library or changing policy/configuration, stop every process using the local file and start with a fresh local SHM file. Do not truncate, delete, or recreate SHM while participants still map it. Appended fields preserve monitor offsets, not compatibility between old and new process mappings. The global registry opener waits for at least the current layout size; it does not identify compatible versions or validate a schema. Global layout compatibility is the deployer's responsibility. Replace that registry only after all of its users stop.
+When upgrading the library or changing policy/configuration, stop every process using the local file and start with a fresh local SHM file. Do not truncate, delete, or recreate SHM while participants still map it. Appended fields preserve monitor offsets, not compatibility between old and new process mappings. The global registry opener waits for at least the current layout size; the supervisor then validates `REGISTRY_PROTOCOL` under the registry transaction. An incompatible scheduler registry terminates the process with status `78`. Follow the [scheduler upgrade procedure](scheduler-upgrade.md), and replace the registry only after all of its users stop.
 
 Invalid resource settings, failure to identify the current physical card, and inability to initialize a required per-card limiter terminate the intercepted process with status `78`. Spatial resource application/readback failures also terminate with `78`.
 
@@ -101,3 +101,5 @@ file path to select the local accounting group; setting only a name does not
 override `/tmp/vnpu_local_shmem`.
 
 Sources: [resource parser](../crates/limiter/src/config.rs), [manager tuning](../crates/limiter/src/manager.rs), [supervisor](../crates/limiter/src/supervisor.rs), [worker and HBM accounting](../crates/limiter/src/worker.rs), [logger](../crates/limiter/src/supervisor.rs), [lazy loading](../crates/limiter/src/dynamic.rs).
+
+Install the paired helper and follow the [scheduler upgrade procedure](scheduler-upgrade.md) when replacing an existing library. `NPU_DCMI_HELPER_PATH` optionally selects the executable; its default is `vnpu-dcmi` adjacent to `libvnpu.so`. Relative paths use the library-load working directory. Local/global paths must refer to different files, including symlink and hard-link aliases.

@@ -233,8 +233,9 @@ fn all_five_actual_hook_wrappers_charge_before_native_and_keep_one_process_repor
 }
 
 #[test]
-fn shared_memory_abi_preserves_original_prefix_and_appends_overdraft_fields() {
-    assert_eq!(6256,std::mem::size_of::<LocalContainerShmem>());
+fn shared_memory_abi_preserves_monitor_offsets_and_appends_measurement_entries() {
+    assert_eq!(6512,std::mem::size_of::<LocalContainerShmem>());
+    assert_eq!(6256,std::mem::offset_of!(LocalContainerShmem,measurement_started_us));
     assert_eq!(1080,std::mem::offset_of!(LocalContainerShmem,procs));
     assert_eq!(6224,std::mem::offset_of!(LocalContainerShmem,overdraft_pool));
 }
@@ -320,6 +321,27 @@ fn unchanged_idle_state_really_blocks_in_linux_futex_until_woken() {
     assert_eq!(calls(), vec![Call::Record(11,10)]);
 }
 
+
+fn untimed_completion(stream: u64, capture: u32) {
+    crate::externed_api::CAPTURE_STATUS.store(capture, Ordering::Release);
+    let c = client(1, true);
+    let timing = c.context_timing(0);
+    let mut lock = timing.lock.write().unwrap();
+    lock.last_user_stream = stream;
+    lock.start_time_us = get_time_us().saturating_sub(400_000);
+    c.measure_and_report_batch(&timing, &mut lock);
+    assert_eq!(c.inner.shmem.reports[0].duration_us.load(Ordering::Acquire), 0);
+    assert_eq!(c.inner.shmem.reports[0].batch_id.load(Ordering::Acquire), 42);
+    assert_eq!(c.inner.shmem.reported_count.load(Ordering::Acquire), 1);
+    assert!(calls().contains(&Call::DeviceSync));
+    assert!(!calls().iter().any(|c| matches!(c, Call::Elapsed(_, _))));
+}
+
+#[test]
+fn no_stream_drains_without_reporting_request_idle_time_as_execution() { untimed_completion(0, 0); }
+
+#[test]
+fn capture_drains_without_reporting_request_idle_time_as_execution() { untimed_completion(6, 1); }
 
 #[test]
 fn contexts_on_one_card_have_independent_timing_resources_and_report_slots() {
@@ -462,4 +484,47 @@ fn physical_allocation_invalid_target_preserves_native_error_without_charging() 
         assert_eq!(0, current.inner.shmem.memory_used.load(Ordering::Acquire));
         assert_eq!(calls().iter().filter(|c| matches!(c, Call::Native("rtMallocPhysical", _, _))).count(), 1);
     }
+}
+
+#[test]
+fn measurement_entry_is_published_before_device_synchronization() {
+    let c = client(1, true);
+    crate::CLIENT.set(c.clone()).unwrap();
+    crate::externed_api::SYNC_OBSERVER.set(|| {
+        let c = crate::CLIENT.get().unwrap();
+        let entry = c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire);
+        assert!(entry > 0, "measurement entry must precede the blocking SDK call");
+        assert_eq!(c.inner.shmem.reports[0].batch_id.load(Ordering::Acquire), 0);
+        assert_eq!(c.inner.shmem.reported_count.load(Ordering::Acquire), 0);
+        thread::sleep(Duration::from_millis(40));
+        assert_eq!(entry, c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire));
+    }).unwrap();
+    let timing = timing(&c);
+    c.measure_and_report_batch(&timing, &mut timing.lock.write().unwrap());
+    let entry = c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire);
+    assert!(shmem::monotonic_time_us() - entry >= 40_000);
+    assert_eq!(c.inner.shmem.reports[0].batch_id.load(Ordering::Acquire), 42);
+    assert_eq!(c.inner.shmem.reports[0].duration_us.load(Ordering::Acquire), 2500);
+}
+
+#[test]
+fn measurement_entry_is_reset_for_new_batches_and_preserved_only_with_completed_reports() {
+    let c = client(2, false);
+    c.inner.shmem.measurement_started_us[0].store(123, Ordering::Release);
+    c.wait_for_token(6);
+    assert_eq!(c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire), 0);
+    let timing = timing(&c);
+    c.measure_and_report_batch(&timing, &mut timing.lock.write().unwrap());
+    let entry = c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire);
+    assert!(entry > 0);
+    c.retire_context(0);
+    assert_eq!(c.inner.shmem.reports[0].occupied.load(Ordering::Acquire), 2);
+    assert_eq!(c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire), entry);
+    c.inner.shmem.batch_id.store(43, Ordering::Release);
+    let next = c.context_timing(1);
+    assert_eq!(next.my_slot_idx, 0);
+    assert_eq!(c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire), 0);
+    c.inner.shmem.measurement_started_us[0].store(456, Ordering::Release);
+    c.retire_context(1); // No completed report belongs to the new context.
+    assert_eq!(c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire), 0);
 }

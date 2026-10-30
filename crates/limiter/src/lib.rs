@@ -1,4 +1,8 @@
 pub mod config;
+pub mod dcmi;
+pub mod dcmi_protocol;
+pub mod registry_lock;
+pub use config::is_dcmi_helper;
 pub mod dynamic;
 pub mod externed_api;
 pub mod manager;
@@ -24,4 +28,10 @@ macro_rules! check_rts {
         }
         ret // Return the result (0 in this case) for further use if needed.
     }};
+}
+
+// Capture only cwd at load time; logging and threads remain deferred until NPU use.
+#[ctor::ctor]
+fn capture_load_directory() {
+    dcmi::capture_load_directory();
 }

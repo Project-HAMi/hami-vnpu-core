@@ -68,8 +68,9 @@ The exported directory contains:
 | File | Purpose |
 | --- | --- |
 | `dist/libvnpu.so` | Release shared library for the selected architecture, for deployment into a compatible workload container. |
+| `dist/vnpu-dcmi` | Matching executable helper for isolated, bounded DCMI observations. Install beside the library. |
 | `dist/build-info.json` | Source commit, Rust/Cargo versions, pinned SDK image, CANN version metadata, SDK library hashes, ELF dependencies, hook exports and SDK API availability. |
-| `dist/SHA256SUMS` | Checksums for the library and build metadata. |
+| `dist/SHA256SUMS` | Checksums for both runtime artifacts and build metadata. |
 
 Before export, [release verification](../scripts/ci/verify-release.py) checks the
 ELF architecture and shared-object type, required hook and SDK exports, and
@@ -85,7 +86,7 @@ CI runs this build independently on native runners:
 | Linux AMD64 (`x86_64`) | `ubuntu-24.04` | `libvnpu-cann8.5.2-amd64` |
 | Linux ARM64 (`aarch64`) | `ubuntu-24.04-arm` | `libvnpu-cann8.5.2-arm64` |
 
-Each artifact contains the three files above. The build containers remain Ubuntu
+Each artifact contains the four files above. The build containers remain Ubuntu
 22.04. Deploy each library with matching-architecture system libraries and
 compatible CANN/driver libraries; the artifact does not bundle the SDK or a driver.
 
@@ -103,7 +104,7 @@ bash scripts/ci.sh
 python3 scripts/ci/check-doc-links.py
 ```
 
-Formatting checks the root workspace's two production crates and does not need
+Formatting checks the root workspace's three production crates and does not need
 Linux or the SDK. The CPU script needs no SDK/driver link stubs and runs
 `cargo clippy --workspace --all-targets --locked -- -D warnings` for the root
 workspace, including its test targets. The standalone CPU test workspaces are
@@ -117,13 +118,14 @@ fake SDKs. These CPU artifacts have not passed real-SDK release verification.
 
 | Check | Coverage |
 | --- | --- |
-| `cargo fmt --all -- --check` | Rust formatting for the root workspace's two production crates. |
-| Workspace `cargo clippy` and `cargo test` | Clippy across both Rust crates and all their targets with warnings denied; configuration defaults, bounds and migration errors; atomic overdraft pool behavior. |
+| `cargo fmt --all -- --check` | Rust formatting for the root workspace's three production crates. |
+| Workspace `cargo clippy` and `cargo test` | Clippy across all three Rust crates and all their targets with warnings denied; configuration defaults, bounds and migration errors; atomic overdraft pool behavior. |
 | `test/manager_cpu` | Production manager arithmetic, fixed rest calculation, report aggregation and spatial exclusion from time rotation. The unused process scan is a panic-on-call test double. |
 | `test/memory_cpu` | Production memory scan/quota paths, rollback, shared-memory ABI and bounded fork cleanup. Procfs reads and CANN calls use explicit test doubles; Linux futexes are real. |
 | `test/memory_ledger` | Production per-card reservation ownership, interrupted allocation cleanup, failed frees, client lifetime, independent domains and overflow. CANN calls are mocked. |
 | `test/worker_cpu/run.py` | Source-linked worker and hook admission cases with observed lock/futex boundaries; Cached/configured/DVPP/physical allocation admission, failure rollback, allocation/free alias deduplication, physical retain lifetimes, concurrent free/address reuse, per-card ownership, threads and fork. Each case runs in a separate process with a timeout. |
 | `test/preload/run.py` | No eager SDK dependencies; ordinary shell/tool startup without CANN, preserved signal handlers, no preload-time supervisor, passive hooks, successful retry after global/local `dlopen`, and cached calls surviving the application's `dlclose`. |
+| `test/dcmi_helper.sh` | Actual helper/interceptor with a fake DCMI driver: physical card/chip selection, errors, deadlines, descendant reaping, helper bypass, legacy rejection, SHM aliases and relative paths after chdir. |
 | `test/process_local.sh` | Actual per-process cache, concurrent initialization and real fork cases. |
 | `test/spatial_cpu/run.py` | Actual built Rust hook library preloaded into a C client with fake ACL: ceil budgets, resets, API failures, device/context switching and fork handling. |
 | `test/host_args.sh` | HostArgs ABI, capture, admission, nested delegation, per-card routing, threads/fork, and cached launch calls after the application releases its ACL handle. |
@@ -199,8 +201,9 @@ runtime 库，以及 `/usr/local/Ascend/driver/lib64/driver` 下的 DCMI 库和�
 | 文件 | 用途 |
 | --- | --- |
 | `dist/libvnpu.so` | 可部署到兼容业务容器、与所选目标架构一致的 release 库。 |
+| `dist/vnpu-dcmi` | 配套的 DCMI 隔离查询可执行文件，与库一起安装。 |
 | `dist/build-info.json` | 源码提交、Rust/Cargo 版本、SDK 镜像、CANN 版本信息、SDK 库哈希、ELF 依赖、hook 导出和 SDK API 可用性。 |
-| `dist/SHA256SUMS` | 库和构建信息的校验和。 |
+| `dist/SHA256SUMS` | 库、helper 和构建信息的校验和。 |
 
 导出前，[产物检查脚本](../scripts/ci/verify-release.py) 核对 ELF 架构与共享库类型、
 hook 与 SDK 导出符号，以及 `ldd -r` 是否能解析系统依赖；CANN/runtime/DCMI
@@ -215,7 +218,7 @@ CI 分别在原生运行器构建：
 | Linux AMD64（`x86_64`） | `ubuntu-24.04` | `libvnpu-cann8.5.2-amd64` |
 | Linux ARM64（`aarch64`） | `ubuntu-24.04-arm` | `libvnpu-cann8.5.2-arm64` |
 
-每个 artifact 都包含上述三个文件，容器内部仍为 Ubuntu 22.04。业务容器需提供
+每个 artifact 都包含上述四个文件，容器内部仍为 Ubuntu 22.04。业务容器需提供
 架构匹配的系统库以及兼容的 CANN 和驱动库；产物不包含 SDK 或驱动。
 
 ### 本地运行开发检查
@@ -231,7 +234,7 @@ python3 scripts/ci/check-doc-links.py
 ```
 
 这些检查无需 CANN SDK、Ascend 驱动、NPU、Docker 服务或集群凭据。
-格式检查覆盖根工作区的两个生产 crate，不依赖 Linux 或 SDK。CPU 脚本无需 SDK/driver
+格式检查覆盖根工作区的三个生产 crate，不依赖 Linux 或 SDK。CPU 脚本无需 SDK/driver
 链接桩，直接执行 `cargo clippy --workspace --all-targets --locked -- -D warnings`，
 覆盖根工作区及其测试目标，警告作为错误。独立 CPU 测试工作区在后续步骤运行，
 不属于这里的 `--workspace` 范围。
@@ -240,8 +243,8 @@ CPU 脚本在临时目录构建，退出时清理，不替换已安装的库。�
 时启动普通命令，核对信号处理器和线程数，并用 global/local 后端验证缺失符号的
 重试。其他集成测试提供独立的 fake SDK。这些 CPU 构建产物未通过真实 SDK 发布校验。
 
-- 格式检查：`cargo fmt --all -- --check` 检查根工作区的两个生产 crate。
-- 工作区 Clippy 和单元测试：对两个 crate 的所有目标运行 Clippy，将警告视为错误；
+- 格式检查：`cargo fmt --all -- --check` 检查根工作区的三个生产 crate。
+- 工作区 Clippy 和单元测试：对三个 crate 的所有目标运行 Clippy，将警告视为错误；
   验证配置默认值、范围、旧变量迁移错误，以及 overdraft 原子票池。
 - Manager：实际源码的份额计算、fixed 休息时间、报告聚合、spatial 不参与时间轮转。
 - Memory：内存扫描、配额、回滚、共享内存 ABI、带超时的 fork 清理；procfs 和 CANN 使用
@@ -254,6 +257,7 @@ CPU 脚本在临时目录构建，退出时清理，不替换已安装的库。�
 - Spatial：预加载实际构建的 Rust 库，通过 fake ACL 验证向上取整、重置、API 错误、
   设备/上下文切换及 fork 行为。
 - HostArgs：ABI、capture、准入、嵌套转调、按卡路由、线程/fork，以及应用释放 ACL 句柄后的缓存调用。
+- DCMI helper：使用 fake DCMI 驱动运行实际 helper/拦截库，覆盖物理卡/芯片选择、错误、超时、子孙进程回收、helper 旁路、旧协议拒绝、SHM 别名，以及 chdir 后的相对路径。
 - 文档：检查根目录 README 与 `docs/` 的本地 Markdown 链接目标；不访问外部链接，
   不检查渲染后的锚点。
 
@@ -273,3 +277,5 @@ Token 仅有仓库读取权限，不保留 checkout 凭据；fork 的首次运�
 Core 发布前，应在目标 CANN/驱动环境核对实际选卡和核心预算，验证分配与清理，
 并在完整预热后测量业务负载。验证所选策略和资源配置，将结果与 CI 分开记录。
 [已有空分验证](spatial-policy.md) 单独说明了其硬件与负载范围。
+
+部署配套产物前，请参阅[调度升级与真机验证](scheduler-upgrade.md)。

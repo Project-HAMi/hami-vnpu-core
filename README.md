@@ -34,7 +34,7 @@ cd dist && sha256sum -c SHA256SUMS
 ```
 
 This builds the complete release library, verifies its APIs against real CANN
-runtime/DCMI libraries, and exports `dist/libvnpu.so`, `dist/build-info.json` and `dist/SHA256SUMS`.
+runtime/DCMI libraries, and exports `dist/libvnpu.so`, `dist/vnpu-dcmi`, `dist/build-info.json` and `dist/SHA256SUMS`.
 The Dockerfile uses the official `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11`
 image, pinned by digest, and Rust **1.94.0**. It downloads the official **HDK 25.5.1**
 package, verifies its SHA256 and extracts the real driver user libraries for
@@ -51,7 +51,7 @@ make build-in-docker PLATFORM=linux/arm64 OUT_DIR=dist/arm64
 Use a native builder for each target, or configure Docker Buildx emulation for
 the other architecture. No NPU is required to compile.
 
-Deploy `libvnpu.so` into a matching-architecture workload container with
+Deploy `libvnpu.so` and the executable `vnpu-dcmi` together into a matching-architecture workload container with
 compatible CANN and host-driver libraries. The HDK driver user-library version describes the
 build environment; choose the host driver using the CANN/hardware compatibility
 requirements.
@@ -61,15 +61,18 @@ artifact provenance, verification and hardware-validation scope.
 
 To build directly on a Linux host with Rust 1.94.0 and a C compiler, run
 `cargo build --release --workspace --locked`. The library is then at
-`target/release/libvnpu.so`. Nonstandard SDK paths are covered in the
+`target/release/libvnpu.so`, with the helper at `target/release/vnpu-dcmi`. Nonstandard SDK paths are covered in the
 [configuration reference](docs/configuration.md).
+
+See the [coordinated scheduler upgrade](docs/scheduler-upgrade.md) before replacing an existing installation.
 
 ## Run an application
 
 First prepare an NPU-enabled Linux container with the Ascend devices and runtime
 libraries available. Mount a writable host directory at `/hami-shared-region` in
-each participating container on the node, and mount the built library at
-`/usr/local/lib/libvnpu.so`.
+each participating container on the node. Mount the built library at
+`/usr/local/lib/libvnpu.so` and its matching executable helper at
+`/usr/local/lib/vnpu-dcmi` (mode `0755`).
 
 Mount a container-specific file at `/etc/ld.so.preload` with this content:
 
@@ -124,6 +127,7 @@ process lifecycle requirements.
 | Guide | Contents |
 | --- | --- |
 | [Scheduling policies](docs/scheduling-policies.md) | Four policies, advantages, tradeoffs and selection examples |
+| [Scheduler upgrade](docs/scheduler-upgrade.md) | Paired helper installation, bounded scheduling and coordinated shared-state migration |
 | [Configuration reference](docs/configuration.md) | Environment variables, defaults, units, advanced tuning and migration |
 | [Testing and CI](docs/testing.md) | Build release artifacts, reproduce CPU checks and understand their coverage |
 | [Spatial design](docs/spatial-policy.md) | Detailed implementation and historical validation evidence |

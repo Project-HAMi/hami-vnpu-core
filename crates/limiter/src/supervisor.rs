@@ -14,10 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use log::{info, warn};
 
 use crate::config::ManagerConfig;
-use crate::manager::ContainerManager;
+use crate::manager::{ContainerManager, REGISTRY_PROTOCOL};
+use crate::registry_lock::RegistryLock;
 use crate::shmem::setup;
 use crate::shmem::{GlobalRegistry, LocalContainerShmem, MAX_MANAGERS, STATE_IDLE, futex};
 use crate::worker::proc_alive;
+use std::sync::Arc;
 
 /// A manager is declared dead if its PID is gone OR its heartbeat is older than this.
 /// Kept comfortably above the global watchdog (1s) so the two mechanisms don't fight,
@@ -55,10 +57,13 @@ fn run_configured(physical_device_id: Option<u32>) {
     let my_pid = std::process::id() as i32;
 
     let cfg = match ManagerConfig::from_env() {
-        Ok(c) => match physical_device_id {
-            Some(device) => c.for_device(device),
-            None => c,
-        },
+        Ok(c) => {
+            crate::config::require_distinct_shmem_paths(&c.global_shm_path, &c.local_shm_path);
+            match physical_device_id {
+                Some(device) => c.for_device(device),
+                None => c,
+            }
+        }
         Err(e) => {
             warn!("[Supervisor] {e}; manager disabled, running worker-only.");
             return;
@@ -70,44 +75,99 @@ fn run_configured(physical_device_id: Option<u32>) {
         return;
     }
 
+    crate::config::require_distinct_shmem_paths(&cfg.global_shm_path, &cfg.local_shm_path);
     let local = setup::create_shmem::<LocalContainerShmem>(&cfg.local_shm_path);
-    let mut global: Option<&'static GlobalRegistry> = None;
-
+    let global = setup::open_global_registry(&cfg.global_shm_path);
+    let registry = match RegistryLock::open(&cfg.global_shm_path) {
+        Ok(lock) => Arc::new(lock),
+        Err(error) => {
+            warn!("[Supervisor] cannot open registry lock: {error}");
+            return;
+        }
+    };
+    {
+        let Ok(_guard) = registry.lock() else {
+            return;
+        };
+        let protocol = global.queue_head.load(Ordering::Acquire);
+        if protocol != REGISTRY_PROTOCOL {
+            // The layout remains compatible with device-plugin memory monitoring,
+            // but old managers do not implement the fenced scheduling protocol.
+            if protocol != 0
+                || global
+                    .slots
+                    .iter()
+                    .any(|s| s.is_active.load(Ordering::Acquire) != 0)
+            {
+                // Returning would eventually let the historical worker-startup
+                // fallback run the application without quota enforcement.
+                eprintln!(
+                    "[Supervisor] incompatible scheduler registry: stop all sharing workloads and recreate the registry before upgrading"
+                );
+                unsafe {
+                    libc::_exit(78);
+                }
+            }
+            global.queue_tail.store(0, Ordering::Relaxed);
+            global
+                .queue_head
+                .store(REGISTRY_PROTOCOL, Ordering::Release);
+        }
+    }
     loop {
         if std::process::id() as i32 != my_pid {
             return;
         }
-
-        if let Some(old_pid) = try_become_manager(local, my_pid) {
-            info!("[Supervisor PID:{}] won manager election", my_pid);
-            let g =
-                *global.get_or_insert_with(|| setup::open_global_registry(&cfg.global_shm_path));
-
-            reclaim_stale_global_slot(g, local, old_pid);
-            local.overdraft_pool.close();
-            local.state.store(STATE_IDLE, Ordering::Release);
-            futex::wake_all(&local.state);
-
-            match ContainerManager::new(g, local, my_pid, cfg.clone()) {
-                Some(mut mgr) => mgr.run(),
-                None => warn!(
-                    "[Supervisor PID:{}] global registry full; cannot manage.",
-                    my_pid
-                ),
-            }
-
-            let _ =
+        let manager = {
+            let Ok(_guard) = registry.lock() else {
+                return;
+            };
+            let predecessor_generation = local.manager_generation.load(Ordering::Acquire);
+            if let Some(old_pid) = try_become_manager(local, my_pid) {
+                reclaim_stale_global_slot(global, local, old_pid, predecessor_generation);
+                // Former queue_tail is now a registry-wide lease sequence. Zero
+                // remains reserved for uninitialized/legacy registrations.
+                let generation = global
+                    .queue_tail
+                    .load(Ordering::Relaxed)
+                    .wrapping_add(1)
+                    .max(1);
+                global.queue_tail.store(generation, Ordering::Relaxed);
                 local
-                    .manager_pid
-                    .compare_exchange(my_pid, 0, Ordering::AcqRel, Ordering::Relaxed);
-        } else {
-            watch(local);
+                    .manager_generation
+                    .store(generation, Ordering::Release);
+                local.overdraft_pool.close();
+                local.tokens_remaining.store(0, Ordering::Relaxed);
+                local.state.store(STATE_IDLE, Ordering::Release);
+                futex::wake_all(&local.state);
+                let manager = ContainerManager::new(
+                    global,
+                    local,
+                    my_pid,
+                    cfg.clone(),
+                    registry.clone(),
+                    generation,
+                );
+                if manager.is_none() {
+                    local.manager_pid.store(0, Ordering::Release);
+                    local.manager_global_idx.store(-1, Ordering::Release);
+                }
+                manager
+            } else {
+                None
+            }
+        };
+        if let Some(mut manager) = manager {
+            info!("[Supervisor PID:{}] won manager election", my_pid);
+            manager.run();
+            // Drop fences cleanup against the current generation while holding
+            // the same transaction as takeover; an old manager cannot reset it.
         }
-
         thread::sleep(Duration::from_millis(POLL_MS));
     }
 }
 
+/// Caller must hold the registry transaction throughout election and publication.
 /// Attempt to claim the pod's single manager role. Returns `Some(predecessor_pid)` iff we
 /// now own it — `0` for a fast-path win (no dead predecessor), or the dead manager's pid we
 /// took over from (so the caller reclaims exactly that manager's global slot). `None` on loss.
@@ -158,25 +218,18 @@ fn manager_alive(local: &LocalContainerShmem, owner_pid: i32) -> bool {
     now <= hb || now - hb <= TAKEOVER_TIMEOUT_US
 }
 
-/// Stand by while another process holds the manager role; return once it vacates or
-/// looks dead, so the caller re-enters election.
-fn watch(local: &LocalContainerShmem) {
-    loop {
-        let owner = local.manager_pid.load(Ordering::Acquire);
-        if owner == 0 || !manager_alive(local, owner) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(POLL_MS));
-    }
-}
-
 /// On takeover, clear the dead predecessor's global registry slot so other pods don't
 /// count this pod's priority more than once. `old_pid` is the manager we took over from;
 /// `0` (fast-path win) means there is no predecessor, so nothing is reclaimed. Clearing is
 /// gated on the slot still belonging to `old_pid`: this prevents a fresh pod — whose
 /// `manager_global_idx` is still the zeroed default 0 — from wiping another live pod's
 /// `global.slots[0]`, and leaves a since-reused slot untouched.
-fn reclaim_stale_global_slot(global: &GlobalRegistry, local: &LocalContainerShmem, old_pid: i32) {
+fn reclaim_stale_global_slot(
+    global: &GlobalRegistry,
+    local: &LocalContainerShmem,
+    old_pid: i32,
+    old_generation: u32,
+) {
     if old_pid == 0 {
         return;
     }
@@ -185,7 +238,9 @@ fn reclaim_stale_global_slot(global: &GlobalRegistry, local: &LocalContainerShme
         return;
     }
     let slot = &global.slots[idx as usize];
-    if slot.pid.load(Ordering::Acquire) == old_pid {
+    if slot.pid.load(Ordering::Acquire) == old_pid
+        && slot.generation.load(Ordering::Acquire) == old_generation
+    {
         slot.is_active.store(0, Ordering::Release);
         warn!(
             "[Supervisor] cleared stale global slot {} of dead manager {}",

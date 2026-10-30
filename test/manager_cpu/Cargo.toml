@@ -8,3 +8,5 @@ edition = "2024"
 [dependencies]
 libc = "=0.2.186"
 log = "=0.4.32"
+
+env_logger = "=0.11.10"

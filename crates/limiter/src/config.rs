@@ -1,3 +1,7 @@
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
 /// 全局共享内存路径的环境变量名
 pub const ENV_GLOBAL_SHM_PATH: &str = "NPU_GLOBAL_SHM_PATH";
 /// 本地共享内存路径的环境变量名
@@ -213,9 +217,29 @@ impl ManagerConfig {
     }
 }
 
+// Immutable for this exec image, including callbacks before library constructors.
+static DCMI_HELPER_PROCESS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn is_dcmi_helper() -> bool {
+    use std::sync::atomic::Ordering;
+    let mut mode = DCMI_HELPER_PROCESS.load(Ordering::Acquire);
+    if mode == 0 {
+        let helper = unsafe {
+            let value = libc::getenv(c"NPU_DCMI_HELPER_PROCESS".as_ptr());
+            !value.is_null() && *value == b'1' as libc::c_char && *value.add(1) == 0
+        };
+        mode = if helper { 2 } else { 1 };
+        DCMI_HELPER_PROCESS.store(mode, Ordering::Release);
+    }
+    mode == 2
+}
+
 /// System preload alone does not opt an unrelated process into NPU control.
 /// Explicit settings, including invalid or legacy values, must still fail closed.
 pub fn vnpu_configuration_requested() -> bool {
+    if is_dcmi_helper() {
+        return false;
+    }
     [
         ENV_GLOBAL_SHM_PATH,
         ENV_LOCAL_SHM_PATH,
@@ -242,6 +266,61 @@ pub fn validate_requested_limits() -> Result<(), String> {
 
 pub fn local_shmem_path() -> String {
     std::env::var(ENV_LOCAL_SHM_PATH).unwrap_or_else(|_| DEFAULT_LOCAL_SHMEM_PATH.to_string())
+}
+
+/// Validate without opening either file: closing an alias would release this
+/// process's POSIX record lock on the global registry.
+pub fn validate_shmem_paths(global: &str, local: &str) -> io::Result<()> {
+    let same_inode = match (std::fs::metadata(global), std::fs::metadata(local)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    };
+    if same_inode
+        || resolve_shmem_path(&std::path::absolute(global)?, 0)?
+            == resolve_shmem_path(&std::path::absolute(local)?, 0)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NPU_LOCAL_SHM_PATH and NPU_GLOBAL_SHM_PATH must refer to different files",
+        ));
+    }
+    Ok(())
+}
+
+// canonicalize requires the file to exist. Resolve existing ancestors and
+// symlinks too, since the manager may not have created the files/directories yet.
+fn resolve_shmem_path(path: &Path, links: usize) -> io::Result<PathBuf> {
+    if links >= 40 {
+        return Err(io::Error::other("too many shared-memory path symlinks"));
+    }
+    if let Ok(target) = std::fs::read_link(path) {
+        let target = path.parent().unwrap_or(Path::new("/")).join(target);
+        return resolve_shmem_path(&target, links + 1);
+    }
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or(error)?;
+            let parent = resolve_shmem_path(parent, links)?;
+            match path.components().next_back() {
+                Some(std::path::Component::Normal(name)) => Ok(parent.join(name)),
+                Some(std::path::Component::ParentDir) => {
+                    Ok(parent.parent().unwrap_or(Path::new("/")).to_path_buf())
+                }
+                _ => Err(io::Error::other("invalid shared-memory path")),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn require_distinct_shmem_paths(global: &str, local: &str) {
+    if let Err(error) = validate_shmem_paths(global, local) {
+        eprintln!("[vnpu] invalid shared-memory configuration: {error}");
+        // A panic is caught by the hook's historical worker-only fallback and
+        // would allow the workload to continue without quota enforcement.
+        unsafe { libc::_exit(78) }
+    }
 }
 
 #[cfg(test)]

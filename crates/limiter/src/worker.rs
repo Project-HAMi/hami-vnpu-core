@@ -402,6 +402,10 @@ impl SchedulerClient {
         let config = ManagerConfig::from_env()
             .unwrap_or_else(|error| panic!("{error}"))
             .for_device(physical_id);
+        crate::config::require_distinct_shmem_paths(
+            &config.global_shm_path,
+            &config.local_shm_path,
+        );
         let sched_policy = config.sched_policy;
         let shmem_path = config.local_shm_path;
         info!("[Worker PID:{my_pid}] initialize physical device {physical_id}");
@@ -486,6 +490,7 @@ impl SchedulerClient {
                 report.batch_id.store(0, Ordering::Relaxed);
                 report.cpu_start_us.store(0, Ordering::Relaxed);
                 report.duration_us.store(0, Ordering::Relaxed);
+                shmem.measurement_started_us[timing.my_slot_idx].store(0, Ordering::Relaxed);
             }
             report.pid.store(0, Ordering::Release);
             // Preserve a completed report until its manager has consumed this round.
@@ -528,6 +533,7 @@ impl SchedulerClient {
                 slot.batch_id.store(0, Ordering::Relaxed);
                 slot.duration_us.store(0, Ordering::Relaxed);
                 slot.cpu_start_us.store(0, Ordering::Relaxed);
+                shmem.measurement_started_us[i].store(0, Ordering::Relaxed);
                 slot.pid.store(pid, Ordering::Release);
                 return i;
             }
@@ -537,6 +543,7 @@ impl SchedulerClient {
                     .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed)
                     .is_ok()
                 {
+                    shmem.measurement_started_us[i].store(0, Ordering::Relaxed);
                     slot.pid.store(pid, Ordering::Relaxed);
                     return i;
                 }
@@ -550,6 +557,7 @@ impl SchedulerClient {
                     slot.batch_id.store(0, Ordering::Relaxed);
                     slot.cpu_start_us.store(0, Ordering::Relaxed);
                     slot.duration_us.store(0, Ordering::Relaxed);
+                    shmem.measurement_started_us[i].store(0, Ordering::Relaxed);
                     return i;
                 }
                 // Lost the race — slot_pid already changed, continue searching
@@ -732,6 +740,8 @@ impl SchedulerClient {
 
                             lock.current_batch_id = global_batch;
                             lock.batch_active = true;
+                            self.inner.shmem.measurement_started_us[timing.my_slot_idx]
+                                .store(0, Ordering::Relaxed);
 
                             // Notify Manager
                             self.inner
@@ -824,8 +834,12 @@ impl SchedulerClient {
     }
 
     fn measure_and_report_batch(&self, timing: &ContextTiming, lock: &mut InnerLock) {
+        // Capture before any SDK call can wait for the device. Completion of the
+        // report later publishes this timestamp through its batch_id release-store.
+        self.inner.shmem.measurement_started_us[timing.my_slot_idx]
+            .store(shmem::monotonic_time_us(), Ordering::Release);
         let mut duration_us: u64 = 0;
-        let mut used_wall_clock = false;
+        let mut untimed_drain = false;
 
         if lock.last_user_stream != 0 {
             let mut status: u32 = 0;
@@ -835,28 +849,26 @@ impl SchedulerClient {
             });
             if status != 0 {
                 debug!(
-                    "[Limiter] stream 0x{:x} is capturing; using device sync timing.",
+                    "[Limiter] stream 0x{:x} is capturing; draining without a timing sample.",
                     lock.last_user_stream
                 );
                 check_rts!(unsafe { rtDeviceSynchronize() });
-                if lock.start_time_us != 0 {
-                    duration_us = get_time_us().saturating_sub(lock.start_time_us);
-                }
-                used_wall_clock = true;
+                // Wall time includes request gaps and delayed reporting. Mark
+                // completion, but do not use it to train the scheduling average.
+                untimed_drain = true;
             }
         }
 
-        // If there is no user stream, fall back to device sync + wall-clock.
-        if !used_wall_clock && lock.last_user_stream == 0 {
-            debug!("[Limiter] no last user stream; using device sync timing.");
+        // With no user stream, drain the device without a timing sample.
+        if !untimed_drain && lock.last_user_stream == 0 {
+            debug!("[Limiter] no last user stream; draining without a timing sample.");
             check_rts!(unsafe { rtDeviceSynchronize() });
-            if lock.start_time_us != 0 {
-                duration_us = get_time_us().saturating_sub(lock.start_time_us);
-            }
-            used_wall_clock = true;
+            // This synchronizes outstanding work without claiming a measured
+            // execution duration. A zero duration is an untimed completion.
+            untimed_drain = true;
         }
 
-        if !used_wall_clock {
+        if !untimed_drain {
             check_rts!(unsafe { rtEventRecord(lock.tracking_event, lock.last_user_stream) });
             check_rts!(unsafe { rtStreamWaitEvent(lock.internal_stream, lock.tracking_event) });
             check_rts!(unsafe { rtEventRecord(lock.end_event, lock.internal_stream) });
