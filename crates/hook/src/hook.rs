@@ -1,5 +1,4 @@
 #![allow(non_snake_case)]
-use crate::npu_limiter;
 use limiter::externed_api::{RT_ERROR_MEMORY_ALLOCATION, RT_ERROR_NONE};
 use limiter::worker::AllocationKind;
 
@@ -245,10 +244,20 @@ pub unsafe extern "C" fn rtMemGetInfoEx(
     free: *mut usize,
     total: *mut usize,
 ) -> u64 {
-    let client = npu_limiter();
-    if client.is_hbm_limited() {
-        unsafe { client.get_hbm_info(free, total) };
-        return 0;
+    if limiter::config::vnpu_configuration_requested() {
+        limiter::config::validate_requested_limits()
+            .unwrap_or_else(|error| crate::spatial::fatal(&error));
+        let _ = crate::spatial::enabled(); // Preserve the spatial fork guard.
+        let mut logical = -1;
+        if unsafe { limiter::externed_api::rtGetDevice(&mut logical) } == 0 && logical >= 0 {
+            // GE queries memory before its compute device object exists. Resolve
+            // only the quota here; device/context selection still applies budgets.
+            let client = crate::npu_limiter_for_device(logical);
+            if client.is_hbm_limited() {
+                unsafe { client.get_hbm_info(free, total) };
+                return 0;
+            }
+        }
     }
     passthrough!(
         "rtMemGetInfoEx",
