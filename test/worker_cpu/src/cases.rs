@@ -490,7 +490,7 @@ fn physical_allocation_invalid_target_preserves_native_error_without_charging() 
 fn measurement_entry_is_published_before_device_synchronization() {
     let c = client(1, true);
     crate::CLIENT.set(c.clone()).unwrap();
-    crate::externed_api::SYNC_OBSERVER.set(|| {
+    *crate::externed_api::SYNC_OBSERVER.lock().unwrap() = Some(|| {
         let c = crate::CLIENT.get().unwrap();
         let entry = c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire);
         assert!(entry > 0, "measurement entry must precede the blocking SDK call");
@@ -498,13 +498,16 @@ fn measurement_entry_is_published_before_device_synchronization() {
         assert_eq!(c.inner.shmem.reported_count.load(Ordering::Acquire), 0);
         thread::sleep(Duration::from_millis(40));
         assert_eq!(entry, c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire));
-    }).unwrap();
+    });
     let timing = timing(&c);
     c.measure_and_report_batch(&timing, &mut timing.lock.write().unwrap());
     let entry = c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire);
     assert!(shmem::monotonic_time_us() - entry >= 40_000);
     assert_eq!(c.inner.shmem.reports[0].batch_id.load(Ordering::Acquire), 42);
     assert_eq!(c.inner.shmem.reports[0].duration_us.load(Ordering::Acquire), 2500);
+    *crate::externed_api::SYNC_OBSERVER.lock().unwrap() = None;
+    // A later synchronization must not invoke the completed measurement's observer.
+    unsafe { crate::externed_api::rtStreamSynchronize(0); }
 }
 
 #[test]
