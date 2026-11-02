@@ -46,7 +46,6 @@ impl Library {
 
 static RUNTIME: Library = Library::new(c"libruntime.so");
 static ACL: Library = Library::new(c"libascendcl.so");
-static DCMI: Library = Library::new(c"libdcmi.so");
 
 /// Prefer the application's backend, including fake backends used by CPU tests.
 /// An explicit local handle also supports SDKs loaded with `RTLD_LOCAL`.
@@ -112,8 +111,4 @@ fn cached_symbol(
 /// Retry a missing backend on the next call.
 pub fn resolve_sdk_symbol(cache: &AtomicPtr<c_void>, name: &CStr) -> Option<*mut c_void> {
     cached_symbol(cache, || sdk_symbol(name))
-}
-
-pub(crate) fn resolve_dcmi_symbol(cache: &AtomicPtr<c_void>, name: &CStr) -> Option<*mut c_void> {
-    cached_symbol(cache, || DCMI.symbol(name))
 }

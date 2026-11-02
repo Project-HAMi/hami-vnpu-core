@@ -22,3 +22,31 @@ pub mod externed_api {
     pub unsafe fn rtStreamGetCaptureInfo(_: u64, status: *mut u32, _: *mut u64) -> i32 { unsafe { *status = 0 }; 0 }
 }
 #[cfg(test)] pub mod procfs_test_double;
+
+#[cfg(target_os = "linux")]
+#[path = "../../../crates/limiter/src/dcmi.rs"]
+pub mod dcmi;
+#[path = "../../../crates/limiter/src/dcmi_protocol.rs"]
+pub mod dcmi_protocol;
+#[path = "../../../crates/limiter/src/registry_lock.rs"]
+pub mod registry_lock;
+// These portable tests exercise quota conversion only, never the Linux helper.
+#[cfg(not(target_os = "linux"))]
+pub mod dcmi {
+    pub fn helper_path() -> Option<std::path::PathBuf> {
+        None
+    }
+    #[derive(Default)]
+    pub struct Collector;
+    impl Collector {
+        pub fn snapshot_for_device(
+            &mut self,
+            _: &std::path::Path,
+            _: std::time::Duration,
+            _: &std::sync::atomic::AtomicBool,
+            _: Option<u32>,
+        ) -> std::io::Result<Vec<crate::dcmi_protocol::Record>> {
+            panic!("unexpected DCMI call in quota test")
+        }
+    }
+}

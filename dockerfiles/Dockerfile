@@ -46,13 +46,13 @@ WORKDIR /build
 COPY . .
 RUN cargo build --release --workspace --locked \
     && mkdir /out \
-    && cp target/release/libvnpu.so /out/libvnpu.so \
+    && cp target/release/libvnpu.so target/release/vnpu-dcmi /out/ \
     && python3 scripts/ci/verify-release.py /out/libvnpu.so \
          --arch "$(uname -m)" --source-commit "${SOURCE_COMMIT}" --sdk-image "${SDK_IMAGE}" \
          --cann-version 8.5.2 --require-spatial-apis \
          --output /out/build-info.json \
-    && cd /out && sha256sum libvnpu.so build-info.json > SHA256SUMS
+    && cd /out && sha256sum libvnpu.so vnpu-dcmi build-info.json > SHA256SUMS
 
-# Export only the release library and its provenance; no SDK or test link stubs.
+# Export the paired release artifacts and their provenance; no SDK or test link stubs.
 FROM scratch AS artifacts
 COPY --from=build /out/ /

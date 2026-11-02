@@ -2,6 +2,7 @@
 members = [
     "crates/hook",
     "crates/limiter",
+    "crates/dcmi-helper",
 ]
 resolver = "2"
 

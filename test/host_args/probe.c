@@ -37,8 +37,8 @@ static unsigned char *domain(const char *base, int physical) {
     assert(asprintf(&device_path, "%s.device-%d", base, physical) > 0);
     int fd = open(device_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
     free(device_path);
-    assert(fd >= 0 && !ftruncate(fd, 6256));
-    unsigned char *shm = mmap(NULL, 6256, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    assert(fd >= 0 && !ftruncate(fd, 6512));
+    unsigned char *shm = mmap(NULL, 6512, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     assert(shm != MAP_FAILED); close(fd);
     atomic_store((_Atomic int32_t *)(shm + 6200), getppid()); // live manager owner
     atomic_store((_Atomic uint64_t *)(shm + 6208), UINT64_MAX); // fresh heartbeat

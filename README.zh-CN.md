@@ -31,7 +31,7 @@ cd dist && sha256sum -c SHA256SUMS
 ```
 
 该流程完整构建 release 版本，并对照真实 CANN runtime/DCMI 库验证 API，导出
-`dist/libvnpu.so`、`dist/build-info.json` 和 `dist/SHA256SUMS`。
+`dist/libvnpu.so`、`dist/vnpu-dcmi`、`dist/build-info.json` 和 `dist/SHA256SUMS`。
 Dockerfile 使用官方 `quay.io/ascend/cann:8.5.2-910b-ubuntu22.04-py3.11`
 镜像并固定摘要，Rust 固定为 **1.94.0**；下载官方 **HDK 25.5.1** 包并验证 SHA256，
 只提取真实驱动用户态库用于 API 校验，不安装内核驱动。
@@ -58,7 +58,8 @@ HDK 驱动用户态库版本只说明构建环境，宿主机驱动应与业务 
 
 先准备能正常使用 NPU 的 Linux 容器，确保设备和昇腾运行时库可用。
 将同一个可写的宿主机共享目录挂载到参与容器的 `/hami-shared-region`，
-将构建的库挂载到 `/usr/local/lib/libvnpu.so`。
+将构建的库挂载到 `/usr/local/lib/libvnpu.so`，并将配套的可执行 helper 挂载到
+`/usr/local/lib/vnpu-dcmi`（权限 `0755`）。
 
 将仅用于该业务容器的预加载文件挂载到 `/etc/ld.so.preload`，内容为：
 
@@ -124,3 +125,5 @@ bash scripts/ci.sh
 后端及直接引用生产源码的测试，检查配置、调度逻辑与 hook 行为。独立的发布构建任务
 使用真实 SDK，分别上传通过检查的 AMD64 和 ARM64 库。NPU 执行和业务性能需要
 在兼容的昇腾环境中另行验证。
+
+升级现有部署前，请按[调度与 DCMI 升级步骤](docs/scheduler-upgrade.md)暂停同卡服务并归档旧共享状态。必须成对安装 `libvnpu.so` 和可执行的 `vnpu-dcmi`。

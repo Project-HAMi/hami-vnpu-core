@@ -306,7 +306,8 @@ fn real_fork_refreshes_self_pid_without_exempting_inherited_parent_slot() {
 
 #[test]
 fn memory_abi_preserves_original_prefix_and_appends_overdraft_fields() {
-    assert_eq!(6256, std::mem::size_of::<LocalContainerShmem>());
+    assert_eq!(6512, std::mem::size_of::<LocalContainerShmem>());
+    assert_eq!(6256, std::mem::offset_of!(LocalContainerShmem, measurement_started_us));
     assert_eq!(1080, std::mem::offset_of!(LocalContainerShmem, procs));
     assert_eq!(6224, std::mem::offset_of!(LocalContainerShmem, overdraft_pool));
 }
