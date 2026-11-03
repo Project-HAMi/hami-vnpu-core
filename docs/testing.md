@@ -125,6 +125,7 @@ fake SDKs. These CPU artifacts have not passed real-SDK release verification.
 | `test/memory_ledger` | Production per-card reservation ownership, interrupted allocation cleanup, failed frees, client lifetime, independent domains and overflow. CANN calls are mocked. |
 | `test/worker_cpu/run.py` | Source-linked worker and hook admission cases with observed lock/futex boundaries; Cached/configured/DVPP/physical allocation admission, failure rollback, allocation/free alias deduplication, physical retain lifetimes, concurrent free/address reuse, per-card ownership, threads and fork. Each case runs in a separate process with a timeout. |
 | `test/preload/run.py` | No eager SDK dependencies; ordinary shell/tool startup without CANN, preserved signal handlers, no preload-time supervisor, passive hooks, successful retry after global/local `dlopen`, and cached calls surviving the application's `dlclose`. |
+| `test/memory_info/run.py` | Actual preloaded hook with a fake runtime: pool-specific capacities, native errors and output validation, quota clamping, physical-card remapping, unlimited/unconfigured calls, and cold spatial queries. |
 | `test/dcmi_helper.sh` | Actual helper/interceptor with a fake DCMI driver: physical card/chip selection, errors, deadlines, descendant reaping, helper bypass, legacy rejection, SHM aliases and relative paths after chdir. |
 | `test/process_local.sh` | Actual per-process cache, concurrent initialization and real fork cases. |
 | `test/spatial_cpu/run.py` | Actual built Rust hook library preloaded into a C client with fake ACL: ceil budgets, resets, API failures, device/context switching and fork handling. |
@@ -254,6 +255,7 @@ CPU 脚本在临时目录构建，退出时清理，不替换已安装的库。�
 - Preload：无 SDK 硬依赖、无 CANN 的普通命令启动、保留信号处理器、加载期无 supervisor、
   未配置时透传、global/local `dlopen` 后的符号重试，以及应用 `dlclose` 后缓存调用仍有效。
 - Process-local：真实缓存实现的并发初始化和 fork。
+- Memory info：预加载实际 Hook，使用 fake runtime 验证按池查询、原生错误及输出检查、配额上限、物理卡映射、不限额/未配置透传，以及空分初始化前的显存查询。
 - Spatial：预加载实际构建的 Rust 库，通过 fake ACL 验证向上取整、重置、API 错误、
   设备/上下文切换及 fork 行为。
 - HostArgs：ABI、capture、准入、嵌套转调、按卡路由、线程/fork，以及应用释放 ACL 句柄后的缓存调用。

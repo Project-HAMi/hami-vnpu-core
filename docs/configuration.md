@@ -65,7 +65,7 @@ Leave the timing controls at their defaults unless measuring a particular schedu
 
 `overdraft` has internal defaults of 10 shared admission tickets, a 5,000 µs blocking threshold per admission call, and 1,000 µs polling. These are not environment settings. A depleted open pool can refill in the same round; 10 is pool capacity, not a cumulative per-round limit or a runtime budget. Enable it with `NPU_SCHED_POLICY=overdraft`.
 
-The virtual HBM free-memory report reserves 128 MiB of overhead. This internal constant is not a configurable variable; the configured quota remains the allocation ceiling.
+Memory queries preserve CANN's requested pool/type mapping and native errors. With a quota enabled, reported total is the smaller of the native pool total and the quota; reported free is the smaller of native pool free and the quota remaining after owned reservations and 128 MiB of overhead. Empty pools remain empty. All queries on a card use the same group ledger; there is no separate quota per page type. The overhead is an internal constant, and the configured quota remains the allocation ceiling. Querying memory does not apply spatial compute budgets.
 
 ## Library loading and build paths
 

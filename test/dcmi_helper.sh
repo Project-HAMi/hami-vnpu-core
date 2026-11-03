@@ -19,7 +19,7 @@ __attribute__((constructor)) static void init(void) {
     if (getenv("VNPU_EXPECT_NO_RUNTIME")) _Exit(99);
 }
 uint64_t rtMemGetInfoEx(uint64_t kind, size_t *free, size_t *total) {
-    (void)kind; *free = 4096; *total = 8192; return 0;
+    (void)kind; *free = (size_t)6144 * 1024 * 1024; *total = (size_t)8192 * 1024 * 1024; return 0;
 }
 C
 cat > "$fixture/driver.c" <<'C'
@@ -97,7 +97,8 @@ int main(void) {
     if (!info) return 2;
     size_t free = 0, total = 0;
     if (info(0, &free, &total)) return 3;
-    if (getenv("NPU_DCMI_HELPER_PROCESS")) return free != 4096 || total != 8192;
+    if (getenv("NPU_DCMI_HELPER_PROCESS"))
+        return free != (size_t)6144 * 1024 * 1024 || total != (size_t)8192 * 1024 * 1024;
     return total != (size_t)4096 * 1024 * 1024;
 }
 C

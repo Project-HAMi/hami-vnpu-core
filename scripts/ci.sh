@@ -27,6 +27,7 @@ python3 test/worker_cpu/run.py
 bash test/process_local.sh
 cargo build --release --locked --workspace
 python3 test/preload/run.py "$CARGO_TARGET_DIR/release/libvnpu.so"
+python3 test/memory_info/run.py "$CARGO_TARGET_DIR/release/libvnpu.so"
 python3 test/spatial_cpu/run.py "$CARGO_TARGET_DIR/release/libvnpu.so"
 HAMI_ARTIFACT_DIR="$CARGO_TARGET_DIR/release" bash test/host_args.sh
 HAMI_ARTIFACT_DIR="$CARGO_TARGET_DIR/release" bash test/dcmi_helper.sh

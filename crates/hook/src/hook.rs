@@ -244,28 +244,39 @@ pub unsafe extern "C" fn rtMemGetInfoEx(
     free: *mut usize,
     total: *mut usize,
 ) -> u64 {
-    if limiter::config::vnpu_configuration_requested() {
+    let configured = limiter::config::vnpu_configuration_requested();
+    if configured {
         limiter::config::validate_requested_limits()
             .unwrap_or_else(|error| crate::spatial::fatal(&error));
         let _ = crate::spatial::enabled(); // Preserve the spatial fork guard.
-        let mut logical = -1;
-        if unsafe { limiter::externed_api::rtGetDevice(&mut logical) } == 0 && logical >= 0 {
-            // GE queries memory before its compute device object exists. Resolve
-            // only the quota here; device/context selection still applies budgets.
-            let client = crate::npu_limiter_for_device(logical);
-            if client.is_hbm_limited() {
-                unsafe { client.get_hbm_info(free, total) };
-                return 0;
-            }
-        }
     }
-    passthrough!(
+    // CANN owns memory-type mapping, pool availability and output validation.
+    // A quota must not turn an unsupported pool or native error into success.
+    let result = passthrough!(
         "rtMemGetInfoEx",
         (u64, *mut usize, *mut usize),
         memInfoType,
         free,
         total
-    )
+    );
+    if result != RT_ERROR_NONE || !configured {
+        return result;
+    }
+    let mut logical = -1;
+    if unsafe { limiter::externed_api::rtGetDevice(&mut logical) } == 0 && logical >= 0 {
+        // GE queries memory before its compute device object exists. Resolve
+        // only the quota here; device/context selection still applies budgets.
+        let client = crate::npu_limiter_for_device(logical);
+        if client.is_hbm_limited() {
+            let (mut quota_free, mut quota_total) = (0, 0);
+            unsafe {
+                client.get_hbm_info(&mut quota_free, &mut quota_total);
+                *free = (*free).min(quota_free);
+                *total = (*total).min(quota_total);
+            }
+        }
+    }
+    result
 }
 
 // ACL ABI from CANN 9.1 acl_rt.h; resource enums and aclError are C ints.
