@@ -196,11 +196,21 @@ fn measuring_uses_exclusive_original_event_chain_and_exactly_one_process_report(
     assert_eq!(0,c.inner.shmem.reported_count.load(Ordering::Acquire));
 }
 
-fn pending_stream_measurement(previous_stream: u64) {
+/// Check pending-stream attribution through measurement and the next admission.
+fn pending_stream_measurement(previous_stream: u64, start_running: bool) {
+    use crate::wait_observer as observed;
     let c = client(0, true);
     timing(&c).lock.write().unwrap().last_user_stream = previous_stream;
-    c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+    c.inner.shmem.state.store(if start_running { STATE_RUNNING } else { STATE_MEASURING }, Ordering::Release);
+    let unlocks = observed::WRITE_UNLOCKS.load(Ordering::Acquire);
     let (rx, thread) = waiting_thread(c.clone(), 7);
+    if start_running {
+        // The request must execute the RUNNING/zero-token unlock before the
+        // manager advances; merely starting the thread would not prove that.
+        wait_until(|| observed::WRITE_UNLOCKS.load(Ordering::Acquire) > unlocks);
+        assert!(rx.try_recv().is_err());
+        c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+    }
     wait_until(|| c.inner.shmem.reported_count.load(Ordering::Acquire) == 1);
     let trace = calls();
     let measured_stream = timing(&c).lock.read().unwrap().last_user_stream;
@@ -236,12 +246,17 @@ fn pending_stream_measurement(previous_stream: u64) {
 
 #[test]
 fn pending_stream_switch_measures_previous_batch_stream() {
-    pending_stream_measurement(6);
+    pending_stream_measurement(6, false);
 }
 
 #[test]
 fn pending_stream_switch_preserves_default_stream_drain() {
-    pending_stream_measurement(0);
+    pending_stream_measurement(0, false);
+}
+
+#[test]
+fn pending_stream_switch_waits_without_tokens_before_measuring_previous_stream() {
+    pending_stream_measurement(6, true);
 }
 
 #[test]

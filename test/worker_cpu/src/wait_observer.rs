@@ -11,6 +11,7 @@ pub static CHANGE_BEFORE_SYSCALL: AtomicBool = AtomicBool::new(false);
 pub static WAIT_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static WAIT_ERRNO: AtomicI32 = AtomicI32::new(-1);
 pub static WAIT_TID: AtomicI32 = AtomicI32::new(0);
+pub static WRITE_UNLOCKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn publish_next_batch() {
     let region = REGION.get().unwrap();
@@ -45,6 +46,7 @@ impl<T> DerefMut for WriteGuard<'_, T> {
 impl<T> Drop for WriteGuard<'_, T> {
     fn drop(&mut self) {
         drop(self.0.take());
+        WRITE_UNLOCKS.fetch_add(1, Ordering::Release);
         if CHANGE_AFTER_UNLOCK.swap(false, Ordering::AcqRel) { publish_next_batch(); }
     }
 }
