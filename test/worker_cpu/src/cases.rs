@@ -196,6 +196,77 @@ fn measuring_uses_exclusive_original_event_chain_and_exactly_one_process_report(
     assert_eq!(0,c.inner.shmem.reported_count.load(Ordering::Acquire));
 }
 
+fn pending_stream_measurement(previous_stream: u64) {
+    let c = client(0, true);
+    timing(&c).lock.write().unwrap().last_user_stream = previous_stream;
+    c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+    let (rx, thread) = waiting_thread(c.clone(), 7);
+    wait_until(|| c.inner.shmem.reported_count.load(Ordering::Acquire) == 1);
+    let trace = calls();
+    let measured_stream = timing(&c).lock.read().unwrap().last_user_stream;
+    let duration = c.inner.shmem.reports[0].duration_us.load(Ordering::Acquire);
+    assert_eq!(c.inner.shmem.reports[0].batch_id.load(Ordering::Acquire), 42);
+    assert!(rx.try_recv().is_err(), "measurement is not admission for stream 7");
+
+    c.inner.shmem.batch_id.store(43, Ordering::Relaxed);
+    c.inner.shmem.active_workers.store(0, Ordering::Relaxed);
+    c.inner.shmem.tokens_remaining.store(1, Ordering::Relaxed);
+    c.inner.shmem.state.store(STATE_RUNNING, Ordering::Release);
+    futex::wake_all(&c.inner.shmem.state);
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    thread.join().unwrap();
+
+    assert_eq!(measured_stream, previous_stream,
+        "pending stream 7 replaced the stream belonging to batch 42; trace: {trace:?}");
+    if previous_stream == 0 {
+        assert_eq!(trace, vec![Call::DeviceSync]);
+        assert_eq!(duration, 0, "default-stream drain remains an untimed completion");
+    } else {
+        assert_eq!(trace, vec![Call::Capture(previous_stream), Call::Record(13, previous_stream),
+            Call::Wait(10, 13), Call::Record(12, 10), Call::StreamSync(10), Call::Elapsed(11, 12)]);
+        assert_eq!(duration, 2500);
+    }
+    let context = timing(&c);
+    let lock = context.lock.read().unwrap();
+    assert_eq!(lock.current_batch_id, 43);
+    assert_eq!(lock.last_user_stream, 7, "new stream is published after admission");
+    assert_eq!(remaining(&c), 0);
+    assert_eq!(c.inner.shmem.active_workers.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn pending_stream_switch_measures_previous_batch_stream() {
+    pending_stream_measurement(6);
+}
+
+#[test]
+fn pending_stream_switch_preserves_default_stream_drain() {
+    pending_stream_measurement(0);
+}
+
+#[test]
+fn pending_stream_switch_preserves_attribution_until_woken_and_admitted() {
+    use crate::wait_observer as observed;
+    let c = client(0, true);
+    c.inner.shmem.state.store(STATE_IDLE, Ordering::Release);
+    observed::REGION.set(c.inner.shmem).unwrap();
+    let (rx, thread) = waiting_thread(c.clone(), 7);
+    wait_until(|| observed::WAIT_CALLS.load(Ordering::Acquire) == 1);
+    let pending_stream = timing(&c).lock.read().unwrap().last_user_stream;
+    assert!(rx.try_recv().is_err());
+    assert!(calls().is_empty());
+    observed::publish_next_batch();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    thread.join().unwrap();
+    assert_eq!(pending_stream, 6, "a waiting request must not change batch attribution");
+    let context = timing(&c);
+    let lock = context.lock.read().unwrap();
+    assert_eq!(lock.last_user_stream, 7);
+    assert_eq!(lock.current_batch_id, 43);
+    assert_eq!(remaining(&c), 0);
+    assert_eq!(calls(), vec![Call::Record(11, 10)]);
+}
+
 #[test]
 fn waiting_writer_progresses_under_continuous_same_stream_readers() {
     let c=client(1_000_000_000,true);let stop=Arc::new(AtomicBool::new(false));let attempts=Arc::new(AtomicU64::new(0));
