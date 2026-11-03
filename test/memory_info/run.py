@@ -20,11 +20,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix="vnpu-memory-info-") as directory:
         root = Path(directory)
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
-                        str(source / "runtime.c"), "-o", str(root / "libruntime.so")], check=True)
+                        str(source / "runtime.c"), "-o", str(root / "libruntime.so")], check=True, timeout=60)
         (root / "libascendcl.so").symlink_to("libruntime.so")
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                         str(source / "probe.c"), "-L" + str(root), "-lruntime",
-                        "-o", str(root / "probe")], check=True)
+                        "-o", str(root / "probe")], check=True, timeout=60)
         clean = {k: v for k, v in os.environ.items()
                  if not k.startswith(("NPU_", "FAKE_"))
                  and k not in {"LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"}}
