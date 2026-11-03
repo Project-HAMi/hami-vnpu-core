@@ -208,6 +208,21 @@ pub fn open_global_registry(path: &str) -> &'static GlobalRegistry {
             );
         }
 
+        // Containers with different UIDs share this registry. open(0666) alone
+        // still applies the creator's umask, so set access before publishing it.
+        if unsafe { libc::fchmod(temp_fd, 0o666) } < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::munmap(ptr, size);
+                close(temp_fd);
+                libc::unlink(c_temp_path.as_ptr());
+            }
+            panic!(
+                "failed to set global registry permissions {}: {error}",
+                path
+            );
+        }
+
         let linked = unsafe { libc::link(c_temp_path.as_ptr(), c_path.as_ptr()) } == 0;
         let link_error = if linked {
             None
