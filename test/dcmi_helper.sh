@@ -164,8 +164,8 @@ done
 
 # An incompatible legacy registry must terminate the application, not allow
 # the old worker-startup timeout to fall back to an unlimited stub.
-# Reject the original queue and fenced protocols without per-worker entry stamps.
-for marker in '\001\000\000\000' '\062\120\116\126' '\063\120\116\126'; do
+# Reject the original queue and protocols predating batch-tagged normal tickets.
+for marker in '\001\000\000\000' '\062\120\116\126' '\063\120\116\126' '\064\120\116\126'; do
 dd if=/dev/zero of="$fixture/legacy.device-0" bs=2848 count=1 status=none
 printf '%b' "$marker" | dd of="$fixture/legacy.device-0" bs=1 seek=16 conv=notrunc status=none
 set +e

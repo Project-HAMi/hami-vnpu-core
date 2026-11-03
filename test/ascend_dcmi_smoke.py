@@ -51,7 +51,8 @@ def local_sample(path):
         return None
     return {"state": struct.unpack_from("<I", data, 24)[0],
             "batch": struct.unpack_from("<Q", data, 32)[0],
-            "tokens": struct.unpack_from("<Q", data, 40)[0],
+            "tokens": struct.unpack_from("<Q", data, 40)[0] & ((1 << 21) - 1),
+            "token_batch": struct.unpack_from("<Q", data, 40)[0] >> 21,
             "manager_pid": struct.unpack_from("<i", data, 6200)[0],
             "generation": struct.unpack_from("<I", data, 6204)[0],
             "active_workers": struct.unpack_from("<I", data, 48)[0],

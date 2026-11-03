@@ -26,10 +26,18 @@ heartbeat. Generation checks fence replaced managers and reused slots. Spatial
 managers maintain memory state without joining compute rotation. These deadlines
 do not preempt a kernel already submitted to the device.
 
-An upgrade from the original queue protocol or fenced protocols 2/3 requires a
-coordinated restart. Protocol 4 preserves the 2848-byte global layout and the
-device-plugin process-memory offsets. Local mappings are 6512 bytes: the previous
-6256-byte prefix is unchanged, followed by 32 per-worker measurement-entry timestamps.
+Normal tickets atomically bind a batch ID to the remaining balance. A worker
+paused across a round change cannot spend a replacement batch's tickets using
+its old snapshot. A rejected stale attempt returns to state/context initialization.
+
+An upgrade from the original queue protocol or fenced protocols 2/3/4 requires a
+coordinated restart. Protocol 5 preserves the 2848-byte global layout, the
+6512-byte local layout and the device-plugin process-memory offsets. The normal
+ticket word at local offset 40 now stores the balance in its low 21 bits and the
+batch ID in its upper 43 bits. Diagnostic readers must decode that word; old
+workers must not share these files. Batch tags are never reused: after the maximum
+43-bit batch ID, admission stays closed until a coordinated fresh-state restart.
+The 32 per-worker measurement-entry timestamps remain at offset 6256.
 Equal file sizes do not imply protocol compatibility.
 An incompatible registry exits with code 78 instead of starting an unlimited
 worker; repeatedly restarting a Pod cannot repair that registry.
@@ -71,8 +79,14 @@ DCMI 查询在全新进程中执行，由独立 subreaper 超时终止并回收�
 五毫秒延迟判断只计算 worker 进入测量前的等待；进入测量后的设备同步即使超过五毫秒，
 仍可在 500 毫秒报告期限内提交有效样本。缺失或过期的测量入口时间戳会使样本失效。
 
-旧队列协议及协议 2/3 升级到协议 4 必须协调停机。全局结构仍为 2848 字节，
-本地结构为 6512 字节，保留原有 6256 字节前缀，尾部追加 32 个 worker 的测量入口时间戳。
+普通令牌将批次号和余额绑定在同一个原子值中。跨轮次暂停的 worker 不能用旧快照
+消耗新批次的令牌；过期尝试会重新检查状态并初始化当前批次的上下文。
+
+旧队列协议及协议 2/3/4 升级到协议 5 必须协调停机。全局结构仍为 2848 字节，
+本地结构仍为 6512 字节，保留设备插件读取的进程显存偏移。本地偏移 40 的普通令牌字
+改为低 21 位存余额、高 43 位存批次号；诊断工具必须解码，旧 worker 不能共享这些文件。
+批次号不回绕复用，达到 43 位上限后停止准入，需要协调停机并重建共享状态。
+32 个 worker 的测量入口时间戳仍从偏移 6256 开始。
 文件大小相同不代表协议兼容。
 不兼容时进程以 78 退出，单独反复重启 Pod 无法恢复。
 

@@ -212,7 +212,10 @@ fn partially_consumed_batch_yields_after_progress_stops_without_using_idle_time_
         let run = scope.spawn(|| m.run_local_round(&plan));
         wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_RUNNING);
         m.local.active_workers.store(1, Ordering::Release);
-        m.local.tokens_remaining.store(1884, Ordering::Release);
+        for _ in 0..116 {
+            let snapshot = m.local.tokens_remaining.snapshot();
+            assert!(m.local.tokens_remaining.try_acquire(snapshot, m.local.batch_id.load(Ordering::Acquire)));
+        }
         assert_eq!(run.join().unwrap(), (0, 0));
     });
     assert!(
@@ -220,7 +223,7 @@ fn partially_consumed_batch_yields_after_progress_stops_without_using_idle_time_
         "waited for the full runtime budget"
     );
     assert_eq!(m.local.state.load(Ordering::Acquire), STATE_IDLE);
-    assert_eq!(m.local.tokens_remaining.load(Ordering::Acquire), 0);
+    assert_eq!(m.local.tokens_remaining.remaining(), 0);
 }
 
 #[test]
@@ -233,7 +236,7 @@ fn completed_reported_batch_still_updates_execution_statistics() {
         let batch = m.local.batch_id.load(Ordering::Acquire);
         m.local.active_workers.store(1, Ordering::Release);
         m.local.reports[0].occupied.store(1, Ordering::Release);
-        m.local.tokens_remaining.store(0, Ordering::Release);
+        m.local.tokens_remaining.close();
         wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
         report(&m, 0, batch, get_time_us(), 2500);
         m.local.reported_count.store(1, Ordering::Release);
@@ -260,7 +263,7 @@ fn timely_measurement_with_slow_device_drain_updates_execution_statistics() {
         let batch = m.local.batch_id.load(Ordering::Acquire);
         m.local.active_workers.store(1, Ordering::Release);
         m.local.reports[0].occupied.store(1, Ordering::Release);
-        m.local.tokens_remaining.store(0, Ordering::Release);
+        m.local.tokens_remaining.close();
         wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
         // Measurement begins promptly, but synchronization drains 40ms of device work.
         begin_measurement(&m, 0);
@@ -284,7 +287,7 @@ fn missing_and_stale_reports_do_not_count_as_completed_work() {
         m.local.reported_count.store(1, Ordering::Release); // late previous-batch writer
         m.local.reports[0].occupied.store(1, Ordering::Release);
         report(&m, 0, 0, get_time_us(), 10_000_000_000);
-        m.local.tokens_remaining.store(0, Ordering::Release);
+        m.local.tokens_remaining.close();
         assert_eq!(run.join().unwrap(), (0, 0));
     });
     assert_eq!(m.current_avg_us, 500);
@@ -317,13 +320,15 @@ fn replaced_manager_cannot_reset_successor_state_or_reused_slot_even_on_drop() {
     let mut m = manager(20.0, false, 500);
     let local = m.local;
     let global = m.global;
+    assert!(m.start_local_batch(8, 123).is_ok());
+    let old_ticket = local.tokens_remaining.snapshot();
     {
         let _guard = m.registry.lock().unwrap();
         local.manager_generation.store(2, Ordering::Release);
         global.slots[0].generation.store(2, Ordering::Release);
         local.state.store(STATE_RUNNING, Ordering::Release);
         local.batch_id.store(9, Ordering::Release);
-        local.tokens_remaining.store(123, Ordering::Release);
+        assert!(local.tokens_remaining.open(9, 123));
     }
     assert!(!m.update_heartbeat());
     assert!(m.start_local_batch(10, 999).is_err());
@@ -331,11 +336,48 @@ fn replaced_manager_cannot_reset_successor_state_or_reused_slot_even_on_drop() {
     assert!(!m.wait_for_global_turn());
     m.update_local_stats(10_000, 100);
     drop(m);
+    assert!(!local.tokens_remaining.try_acquire(old_ticket, 8));
     assert_eq!(local.state.load(Ordering::Acquire), STATE_RUNNING);
     assert_eq!(local.batch_id.load(Ordering::Acquire), 9);
-    assert_eq!(local.tokens_remaining.load(Ordering::Acquire), 123);
+    assert_eq!(local.tokens_remaining.remaining(), 123);
     assert_eq!(local.manager_generation.load(Ordering::Acquire), 2);
     assert_eq!(global.slots[0].is_active.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn manager_round_closure_and_next_publication_invalidate_old_tickets() {
+    let m = manager(20.0, false, 500);
+    assert!(m.start_local_batch(41, 1).is_ok());
+    let old = m.local.tokens_remaining.snapshot();
+    let plan = SharePlan { tokens: 1, time_limit_us: 10_000,
+        expected_run_us: 500, rest_wait_us: 0, anchor_speed_us: 500 };
+    assert_eq!(m.run_local_round(&plan), (0, 0));
+    assert_eq!(m.local.batch_id.load(Ordering::Acquire), 42);
+    assert_eq!(m.local.state.load(Ordering::Acquire), STATE_IDLE);
+    assert_eq!(m.local.tokens_remaining.remaining(), 0);
+    assert!(!m.local.tokens_remaining.try_acquire(old, 41));
+    assert!(m.start_local_batch(43, 1).is_ok());
+    assert!(!m.local.tokens_remaining.try_acquire(old, 41));
+    assert_eq!(m.local.tokens_remaining.remaining(), 1);
+    let local = m.local;
+    let latest = local.tokens_remaining.snapshot();
+    drop(m);
+    assert!(!local.tokens_remaining.try_acquire(latest, 43));
+    assert_eq!(local.tokens_remaining.remaining(), 0);
+    assert!(!local.tokens_remaining.open(43, 1));
+}
+
+#[test]
+fn manager_does_not_wrap_an_exhausted_normal_batch_tag() {
+    let m = manager(20.0, false, 500);
+    assert!(m.start_local_batch(crate::shmem::NormalTokens::MAX_BATCH, 1).is_ok());
+    let old = m.local.tokens_remaining.snapshot();
+    let plan = SharePlan { tokens: 1, time_limit_us: 10_000,
+        expected_run_us: 500, rest_wait_us: 0, anchor_speed_us: 500 };
+    assert_eq!(m.run_local_round(&plan), (0, 0));
+    assert_eq!(m.local.state.load(Ordering::Acquire), STATE_IDLE);
+    assert_eq!(m.local.tokens_remaining.remaining(), 0);
+    assert!(!m.local.tokens_remaining.try_acquire(old, crate::shmem::NormalTokens::MAX_BATCH));
 }
 
 #[test]
@@ -391,7 +433,7 @@ fn delayed_report_after_token_exhaustion_cannot_train_average() {
         let batch = m.local.batch_id.load(Ordering::Acquire);
         m.local.active_workers.store(1, Ordering::Release);
         m.local.reports[0].occupied.store(1, Ordering::Release);
-        m.local.tokens_remaining.store(0, Ordering::Release);
+        m.local.tokens_remaining.close();
         wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
         // The next request/hook arrives within the 500ms completion grace, but
         // its event interval includes an idle gap after the last admission.
@@ -417,7 +459,7 @@ fn mixed_timed_and_untimed_workers_do_not_train_a_partial_average() {
         for slot in &m.local.reports[..2] {
             slot.occupied.store(1, Ordering::Release);
         }
-        m.local.tokens_remaining.store(0, Ordering::Release);
+        m.local.tokens_remaining.close();
         wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
         report(&m, 0, batch, get_time_us(), 2500);
         report(&m, 1, batch, get_time_us(), 0);
@@ -445,7 +487,7 @@ fn manager_observation_gap_before_measuring_cannot_train_idle_time() {
             let _guard = m.registry.lock().unwrap();
             m.local.active_workers.store(1, Ordering::Release);
             m.local.reports[0].occupied.store(1, Ordering::Release);
-            m.local.tokens_remaining.store(0, Ordering::Release);
+            m.local.tokens_remaining.close();
             thread::sleep(Duration::from_millis(40));
         }
         wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
@@ -591,7 +633,7 @@ fn physical_card_domains_keep_registry_quota_and_allowance_independent() {
 
     let other_registry_before = global_snapshot(global_b);
     local_a.memory_used.store(1024 * MB_TO_BYTES, Ordering::Release);
-    local_a.tokens_remaining.store(17, Ordering::Release);
+    assert!(local_a.tokens_remaining.open(1, 17));
     local_a.state.store(STATE_RUNNING, Ordering::Release);
     local_a.procs[0].pid.store(pid, Ordering::Release);
     local_a.procs[0].hbm_used[0].store(1024 * MB_TO_BYTES, Ordering::Release);
@@ -601,7 +643,7 @@ fn physical_card_domains_keep_registry_quota_and_allowance_independent() {
     manager_a.pass_baton();
     assert_eq!(global_snapshot(global_b), other_registry_before);
     assert_eq!(local_b.memory_used.load(Ordering::Acquire), 0);
-    assert_eq!(local_b.tokens_remaining.load(Ordering::Acquire), 0);
+    assert_eq!(local_b.tokens_remaining.remaining(), 0);
     assert_eq!(local_b.state.load(Ordering::Acquire), STATE_IDLE);
     assert!(!local_b.overdraft_pool.try_acquire(local_b.overdraft_pool.snapshot(), 10, true));
 
@@ -610,7 +652,7 @@ fn physical_card_domains_keep_registry_quota_and_allowance_independent() {
     let reopened = crate::shmem::setup::create_shmem::<LocalContainerShmem>(&a.local_shm_path);
     assert_eq!(reopened.memory_used.load(Ordering::Acquire), 1024 * MB_TO_BYTES);
     assert_eq!(reopened.procs[0].hbm_used[0].load(Ordering::Acquire), 1024 * MB_TO_BYTES);
-    assert_eq!(reopened.tokens_remaining.load(Ordering::Acquire), 17);
+    assert_eq!(reopened.tokens_remaining.remaining(), 17);
     drop(manager_a);
     assert_eq!(global_snapshot(global_b), other_registry_before);
     assert_eq!(global_b.slots[0].is_active.load(Ordering::Acquire), 1);
@@ -684,7 +726,7 @@ fn timely_entry_without_device_completion_still_has_a_bounded_report_wait() {
         wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_RUNNING);
         m.local.active_workers.store(1, Ordering::Release);
         m.local.reports[0].occupied.store(1, Ordering::Release);
-        m.local.tokens_remaining.store(0, Ordering::Release);
+        m.local.tokens_remaining.close();
         wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
         begin_measurement(&m, 0);
         let started = Instant::now();
