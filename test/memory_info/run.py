@@ -52,6 +52,7 @@ def main():
                 print("PASS " + name, flush=True)
 
         case("aggregate-quota", 1, 2944 * mib, 4096 * mib)
+        case("nonaggregate-pool-over-quota", 2, 2944 * mib, 4096 * mib)
         case("ddr-pool", 0, 1024 * mib, 2048 * mib)
         case("huge-page-pool", 4, 256 * mib, 512 * mib)
         case("exhausted-normal-pool", 5, 0, 256 * mib)
@@ -66,6 +67,8 @@ def main():
         case("small-quota-overhead", 1, 0, 64 * mib,
              settings={"NPU_MEMORY_LIMIT_MB": "64", "FAKE_USED_MB": "0"})
         case("unlimited", 1, 6144 * mib, 8192 * mib, settings={"NPU_MEMORY_LIMIT_MB": "0"})
+        case("unlimited-cold-query", 1, 6144 * mib, 8192 * mib,
+             settings={"NPU_MEMORY_LIMIT_MB": "0", "FAKE_COLD_QUERY": "1"})
         case("unconfigured", 1, 6144 * mib, 8192 * mib, configured=False, device_queries=0)
         case("no-current-device", 1, 6144 * mib, 8192 * mib, settings={"FAKE_NO_DEVICE": "1"})
         case("spatial-cold-query", 1, 2944 * mib, 4096 * mib, settings={"NPU_SCHED_POLICY": "spatial"})

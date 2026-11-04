@@ -24,6 +24,11 @@ static void domain(const char *base, int physical, uint64_t quota, uint64_t used
     unsigned char *shm = mmap(NULL, 6512, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     assert(shm != MAP_FAILED);
     close(fd);
+    if (getenv("FAKE_COLD_QUERY")) {
+        /* Leave publication to the real in-process supervisor. */
+        assert(!munmap(shm, 6512));
+        return;
+    }
     atomic_store((_Atomic uint64_t *)(shm + 0), quota);
     atomic_store((_Atomic int32_t *)(shm + 1080), getpid());
     atomic_store((_Atomic uint64_t *)(shm + 1088), used);
@@ -32,6 +37,22 @@ static void domain(const char *base, int physical, uint64_t quota, uint64_t used
     atomic_store((_Atomic int32_t *)(shm + 6200), getppid());
     atomic_store((_Atomic uint64_t *)(shm + 6208), UINT64_MAX);
     atomic_store((_Atomic uint32_t *)(shm + 6220), 1);
+    assert(!munmap(shm, 6512));
+}
+
+static void assert_supervisor_published(const char *base) {
+    char *path = NULL;
+    assert(asprintf(&path, "%s.device-7", base) > 0);
+    int fd = open(path, O_RDONLY);
+    free(path);
+    assert(fd >= 0);
+    unsigned char *shm = mmap(NULL, 6512, PROT_READ, MAP_SHARED, fd, 0);
+    assert(shm != MAP_FAILED);
+    close(fd);
+    /* Prove that the query waited for publication, rather than falling back. */
+    assert(atomic_load((_Atomic uint32_t *)(shm + 6220)) == 1);
+    assert(atomic_load((_Atomic int32_t *)(shm + 6200)) == getpid());
+    assert(atomic_load((_Atomic uint64_t *)(shm + 0)) == 0);
     assert(!munmap(shm, 6512));
 }
 
@@ -60,6 +81,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "kind=%" PRIu64 " result=%" PRIu64 " free=%zu total=%zu native_calls=%u device_calls=%u\n",
                 kind, result, free, total, fake_queries(), fake_device_queries());
         return 1;
+    }
+    if (getenv("FAKE_COLD_QUERY")) {
+        assert(local);
+        assert_supervisor_published(local);
     }
     return 0;
 }

@@ -31,6 +31,7 @@ uint64_t rtMemGetInfoEx(uint64_t kind, size_t *free, size_t *total) {
     switch (kind) {
         case 0: *free = 1024 * MIB; *total = 2048 * MIB; return 0;
         case 1: *free = 6144 * MIB; *total = 8192 * MIB; return 0;
+        case 2: *free = 6144 * MIB; *total = 8192 * MIB; return 0;
         case 4: *free = 256 * MIB; *total = 512 * MIB; return 0;
         case 5: *free = 0; *total = 256 * MIB; return 0;
         case 8: *free = 0; *total = 0; return 0;
