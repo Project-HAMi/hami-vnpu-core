@@ -694,8 +694,6 @@ impl SchedulerClient {
         // Batch initialization, stream changes and measurement remain exclusive.
         let mut lock = timing.lock.write().unwrap();
 
-        lock.last_user_stream = user_stream;
-
         loop {
             assert!(
                 !timing.retired.load(Ordering::Acquire),
@@ -727,7 +725,10 @@ impl SchedulerClient {
                     }
 
                     if self.try_consume_one_token(global_batch) {
-                        // SUCCESS!
+                        // A pending request must not change the previous batch's
+                        // measurement stream. Publish this request's stream only
+                        // after admission, including after releasing the lock to wait.
+                        lock.last_user_stream = user_stream;
 
                         // First Token of Batch
                         if !lock.batch_active {
