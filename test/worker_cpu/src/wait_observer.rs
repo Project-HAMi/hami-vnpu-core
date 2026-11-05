@@ -17,7 +17,7 @@ pub fn publish_next_batch() {
     let region = REGION.get().unwrap();
     region.batch_id.store(43, Ordering::Relaxed);
     region.active_workers.store(0, Ordering::Relaxed);
-    region.tokens_remaining.store(1, Ordering::Relaxed);
+    assert!(region.tokens_remaining.open(43, 1));
     region.state.store(STATE_RUNNING, Ordering::Release);
     crate::raw_futex::wake_all(&region.state);
 }

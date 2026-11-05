@@ -630,19 +630,19 @@ impl SchedulerClient {
 
 // Limit computing power
 impl SchedulerClient {
-    /// Reserve exactly one ticket, without a transient zero-to-MAX underflow.
-    /// The shared balance can change between the initial load and decrement.
-    /// Never expose a wrapped balance that another process could consume.
+    /// Reserve one ticket only from the batch whose context was checked.
+    /// Include the batch in the CAS so an equal-balance refill is not an ABA.
     #[inline]
-    fn try_consume_one_token(&self) -> bool {
+    fn try_consume_one_token(&self, batch: u64) -> bool {
         let remaining = &self.inner.shmem.tokens_remaining;
-        let current = remaining.load(Ordering::Acquire);
-        // On contention, return to the caller to recheck state/batch rather
-        // than retrying against a potentially replenished round's balance.
-        current != 0
-            && remaining
-                .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        let snapshot = remaining.snapshot();
+        let current_batch = || {
+            self.inner.shmem.state.load(Ordering::Acquire) == STATE_RUNNING
+                && self.inner.shmem.batch_id.load(Ordering::Acquire) == batch
+        };
+        // A state change after a successful reservation may conservatively
+        // retire that old ticket. Never refund into a potentially newer batch.
+        current_batch() && remaining.try_acquire(snapshot, batch) && current_batch()
     }
 
     /// Same stream, already active batch: reserve one ticket using this context's
@@ -667,7 +667,7 @@ impl SchedulerClient {
                 && lock.current_batch_id == batch
                 && lock.last_user_stream == user_stream
             {
-                return self.try_consume_one_token();
+                return self.try_consume_one_token(batch);
             }
         }
         false
@@ -714,7 +714,7 @@ impl SchedulerClient {
                 // RUNNING: Try to grab token
                 // ---------------------------------------------------------
                 STATE_RUNNING => {
-                    let tokens = self.inner.shmem.tokens_remaining.load(Ordering::Relaxed);
+                    let tokens = self.inner.shmem.tokens_remaining.remaining();
 
                     if tokens == 0 {
                         // Release lock while yielding to allow other threads to enter
@@ -724,7 +724,7 @@ impl SchedulerClient {
                         continue;
                     }
 
-                    if self.try_consume_one_token() {
+                    if self.try_consume_one_token(global_batch) {
                         // A pending request must not change the previous batch's
                         // measurement stream. Publish this request's stream only
                         // after admission, including after releasing the lock to wait.

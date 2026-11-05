@@ -7,7 +7,7 @@ fn client(limit: u64, used: u64) -> SchedulerClient {
     shmem.memory_limit.store(limit, Ordering::Relaxed);
     shmem.state.store(STATE_RUNNING, Ordering::Relaxed);
     shmem.batch_id.store(19, Ordering::Relaxed);
-    shmem.tokens_remaining.store(137, Ordering::Relaxed);
+    assert!(shmem.tokens_remaining.open(1, 137));
     shmem.compute_limit.store(50, Ordering::Relaxed);
     set_slot(shmem, 0, std::process::id() as i32, used);
     // Start with the production constructor's lock type so this independent
@@ -31,7 +31,7 @@ fn set_slot(shmem: &LocalContainerShmem, index: usize, pid: i32, used: u64) {
 fn assert_compute_unchanged(shmem: &LocalContainerShmem) {
     assert_eq!(STATE_RUNNING, shmem.state.load(Ordering::Acquire));
     assert_eq!(19, shmem.batch_id.load(Ordering::Acquire));
-    assert_eq!(137, shmem.tokens_remaining.load(Ordering::Acquire));
+    assert_eq!(137, shmem.tokens_remaining.remaining());
     assert_eq!(50, shmem.compute_limit.load(Ordering::Acquire));
 }
 fn me() -> i32 { std::process::id() as i32 }

@@ -137,7 +137,7 @@ fn run_configured(physical_device_id: Option<u32>) {
                     .manager_generation
                     .store(generation, Ordering::Release);
                 local.overdraft_pool.close();
-                local.tokens_remaining.store(0, Ordering::Relaxed);
+                local.tokens_remaining.close();
                 local.state.store(STATE_IDLE, Ordering::Release);
                 futex::wake_all(&local.state);
                 let manager = ContainerManager::new(
