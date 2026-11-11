@@ -47,11 +47,12 @@ def local_sample(path):
         data = matches[0].read_bytes()
     except FileNotFoundError:
         return None
-    if len(data) < 6512:
+    if len(data) < 6768:
         return None
     return {"state": struct.unpack_from("<I", data, 24)[0],
             "batch": struct.unpack_from("<Q", data, 32)[0],
-            "tokens": struct.unpack_from("<Q", data, 40)[0],
+            "tokens": struct.unpack_from("<Q", data, 40)[0] & ((1 << 21) - 1),
+            "token_batch": struct.unpack_from("<Q", data, 40)[0] >> 21,
             "manager_pid": struct.unpack_from("<i", data, 6200)[0],
             "generation": struct.unpack_from("<I", data, 6204)[0],
             "active_workers": struct.unpack_from("<I", data, 48)[0],

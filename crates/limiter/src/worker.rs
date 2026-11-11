@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -93,8 +93,9 @@ struct InnerLock {
 
     batch_active: bool,
     current_batch_id: u64,
-    last_user_stream: u64, // To track where to record the tracking_event
-    start_time_us: u64,    // Wall-clock fallback start timestamp
+    last_user_stream: u64,      // To track where to record the tracking_event
+    start_time_us: u64,         // Wall-clock fallback start timestamp
+    admitted_tokens: AtomicU64, // Accepted launches in this context and batch
 }
 
 /// Runtime virtual addresses and opaque physical-memory handles are separate namespaces.
@@ -624,25 +625,26 @@ impl SchedulerClient {
             current_batch_id: 0,
             last_user_stream: 0,
             start_time_us: 0,
+            admitted_tokens: AtomicU64::new(0),
         }
     }
 }
 
 // Limit computing power
 impl SchedulerClient {
-    /// Reserve exactly one ticket, without a transient zero-to-MAX underflow.
-    /// The shared balance can change between the initial load and decrement.
-    /// Never expose a wrapped balance that another process could consume.
+    /// Reserve one ticket only from the batch whose context was checked.
+    /// Include the batch in the CAS so an equal-balance refill is not an ABA.
     #[inline]
-    fn try_consume_one_token(&self) -> bool {
+    fn try_consume_one_token(&self, batch: u64) -> bool {
         let remaining = &self.inner.shmem.tokens_remaining;
-        let current = remaining.load(Ordering::Acquire);
-        // On contention, return to the caller to recheck state/batch rather
-        // than retrying against a potentially replenished round's balance.
-        current != 0
-            && remaining
-                .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        let snapshot = remaining.snapshot();
+        let current_batch = || {
+            self.inner.shmem.state.load(Ordering::Acquire) == STATE_RUNNING
+                && self.inner.shmem.batch_id.load(Ordering::Acquire) == batch
+        };
+        // A state change after a successful reservation may conservatively
+        // retire that old ticket. Never refund into a potentially newer batch.
+        current_batch() && remaining.try_acquire(snapshot, batch) && current_batch()
     }
 
     /// Same stream, already active batch: reserve one ticket using this context's
@@ -666,8 +668,10 @@ impl SchedulerClient {
                 && lock.batch_active
                 && lock.current_batch_id == batch
                 && lock.last_user_stream == user_stream
+                && self.try_consume_one_token(batch)
             {
-                return self.try_consume_one_token();
+                lock.admitted_tokens.fetch_add(1, Ordering::Relaxed);
+                return true;
             }
         }
         false
@@ -714,7 +718,7 @@ impl SchedulerClient {
                 // RUNNING: Try to grab token
                 // ---------------------------------------------------------
                 STATE_RUNNING => {
-                    let tokens = self.inner.shmem.tokens_remaining.load(Ordering::Relaxed);
+                    let tokens = self.inner.shmem.tokens_remaining.remaining();
 
                     if tokens == 0 {
                         // Release lock while yielding to allow other threads to enter
@@ -724,7 +728,7 @@ impl SchedulerClient {
                         continue;
                     }
 
-                    if self.try_consume_one_token() {
+                    if self.try_consume_one_token(global_batch) {
                         // A pending request must not change the previous batch's
                         // measurement stream. Publish this request's stream only
                         // after admission, including after releasing the lock to wait.
@@ -741,6 +745,7 @@ impl SchedulerClient {
 
                             lock.current_batch_id = global_batch;
                             lock.batch_active = true;
+                            lock.admitted_tokens.store(0, Ordering::Relaxed);
                             self.inner.shmem.measurement_started_us[timing.my_slot_idx]
                                 .store(0, Ordering::Relaxed);
 
@@ -763,6 +768,7 @@ impl SchedulerClient {
                             });
                         }
 
+                        lock.admitted_tokens.fetch_add(1, Ordering::Relaxed);
                         return; // -> Kernel Launch
                     }
                 }
@@ -882,6 +888,10 @@ impl SchedulerClient {
         // Report to Shared Memory
         let slot = &self.inner.shmem.reports[timing.my_slot_idx];
         slot.duration_us.store(duration_us, Ordering::Relaxed);
+        self.inner.shmem.admitted_tokens[timing.my_slot_idx].store(
+            lock.admitted_tokens.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         slot.batch_id
             .store(lock.current_batch_id, Ordering::Release);
 

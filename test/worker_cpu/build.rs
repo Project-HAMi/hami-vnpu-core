@@ -9,11 +9,14 @@ fn main() {
         .replace("pub mod setup;", &format!("#[path = {:?}] pub mod setup;", src.join("shmem/setup.rs")))
         .replace("pub mod futex;", "pub use crate::wait_observer::futex;");
     fs::write(out.join("shared.rs"), shared).unwrap();
-    // Only redirect the lock type so tests can publish a state change exactly
-    // after a real write guard unlocks. No worker branch or atomic is rewritten.
+    // Redirect the lock type and observe the token snapshot boundary. Tests can
+    // pause before the real CAS; no worker branch or atomic is rewritten.
     let worker = fs::read_to_string(src.join("worker.rs")).unwrap();
     let import = "use std::sync::{Arc, Mutex, RwLock};";
     assert_eq!(worker.matches(import).count(), 1);
+    let acquire = "remaining.try_acquire(snapshot, batch)";
+    assert_eq!(worker.matches(acquire).count(), 1);
+    let worker = worker.replace(acquire, &format!("{{ crate::token_observer::after_snapshot(); let acquired = {acquire}; crate::token_observer::after_acquire(acquired); acquired }}"));
     fs::write(out.join("worker.rs"), worker.replace(import,
         "use std::sync::{Arc, Mutex}; use crate::wait_observer::RwLock;")).unwrap();
     fs::write(out.join("source.rs"), format!(

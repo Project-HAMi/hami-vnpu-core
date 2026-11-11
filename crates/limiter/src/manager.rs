@@ -52,13 +52,14 @@ const STALE_MANAGER_US: u64 = 3_000_000;
 // Cap a complete run/rest period without changing ordinary 500us seed budgets.
 const MAX_RUN_US: u64 = 5_000_000;
 const NO_PROGRESS_US: u64 = 5_000;
-pub(crate) const REGISTRY_PROTOCOL: u32 = 0x564e_5034;
+pub(crate) const REGISTRY_PROTOCOL: u32 = 0x564e_5036;
 // How long the manager waits in MEASURING for workers to report.
 // Was 50ms, which was too short when kernels take hundreds of ms; make it longer
 // and also extend dynamically in the run loop.
 const LOCAL_REPORT_GRACE_MS: u64 = 500;
 const MIN_TOKENS: u64 = 1;
 const MAX_TOKENS: u64 = 2_000_000;
+const _: () = assert!(MAX_TOKENS <= crate::shmem::NormalTokens::MAX_TOKENS);
 // Seed per-manager average; used both locally and when registering in the global scoreboard.
 const DEFAULT_AVG_US: u64 = 500;
 
@@ -155,7 +156,7 @@ impl ContainerManager {
                 .compute_limit
                 .store(compute_limit as u64, Ordering::Release);
         } else {
-            local.tokens_remaining.store(0, Ordering::Relaxed);
+            local.tokens_remaining.close();
             local.active_workers.store(0, Ordering::Relaxed);
             local.reported_count.store(0, Ordering::Relaxed);
             local.state.store(STATE_IDLE, Ordering::Release);
@@ -248,6 +249,9 @@ impl ContainerManager {
     }
 
     pub fn run(&mut self) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         // Background collectors are stopped when this lease is replaced. Their
         // results must be revalidated under the same registry transaction.
         self.start_collectors();
@@ -257,9 +261,15 @@ impl ContainerManager {
             }
             return;
         }
-        while self.honor_fixed_rest_wait() && self.wait_for_global_turn() {
+        while !self.stopped.load(Ordering::Acquire)
+            && self.honor_fixed_rest_wait()
+            && self.wait_for_global_turn()
+        {
             let plan = self.calculate_fair_share();
             let (duration, tokens) = self.run_local_round(&plan);
+            if self.stopped.load(Ordering::Acquire) {
+                break;
+            }
             self.update_local_stats(duration, tokens);
             self.schedule_rest_wait(plan.rest_wait_us);
             if !self.pass_baton() {
@@ -503,11 +513,21 @@ impl ContainerManager {
         if !self.has_turn() {
             return Err(());
         }
+        self.local.state.store(STATE_IDLE, Ordering::Release);
+        self.local.tokens_remaining.close();
         let round = self.local.overdraft_pool.begin_round();
         self.local.batch_id.store(batch_id, Ordering::Relaxed);
-        self.local.tokens_remaining.store(tokens, Ordering::Relaxed);
         self.local.active_workers.store(0, Ordering::Relaxed);
         self.local.reported_count.store(0, Ordering::Relaxed);
+        if !self.local.tokens_remaining.open(batch_id, tokens) {
+            // Permanent publication failures must return to supervisor cleanup,
+            // which releases ownership before its bounded election retry.
+            self.stopped.store(true, Ordering::Release);
+            warn!(
+                "normal-token batch cannot be published; recreate shared state after stopping all participants"
+            );
+            return Err(());
+        }
         self.local.state.store(STATE_RUNNING, Ordering::Release);
         futex::wake_all(&self.local.state);
         Ok(round)
@@ -536,7 +556,7 @@ impl ContainerManager {
             timely_observations &=
                 observed.duration_since(last_observation).as_micros() <= NO_PROGRESS_US as u128;
             last_observation = observed;
-            let current = self.local.tokens_remaining.load(Ordering::Acquire);
+            let current = self.local.tokens_remaining.remaining();
             if current < remaining {
                 last_progress = Instant::now();
             }
@@ -563,7 +583,7 @@ impl ContainerManager {
             if !self.has_turn() {
                 return (0, 0);
             }
-            let remaining = self.local.tokens_remaining.swap(0, Ordering::AcqRel);
+            let remaining = self.local.tokens_remaining.close();
             // Capture before publishing MEASURING: a worker may enter as soon as
             // it observes that state, before this manager resumes polling.
             let measurement_start_us = crate::shmem::monotonic_time_us();
@@ -686,6 +706,7 @@ impl ContainerManager {
         let mut global_start = u64::MAX;
         let mut global_end = 0;
         let mut participants = 0;
+        let mut admitted = 0u64;
 
         for i in 0..MAX_WORKERS {
             let slot = &self.local.reports[i];
@@ -703,6 +724,8 @@ impl ContainerManager {
                         global_end = end;
                     }
                     participants += 1;
+                    admitted = admitted
+                        .saturating_add(self.local.admitted_tokens[i].load(Ordering::Relaxed));
                 }
             }
         }
@@ -711,8 +734,12 @@ impl ContainerManager {
             return (0, 0);
         }
         let total_duration = global_end.saturating_sub(global_start);
-        // Use the actual tokens consumed (post-scale) so averages are per real token.
-        let tokens_used = tokens_for_stats;
+        // Completed reports publish only admissions that passed the post-check.
+        // Debited but retired reservations must not dilute the timing average.
+        if admitted == 0 || admitted > tokens_for_stats {
+            return (0, 0);
+        }
+        let tokens_used = admitted;
 
         debug!(
             "[Manager-Aggregate] total participants: {}, earliest time: {}, latest time: {}",
@@ -819,7 +846,7 @@ impl Drop for ContainerManager {
             self.local.overdraft_pool.close();
             self.local.manager_pid.store(0, Ordering::Release);
             self.local.manager_global_idx.store(-1, Ordering::Release);
-            self.local.tokens_remaining.store(0, Ordering::Release);
+            self.local.tokens_remaining.close();
             self.local.state.store(STATE_IDLE, Ordering::Release);
             futex::wake_all(&self.local.state);
         }

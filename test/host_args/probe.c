@@ -37,14 +37,14 @@ static unsigned char *domain(const char *base, int physical) {
     assert(asprintf(&device_path, "%s.device-%d", base, physical) > 0);
     int fd = open(device_path, O_CREAT | O_RDWR | O_TRUNC, 0600);
     free(device_path);
-    assert(fd >= 0 && !ftruncate(fd, 6512));
-    unsigned char *shm = mmap(NULL, 6512, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    assert(fd >= 0 && !ftruncate(fd, 6768));
+    unsigned char *shm = mmap(NULL, 6768, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     assert(shm != MAP_FAILED); close(fd);
     atomic_store((_Atomic int32_t *)(shm + 6200), getppid()); // live manager owner
     atomic_store((_Atomic uint64_t *)(shm + 6208), UINT64_MAX); // fresh heartbeat
     atomic_store((_Atomic uint32_t *)(shm + 6220), 1); // initialized
     atomic_store((_Atomic uint64_t *)(shm + 32), 1); // batch
-    atomic_store((_Atomic uint64_t *)(shm + 40), 10000);
+    atomic_store((_Atomic uint64_t *)(shm + 40), (UINT64_C(1) << 21) | 10000); // batch-tagged balance
     return shm;
 }
 int main(int argc, char **argv) {
@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     _Atomic uint64_t *tokens_one = (_Atomic uint64_t *)(shm_one + 40);
     // Capture must return even with STATE_IDLE, without initializing a worker.
     capture(1, 0); mode(2); call();
-    assert(atomic_load(tokens) == 10000 && atomic_load((_Atomic uint32_t *)(shm + 48)) == 0);
+    assert(atomic_load(tokens) == ((UINT64_C(1) << 21) | 10000) && atomic_load((_Atomic uint32_t *)(shm + 48)) == 0);
     atomic_store((_Atomic uint32_t *)(shm + 24), 1); // STATE_RUNNING
     atomic_store((_Atomic uint32_t *)(shm_one + 24), 1);
     capture(0, 0);
@@ -96,12 +96,12 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 2; ++i) assert(!pthread_join(threads[i], NULL));
     assert(atomic_load(tokens) == before - 100 && atomic_load(tokens_one) == before_one - 100);
     mode(3); before = atomic_load(tokens); call(); assert(atomic_load(tokens) == before - 2);
-    mode(0); atomic_store(tokens, 0);
+    mode(0); atomic_store(tokens, UINT64_C(1) << 21);
     assert(!pthread_create(&threads[0], NULL, blocked, NULL));
     while (!atomic_load(&started)) usleep(1000);
     usleep(50000); assert(!atomic_load(&completed));
-    atomic_store(tokens, 1);
-    assert(!pthread_join(threads[0], NULL)); assert(atomic_load(&completed) && atomic_load(tokens) == 0);
+    atomic_store(tokens, (UINT64_C(1) << 21) | 1);
+    assert(!pthread_join(threads[0], NULL)); assert(atomic_load(&completed) && atomic_load(tokens) == (UINT64_C(1) << 21));
     // Releasing the application's ACL handle must not invalidate the cached launch.
     mode(0); capture(1, 0);
     assert(dlclose(acl) == 0);

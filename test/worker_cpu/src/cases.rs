@@ -7,7 +7,7 @@ fn client(tokens: u64, active: bool) -> SchedulerClient {
     let shmem = Box::leak(Box::new(unsafe { std::mem::zeroed::<LocalContainerShmem>() }));
     shmem.state.store(STATE_RUNNING, Ordering::Release);
     shmem.batch_id.store(42, Ordering::Release);
-    shmem.tokens_remaining.store(tokens, Ordering::Release);
+    assert!(shmem.tokens_remaining.open(42, tokens));
     shmem.active_workers.store(if active {1} else {0}, Ordering::Release);
     shmem.compute_limit.store(50, Ordering::Release);
     shmem.reports[0].cpu_start_us.store(if active {100} else {0}, Ordering::Release);
@@ -19,14 +19,14 @@ fn client(tokens: u64, active: bool) -> SchedulerClient {
             my_slot_idx: 0,
             lock: RwLock::new(InnerLock { internal_stream:10, start_event:11, end_event:12,
                 tracking_event:13, batch_active:active, current_batch_id:if active {42} else {0},
-                last_user_stream:6, start_time_us:if active {100} else {0} }),
+                last_user_stream:6, start_time_us:if active {100} else {0}, admitted_tokens:AtomicU64::new(0) }),
             retired: AtomicBool::new(false),
         }))])),
         hbm_handle_map:Mutex::new(HashMap::new()), is_stub:false, sched_policy:SchedPolicy::Dynamic,
     }) }
 }
 fn timing(c: &SchedulerClient) -> Arc<ContextTiming> { c.context_timing(0) }
-pub fn remaining(c: &SchedulerClient) -> u64 { c.inner.shmem.tokens_remaining.load(Ordering::Acquire) }
+pub fn remaining(c: &SchedulerClient) -> u64 { c.inner.shmem.tokens_remaining.remaining() }
 fn wait_until(mut predicate: impl FnMut()->bool) {
     let limit=Instant::now()+Duration::from_secs(2);
     while !predicate() { assert!(Instant::now()<limit,"bounded condition wait failed"); thread::yield_now(); }
@@ -62,11 +62,62 @@ fn spatial_bypasses_all_admission_states_without_borrowing_locking_or_measuremen
     }
 }
 
+fn admission_across_equal_balance_rollover(active: bool, after_cas: bool) {
+    use crate::token_observer as observed;
+    let c = client(1, active);
+    observed::BARRIERS.set((Barrier::new(2), Barrier::new(2))).unwrap();
+    observed::PAUSE.store(true, Ordering::Release);
+    observed::AFTER_CAS.store(after_cas, Ordering::Release);
+    let (rx, thread) = waiting_thread(c.clone(), 6);
+    let (reached, resume) = observed::BARRIERS.get().unwrap();
+    reached.wait();
+    // The manager can advance after its bounded report timeout, even while
+    // this context's lock is held. Reproduce its shared-state publication.
+    c.inner.shmem.tokens_remaining.close();
+    c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+    c.inner.shmem.state.store(STATE_IDLE, Ordering::Release);
+    c.inner.shmem.batch_id.store(43, Ordering::Relaxed);
+    c.inner.shmem.active_workers.store(0, Ordering::Relaxed);
+    c.inner.shmem.reported_count.store(0, Ordering::Relaxed);
+    assert!(c.inner.shmem.tokens_remaining.open(43, 1));
+    c.inner.shmem.state.store(STATE_RUNNING, Ordering::Release);
+    resume.wait();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    thread.join().unwrap();
+    let context = timing(&c);
+    let lock = context.lock.read().unwrap();
+    assert_eq!(lock.current_batch_id, 43,
+        "old admission consumed a replacement batch without reinitialization");
+    assert_eq!(remaining(&c), 0);
+    assert_eq!(c.inner.shmem.active_workers.load(Ordering::Acquire), 1);
+    assert_eq!(calls(), vec![Call::Record(11, 10)]);
+}
+
+#[test]
+fn normal_token_aba_fast_path_retries_and_registers_replacement_batch() {
+    admission_across_equal_balance_rollover(true, false);
+}
+
+#[test]
+fn normal_token_aba_first_ticket_retries_and_registers_replacement_batch() {
+    admission_across_equal_balance_rollover(false, false);
+}
+
+#[test]
+fn normal_token_round_change_after_cas_retries_without_refunding_new_batch() {
+    admission_across_equal_balance_rollover(true, true);
+}
+
+#[test]
+fn normal_token_first_ticket_round_change_after_cas_registers_new_batch() {
+    admission_across_equal_balance_rollover(false, true);
+}
+
 #[test]
 fn take_one_sequential_zero_never_wraps() {
     let c=client(37,true);
-    for expected in (0..37).rev() { assert!(c.try_consume_one_token()); assert_eq!(expected,remaining(&c)); }
-    for _ in 0..100 { assert!(!c.try_consume_one_token()); assert_eq!(0,remaining(&c)); }
+    for expected in (0..37).rev() { assert!(c.try_consume_one_token(42)); assert_eq!(expected,remaining(&c)); }
+    for _ in 0..100 { assert!(!c.try_consume_one_token(42)); assert_eq!(0,remaining(&c)); }
     assert_eq!(1,c.inner.shmem.active_workers.load(Ordering::Acquire));
     assert!(calls().is_empty());
 }
@@ -78,13 +129,13 @@ fn exactly_one_contender_can_consume_the_last_ticket() {
     let threads: Vec<_> = (0..32).map(|_| {
         let c = c.clone();
         let barrier = barrier.clone();
-        thread::spawn(move || { barrier.wait(); c.try_consume_one_token() })
+        thread::spawn(move || { barrier.wait(); c.try_consume_one_token(42) })
     }).collect();
     barrier.wait();
     let winners = threads.into_iter().filter_map(|t| t.join().unwrap().then_some(())).count();
     assert_eq!(winners, 1);
     assert_eq!(remaining(&c), 0);
-    assert!(!c.try_consume_one_token());
+    assert!(!c.try_consume_one_token(42));
 }
 
 #[test]
@@ -97,7 +148,7 @@ fn concurrent_take_one_conserves_budget_and_never_exposes_wrapped_balance() {
     })};
     let threads:Vec<_>=(0..16).map(|_| {let c=c.clone();let n=successes.clone();let b=barrier.clone();
         thread::spawn(move || { b.wait(); loop {
-            if c.try_consume_one_token() {n.fetch_add(1,Ordering::Relaxed);}
+            if c.try_consume_one_token(42) {n.fetch_add(1,Ordering::Relaxed);}
             else if remaining(&c)==0 {break;} // A CAS collision alone is not exhaustion.
         } }) }).collect();
     barrier.wait();for h in threads {h.join().unwrap();}
@@ -141,6 +192,7 @@ fn different_stream_requires_writer_and_preserves_current_batch_events() {
 #[test]
 fn new_batch_requires_writer_and_records_one_new_start_event() {
     let c=client(2,true);c.inner.shmem.batch_id.store(43,Ordering::Release);
+    assert!(c.inner.shmem.tokens_remaining.open(43, 2));
     c.inner.shmem.active_workers.store(0,Ordering::Release);
     let context=timing(&c);let guard=context.lock.read().unwrap();let (rx,h)=waiting_thread(c.clone(),6);
     assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());assert_eq!(2,remaining(&c));
@@ -167,7 +219,7 @@ fn no_ticket_wait_is_not_fail_open_and_new_batch_spends_its_own_ticket() {
     c.inner.shmem.state.store(STATE_IDLE,Ordering::Release);
     c.inner.shmem.batch_id.store(43,Ordering::Relaxed);
     c.inner.shmem.active_workers.store(0,Ordering::Relaxed);
-    c.inner.shmem.tokens_remaining.store(1,Ordering::Relaxed);
+    assert!(c.inner.shmem.tokens_remaining.open(43, 1));
     c.inner.shmem.state.store(STATE_RUNNING,Ordering::Release);futex::wake_all(&c.inner.shmem.state);
     rx.recv_timeout(Duration::from_secs(2)).unwrap();h.join().unwrap();
     assert_eq!(0,remaining(&c));assert_eq!(43,timing(&c).lock.read().unwrap().current_batch_id);
@@ -188,7 +240,7 @@ fn measuring_uses_exclusive_original_event_chain_and_exactly_one_process_report(
     assert!(rx.try_recv().is_err());clear_calls();
     c.inner.shmem.batch_id.store(43,Ordering::Relaxed);
     c.inner.shmem.active_workers.store(0,Ordering::Relaxed);c.inner.shmem.reported_count.store(0,Ordering::Relaxed);
-    c.inner.shmem.tokens_remaining.store(1,Ordering::Relaxed);
+    assert!(c.inner.shmem.tokens_remaining.open(43, 1));
     c.inner.shmem.state.store(STATE_RUNNING,Ordering::Release);futex::wake_all(&c.inner.shmem.state);
     rx.recv_timeout(Duration::from_secs(2)).unwrap();h.join().unwrap();
     assert_eq!(0,remaining(&c));assert_eq!(vec![Call::Record(11,10)],calls());
@@ -220,7 +272,7 @@ fn pending_stream_measurement(previous_stream: u64, start_running: bool) {
 
     c.inner.shmem.batch_id.store(43, Ordering::Relaxed);
     c.inner.shmem.active_workers.store(0, Ordering::Relaxed);
-    c.inner.shmem.tokens_remaining.store(1, Ordering::Relaxed);
+    assert!(c.inner.shmem.tokens_remaining.open(43, 1));
     c.inner.shmem.state.store(STATE_RUNNING, Ordering::Release);
     futex::wake_all(&c.inner.shmem.state);
     rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -284,7 +336,7 @@ fn pending_stream_switch_preserves_attribution_until_woken_and_admitted() {
 
 #[test]
 fn waiting_writer_progresses_under_continuous_same_stream_readers() {
-    let c=client(1_000_000_000,true);let stop=Arc::new(AtomicBool::new(false));let attempts=Arc::new(AtomicU64::new(0));
+    let c=client(1_000_000,true);let stop=Arc::new(AtomicBool::new(false));let attempts=Arc::new(AtomicU64::new(0));
     let readers:Vec<_>=(0..8).map(|_|{let c=c.clone();let stop=stop.clone();let n=attempts.clone();thread::spawn(move||{
         while !stop.load(Ordering::Acquire) {let _=c.try_same_stream_token(6);n.fetch_add(1,Ordering::Relaxed);}
     })}).collect();
@@ -320,7 +372,7 @@ fn all_five_actual_hook_wrappers_charge_before_native_and_keep_one_process_repor
 
 #[test]
 fn shared_memory_abi_preserves_monitor_offsets_and_appends_measurement_entries() {
-    assert_eq!(6512,std::mem::size_of::<LocalContainerShmem>());
+    assert_eq!(6768,std::mem::size_of::<LocalContainerShmem>());
     assert_eq!(6256,std::mem::offset_of!(LocalContainerShmem,measurement_started_us));
     assert_eq!(1080,std::mem::offset_of!(LocalContainerShmem,procs));
     assert_eq!(6224,std::mem::offset_of!(LocalContainerShmem,overdraft_pool));
@@ -616,4 +668,60 @@ fn measurement_entry_is_reset_for_new_batches_and_preserved_only_with_completed_
     c.inner.shmem.measurement_started_us[0].store(456, Ordering::Release);
     c.retire_context(1); // No completed report belongs to the new context.
     assert_eq!(c.inner.shmem.measurement_started_us[0].load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn accepted_launch_count_includes_fast_and_stream_switch_paths() {
+    let c = client(4, false);
+    c.wait_for_token(6); // first ticket
+    c.wait_for_token(6); // same-stream fast path
+    c.wait_for_token(7); // stream switch
+    c.wait_for_token(7);
+    let context = timing(&c);
+    let mut lock = context.lock.write().unwrap();
+    c.inner.shmem.tokens_remaining.close();
+    c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+    c.measure_and_report_batch(&context, &mut lock);
+    assert_eq!(c.inner.shmem.reports[0].batch_id.load(Ordering::Acquire), 42);
+    assert_eq!(c.inner.shmem.admitted_tokens[0].load(Ordering::Relaxed), 4);
+    drop(lock);
+    c.inner.shmem.batch_id.store(43, Ordering::Relaxed);
+    assert!(c.inner.shmem.tokens_remaining.open(43, 1));
+    c.inner.shmem.state.store(STATE_RUNNING, Ordering::Release);
+    c.wait_for_token(7);
+    let mut lock = context.lock.write().unwrap();
+    c.inner.shmem.tokens_remaining.close();
+    c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+    c.measure_and_report_batch(&context, &mut lock);
+    assert_eq!(c.inner.shmem.admitted_tokens[0].load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn retired_ticket_does_not_enter_completed_report() {
+    use crate::token_observer as observed;
+    let c = client(5, false);
+    c.wait_for_token(6);
+    observed::BARRIERS.set((Barrier::new(5), Barrier::new(5))).unwrap();
+    observed::PAUSE_COUNT.store(4, Ordering::Release);
+    observed::AFTER_CAS.store(true, Ordering::Release);
+    let workers: Vec<_> = (0..4).map(|_| waiting_thread(c.clone(), 6)).collect();
+    let (reached, resume) = observed::BARRIERS.get().unwrap();
+    reached.wait();
+    assert_eq!(remaining(&c), 0); // five debits, four pending post-checks
+    c.inner.shmem.tokens_remaining.close();
+    c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+    resume.wait();
+    wait_until(|| c.inner.shmem.reports[0].batch_id.load(Ordering::Acquire) == 42);
+    assert_eq!(c.inner.shmem.admitted_tokens[0].load(Ordering::Relaxed), 1);
+    for (rx, _) in &workers { assert!(rx.try_recv().is_err()); }
+    c.inner.shmem.batch_id.store(43, Ordering::Relaxed);
+    c.inner.shmem.active_workers.store(0, Ordering::Relaxed);
+    assert!(c.inner.shmem.tokens_remaining.open(43, 4));
+    c.inner.shmem.state.store(STATE_RUNNING, Ordering::Release);
+    crate::raw_futex::wake_all(&c.inner.shmem.state);
+    for (rx, worker) in workers {
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+    }
+    assert_eq!(timing(&c).lock.read().unwrap().admitted_tokens.load(Ordering::Relaxed), 4);
 }
