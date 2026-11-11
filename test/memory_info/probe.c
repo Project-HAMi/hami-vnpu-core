@@ -20,13 +20,13 @@ static void domain(const char *base, int physical, uint64_t quota, uint64_t used
     assert(asprintf(&path, "%s.device-%d", base, physical) > 0);
     int fd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
     free(path);
-    assert(fd >= 0 && !ftruncate(fd, 6512));
-    unsigned char *shm = mmap(NULL, 6512, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    assert(fd >= 0 && !ftruncate(fd, 6768));
+    unsigned char *shm = mmap(NULL, 6768, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     assert(shm != MAP_FAILED);
     close(fd);
     if (getenv("FAKE_COLD_QUERY")) {
         /* Leave publication to the real in-process supervisor. */
-        assert(!munmap(shm, 6512));
+        assert(!munmap(shm, 6768));
         return;
     }
     atomic_store((_Atomic uint64_t *)(shm + 0), quota);
@@ -37,7 +37,7 @@ static void domain(const char *base, int physical, uint64_t quota, uint64_t used
     atomic_store((_Atomic int32_t *)(shm + 6200), getppid());
     atomic_store((_Atomic uint64_t *)(shm + 6208), UINT64_MAX);
     atomic_store((_Atomic uint32_t *)(shm + 6220), 1);
-    assert(!munmap(shm, 6512));
+    assert(!munmap(shm, 6768));
 }
 
 static void assert_supervisor_published(const char *base) {
@@ -46,14 +46,14 @@ static void assert_supervisor_published(const char *base) {
     int fd = open(path, O_RDONLY);
     free(path);
     assert(fd >= 0);
-    unsigned char *shm = mmap(NULL, 6512, PROT_READ, MAP_SHARED, fd, 0);
+    unsigned char *shm = mmap(NULL, 6768, PROT_READ, MAP_SHARED, fd, 0);
     assert(shm != MAP_FAILED);
     close(fd);
     /* Prove that the query waited for publication, rather than falling back. */
     assert(atomic_load((_Atomic uint32_t *)(shm + 6220)) == 1);
     assert(atomic_load((_Atomic int32_t *)(shm + 6200)) == getpid());
     assert(atomic_load((_Atomic uint64_t *)(shm + 0)) == 0);
-    assert(!munmap(shm, 6512));
+    assert(!munmap(shm, 6768));
 }
 
 int main(int argc, char **argv) {

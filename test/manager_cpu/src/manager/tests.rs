@@ -131,12 +131,17 @@ fn saturated_run_budget_is_bounded_instead_of_waiting_for_hours() {
 }
 
 fn report(m: &ContainerManager, index: usize, batch: u64, start: u64, duration: u64) {
+    report_tokens(m, index, batch, start, duration, 1);
+}
+
+fn report_tokens(m: &ContainerManager, index: usize, batch: u64, start: u64, duration: u64, tokens: u64) {
     let slot = &m.local.reports[index];
     if m.local.measurement_started_us[index].load(Ordering::Acquire) == 0 {
         begin_measurement(m, index);
     }
     slot.cpu_start_us.store(start, Ordering::Relaxed);
     slot.duration_us.store(duration, Ordering::Relaxed);
+    m.local.admitted_tokens[index].store(tokens, Ordering::Relaxed);
     slot.batch_id.store(batch, Ordering::Release);
 }
 
@@ -151,7 +156,7 @@ fn report_aggregation_keeps_ordinary_interval_and_token_count() {
     report(&m, 0, 7, 100, 200);
     report(&m, 1, 7, 200, 300);
     report(&m, 2, 6, 1, 1000);
-    assert_eq!(m.aggregate_local_times(7, 13), (400, 13));
+    assert_eq!(m.aggregate_local_times(7, 13), (400, 2));
     assert_eq!(m.aggregate_local_times(8, 13), (0, 0));
 }
 
@@ -159,7 +164,7 @@ fn report_aggregation_keeps_ordinary_interval_and_token_count() {
 fn overflowing_report_end_is_clamped_instead_of_disappearing() {
     let m = manager(50.0, false, 500);
     report(&m, 0, 7, u64::MAX - 10, 20);
-    assert_eq!(m.aggregate_local_times(7, 13), (10, 13));
+    assert_eq!(m.aggregate_local_times(7, 13), (10, 1));
 }
 
 fn wait_until(mut ready: impl FnMut() -> bool) {
@@ -238,7 +243,7 @@ fn completed_reported_batch_still_updates_execution_statistics() {
         m.local.reports[0].occupied.store(1, Ordering::Release);
         m.local.tokens_remaining.close();
         wait_until(|| m.local.state.load(Ordering::Acquire) == STATE_MEASURING);
-        report(&m, 0, batch, get_time_us(), 2500);
+        report_tokens(&m, 0, batch, get_time_us(), 2500, plan.tokens);
         m.local.reported_count.store(1, Ordering::Release);
         run.join().unwrap()
     });
@@ -369,7 +374,7 @@ fn manager_round_closure_and_next_publication_invalidate_old_tickets() {
 
 #[test]
 fn manager_does_not_wrap_an_exhausted_normal_batch_tag() {
-    let m = manager(20.0, false, 500);
+    let mut m = manager(20.0, false, 500);
     assert!(m.start_local_batch(crate::shmem::NormalTokens::MAX_BATCH, 1).is_ok());
     let old = m.local.tokens_remaining.snapshot();
     let plan = SharePlan { tokens: 1, time_limit_us: 10_000,
@@ -378,6 +383,16 @@ fn manager_does_not_wrap_an_exhausted_normal_batch_tag() {
     assert_eq!(m.local.state.load(Ordering::Acquire), STATE_IDLE);
     assert_eq!(m.local.tokens_remaining.remaining(), 0);
     assert!(!m.local.tokens_remaining.try_acquire(old, crate::shmem::NormalTokens::MAX_BATCH));
+    assert!(m.stopped.load(Ordering::Acquire));
+    let batch = m.local.batch_id.load(Ordering::Acquire);
+    m.run();
+    assert_eq!(m.local.batch_id.load(Ordering::Acquire), batch);
+    let global = m.global;
+    let local = m.local;
+    drop(m);
+    assert_eq!(global.slots[0].is_active.load(Ordering::Acquire), 0);
+    assert_eq!(global.lock_owner.load(Ordering::Acquire), MAX_MANAGERS as u32);
+    assert_eq!(local.manager_pid.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -735,4 +750,21 @@ fn timely_entry_without_device_completion_still_has_a_bounded_report_wait() {
     });
     assert_eq!(m.local.state.load(Ordering::Acquire), STATE_IDLE);
     assert_eq!(m.current_avg_us, DEFAULT_AVG_US);
+}
+
+#[test]
+fn retired_reservations_do_not_dilute_completed_worker_reports() {
+    let mut m = manager(20.0, false, 500);
+    // Ten debits, but only three admitted calls. Two workers report one and
+    // two calls respectively. Seven delayed post-check failures emit no work.
+    report_tokens(&m, 0, 42, 100, 300, 1);
+    report_tokens(&m, 1, 42, 100, 300, 2);
+    report_tokens(&m, 2, 41, 100, 9000, 100); // stale batch must be excluded
+    let (duration, tokens) = m.aggregate_local_times(42, 10);
+    assert_eq!((duration, tokens), (300, 3));
+    m.update_local_stats(duration, tokens);
+    assert_eq!(m.current_avg_us, 237);
+    // A batch with only retired reservations has no useful measurement.
+    report_tokens(&m, 0, 43, 100, 300, 0);
+    assert_eq!(m.aggregate_local_times(43, 10), (0, 0));
 }

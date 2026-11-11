@@ -52,7 +52,7 @@ const STALE_MANAGER_US: u64 = 3_000_000;
 // Cap a complete run/rest period without changing ordinary 500us seed budgets.
 const MAX_RUN_US: u64 = 5_000_000;
 const NO_PROGRESS_US: u64 = 5_000;
-pub(crate) const REGISTRY_PROTOCOL: u32 = 0x564e_5035;
+pub(crate) const REGISTRY_PROTOCOL: u32 = 0x564e_5036;
 // How long the manager waits in MEASURING for workers to report.
 // Was 50ms, which was too short when kernels take hundreds of ms; make it longer
 // and also extend dynamically in the run loop.
@@ -249,6 +249,9 @@ impl ContainerManager {
     }
 
     pub fn run(&mut self) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         // Background collectors are stopped when this lease is replaced. Their
         // results must be revalidated under the same registry transaction.
         self.start_collectors();
@@ -258,9 +261,15 @@ impl ContainerManager {
             }
             return;
         }
-        while self.honor_fixed_rest_wait() && self.wait_for_global_turn() {
+        while !self.stopped.load(Ordering::Acquire)
+            && self.honor_fixed_rest_wait()
+            && self.wait_for_global_turn()
+        {
             let plan = self.calculate_fair_share();
             let (duration, tokens) = self.run_local_round(&plan);
+            if self.stopped.load(Ordering::Acquire) {
+                break;
+            }
             self.update_local_stats(duration, tokens);
             self.schedule_rest_wait(plan.rest_wait_us);
             if !self.pass_baton() {
@@ -511,6 +520,9 @@ impl ContainerManager {
         self.local.active_workers.store(0, Ordering::Relaxed);
         self.local.reported_count.store(0, Ordering::Relaxed);
         if !self.local.tokens_remaining.open(batch_id, tokens) {
+            // Permanent publication failures must return to supervisor cleanup,
+            // which releases ownership before its bounded election retry.
+            self.stopped.store(true, Ordering::Release);
             warn!(
                 "normal-token batch cannot be published; recreate shared state after stopping all participants"
             );
@@ -694,6 +706,7 @@ impl ContainerManager {
         let mut global_start = u64::MAX;
         let mut global_end = 0;
         let mut participants = 0;
+        let mut admitted = 0u64;
 
         for i in 0..MAX_WORKERS {
             let slot = &self.local.reports[i];
@@ -711,6 +724,8 @@ impl ContainerManager {
                         global_end = end;
                     }
                     participants += 1;
+                    admitted = admitted
+                        .saturating_add(self.local.admitted_tokens[i].load(Ordering::Relaxed));
                 }
             }
         }
@@ -719,8 +734,12 @@ impl ContainerManager {
             return (0, 0);
         }
         let total_duration = global_end.saturating_sub(global_start);
-        // Use the actual tokens consumed (post-scale) so averages are per real token.
-        let tokens_used = tokens_for_stats;
+        // Completed reports publish only admissions that passed the post-check.
+        // Debited but retired reservations must not dilute the timing average.
+        if admitted == 0 || admitted > tokens_for_stats {
+            return (0, 0);
+        }
+        let tokens_used = admitted;
 
         debug!(
             "[Manager-Aggregate] total participants: {}, earliest time: {}, latest time: {}",

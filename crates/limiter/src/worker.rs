@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -93,8 +93,9 @@ struct InnerLock {
 
     batch_active: bool,
     current_batch_id: u64,
-    last_user_stream: u64, // To track where to record the tracking_event
-    start_time_us: u64,    // Wall-clock fallback start timestamp
+    last_user_stream: u64,      // To track where to record the tracking_event
+    start_time_us: u64,         // Wall-clock fallback start timestamp
+    admitted_tokens: AtomicU64, // Accepted launches in this context and batch
 }
 
 /// Runtime virtual addresses and opaque physical-memory handles are separate namespaces.
@@ -624,6 +625,7 @@ impl SchedulerClient {
             current_batch_id: 0,
             last_user_stream: 0,
             start_time_us: 0,
+            admitted_tokens: AtomicU64::new(0),
         }
     }
 }
@@ -666,8 +668,10 @@ impl SchedulerClient {
                 && lock.batch_active
                 && lock.current_batch_id == batch
                 && lock.last_user_stream == user_stream
+                && self.try_consume_one_token(batch)
             {
-                return self.try_consume_one_token(batch);
+                lock.admitted_tokens.fetch_add(1, Ordering::Relaxed);
+                return true;
             }
         }
         false
@@ -741,6 +745,7 @@ impl SchedulerClient {
 
                             lock.current_batch_id = global_batch;
                             lock.batch_active = true;
+                            lock.admitted_tokens.store(0, Ordering::Relaxed);
                             self.inner.shmem.measurement_started_us[timing.my_slot_idx]
                                 .store(0, Ordering::Relaxed);
 
@@ -763,6 +768,7 @@ impl SchedulerClient {
                             });
                         }
 
+                        lock.admitted_tokens.fetch_add(1, Ordering::Relaxed);
                         return; // -> Kernel Launch
                     }
                 }
@@ -882,6 +888,10 @@ impl SchedulerClient {
         // Report to Shared Memory
         let slot = &self.inner.shmem.reports[timing.my_slot_idx];
         slot.duration_us.store(duration_us, Ordering::Relaxed);
+        self.inner.shmem.admitted_tokens[timing.my_slot_idx].store(
+            lock.admitted_tokens.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         slot.batch_id
             .store(lock.current_batch_id, Ordering::Release);
 

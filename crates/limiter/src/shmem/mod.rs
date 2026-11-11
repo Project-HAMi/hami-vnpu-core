@@ -172,12 +172,16 @@ pub struct LocalContainerShmem {
     // A worker writes its monotonic entry timestamp before device synchronization;
     // the report's release-store of batch_id publishes it with the completed report.
     pub measurement_started_us: [AtomicU64; MAX_WORKERS],
+
+    // The report batch release-store publishes this count with its duration.
+    // Only successful post-checked admissions contribute, never retired tickets.
+    pub admitted_tokens: [AtomicU64; MAX_WORKERS],
 }
 
 const _: () = {
     assert!(std::mem::size_of::<GlobalManagerSlot>() == 40);
     assert!(std::mem::size_of::<GlobalRegistry>() == 2848);
-    assert!(std::mem::size_of::<LocalContainerShmem>() == 6512);
+    assert!(std::mem::size_of::<LocalContainerShmem>() == 6768);
     assert!(std::mem::size_of::<NormalTokens>() == 8);
     assert!(std::mem::offset_of!(LocalContainerShmem, tokens_remaining) == 40);
     assert!(std::mem::offset_of!(GlobalManagerSlot, compute_limit) == 32);
@@ -187,6 +191,7 @@ const _: () = {
     assert!(std::mem::offset_of!(LocalContainerShmem, procs) == 1080);
     assert!(std::mem::offset_of!(LocalContainerShmem, manager_generation) == 6204);
     assert!(std::mem::offset_of!(LocalContainerShmem, measurement_started_us) == 6256);
+    assert!(std::mem::offset_of!(LocalContainerShmem, admitted_tokens) == 6512);
 };
 
 /// Comparable across processes on the same host, unaffected by wall-clock changes.

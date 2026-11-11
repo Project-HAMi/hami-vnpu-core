@@ -30,14 +30,19 @@ Normal tickets atomically bind a batch ID to the remaining balance. A worker
 paused across a round change cannot spend a replacement batch's tickets using
 its old snapshot. A rejected stale attempt returns to state/context initialization.
 
-An upgrade from the original queue protocol or fenced protocols 2/3/4 requires a
-coordinated restart. Protocol 5 preserves the 2848-byte global layout, the
-6512-byte local layout and the device-plugin process-memory offsets. The normal
+An upgrade from the original queue protocol or fenced protocols 2/3/4/5 requires a
+coordinated restart. Protocol 6 preserves the 2848-byte global layout and the
+device-plugin process-memory offsets. The local layout grows to 6768 bytes. The normal
 ticket word at local offset 40 now stores the balance in its low 21 bits and the
 batch ID in its upper 43 bits. Diagnostic readers must decode that word; old
 workers must not share these files. Batch tags are never reused: after the maximum
 43-bit batch ID, admission stays closed until a coordinated fresh-state restart.
 The 32 per-worker measurement-entry timestamps remain at offset 6256.
+A 32-entry admitted-launch count array starts at offset 6512. Workers publish
+these counts with their completed reports. Timing averages exclude debited
+reservations rejected by the admission post-check.
+Permanent publication failure stops the manager and releases its lease through
+supervisor cleanup before the next bounded election retry.
 Equal file sizes do not imply protocol compatibility.
 An incompatible registry exits with code 78 instead of starting an unlimited
 worker; repeatedly restarting a Pod cannot repair that registry.
@@ -82,11 +87,14 @@ DCMI 查询在全新进程中执行，由独立 subreaper 超时终止并回收�
 普通令牌将批次号和余额绑定在同一个原子值中。跨轮次暂停的 worker 不能用旧快照
 消耗新批次的令牌；过期尝试会重新检查状态并初始化当前批次的上下文。
 
-旧队列协议及协议 2/3/4 升级到协议 5 必须协调停机。全局结构仍为 2848 字节，
-本地结构仍为 6512 字节，保留设备插件读取的进程显存偏移。本地偏移 40 的普通令牌字
+旧队列协议及协议 2/3/4/5 升级到协议 6 必须协调停机。全局结构仍为 2848 字节，
+本地结构增至 6768 字节，保留设备插件读取的进程显存偏移。本地偏移 40 的普通令牌字
 改为低 21 位存余额、高 43 位存批次号；诊断工具必须解码，旧 worker 不能共享这些文件。
 批次号不回绕复用，达到 43 位上限后停止准入，需要协调停机并重建共享状态。
 32 个 worker 的测量入口时间戳仍从偏移 6256 开始。
+偏移 6512 新增 32 个实际准入计数，与完成报告的 batch 一起发布。
+耗时均值使用这些计数，排除扣款后被准入复核拒绝的预留。
+永久发布失败会退出 manager，由 supervisor 清理租约后再按有界周期重试选主。
 文件大小相同不代表协议兼容。
 不兼容时进程以 78 退出，单独反复重启 Pod 无法恢复。
 
