@@ -26,6 +26,18 @@ heartbeat. Generation checks fence replaced managers and reused slots. Spatial
 managers maintain memory state without joining compute rotation. These deadlines
 do not preempt a kernel already submitted to the device.
 
+A timing sample is published only when every SDK timing call succeeds. A batch
+that admits more than one stream in a context uses an untimed device drain,
+rather than timing only its last stream or serializing application streams.
+Failed timing falls back to that drain as well; if the drain itself fails, the
+process exits with code 78 instead of publishing completion and submitting more
+work. Single-stream batches retain the event-timing path.
+
+New clients wait for a live, published manager lease with matching memory and
+compute limits. Election and cleanup invalidate local readiness; a retained
+`initialized` flag alone cannot authorize a client to reuse stale limits. This
+check occurs at client startup, not on every allocation or kernel launch.
+
 Normal tickets atomically bind a batch ID to the remaining balance. A worker
 paused across a round change cannot spend a replacement batch's tickets using
 its old snapshot. A rejected stale attempt returns to state/context initialization.
@@ -83,6 +95,15 @@ DCMI 查询在全新进程中执行，由独立 subreaper 超时终止并回收�
 不参与计算轮转。这些期限不会抢占已提交的设备算子。
 五毫秒延迟判断只计算 worker 进入测量前的等待；进入测量后的设备同步即使超过五毫秒，
 仍可在 500 毫秒报告期限内提交有效样本。缺失或过期的测量入口时间戳会使样本失效。
+
+只有全部 SDK 计时调用成功才发布有效耗时。同一 context 的批次准入多条 stream 时，
+使用不计时的设备排空，避免只测最后一条流或强制改变应用流之间的执行顺序。
+计时失败也回退到该排空路径；排空本身失败时进程以 78 退出，不会继续发布完成报告
+并提交新工作。单 stream 批次仍使用原有事件计时路径。
+
+新 client 会等待已发布且存活的 manager 租约，并核对显存和计算额度。
+选主及清理会先撤销本地就绪标记，残留的 initialized 不能单独授权复用旧额度。
+此检查只发生在 client 启动阶段，不会在每次分配或算子发射时查询进程状态。
 
 普通令牌将批次号和余额绑定在同一个原子值中。跨轮次暂停的 worker 不能用旧快照
 消耗新批次的令牌；过期尝试会重新检查状态并初始化当前批次的上下文。

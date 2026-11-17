@@ -82,15 +82,17 @@ pub mod externed_api {
     static NEXT: AtomicU64 = AtomicU64::new(100);
     pub static SYNC_OBSERVER: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
     pub static CAPTURE_STATUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    pub static FAILURE_STAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    pub static ELAPSED_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2.5f32.to_bits());
     pub const RT_ERROR_NONE: u64 = 0;
     pub const RT_ERROR_MEMORY_ALLOCATION: u64 = 207001;
     pub unsafe fn rtStreamCreate(out: *mut u64, _: i32) -> i32 { unsafe { *out = NEXT.fetch_add(1,Ordering::Relaxed); } track_resource(unsafe { *out }); trace(Call::StreamCreate(CONTEXT.get())); 0 }
     pub unsafe fn rtEventCreate(out: *mut u64) -> usize { unsafe { *out = NEXT.fetch_add(1,Ordering::Relaxed); } track_resource(unsafe { *out }); trace(Call::EventCreate(CONTEXT.get())); 0 }
-    pub unsafe fn rtEventRecord(event: u64, stream: u64) -> usize { check_resource(event); check_resource(stream); trace(Call::Record(event,stream)); 0 }
-    pub unsafe fn rtStreamWaitEvent(stream: u64, event: u64) -> usize { check_resource(stream); check_resource(event); trace(Call::Wait(stream,event)); 0 }
-    pub unsafe fn rtStreamSynchronize(stream: u64) -> i32 { check_resource(stream); trace(Call::StreamSync(stream)); let observer = *SYNC_OBSERVER.lock().unwrap(); if let Some(observe) = observer { observe(); } 0 }
-    pub unsafe fn rtDeviceSynchronize() -> i32 { trace(Call::DeviceSync); 0 }
-    pub unsafe fn rtEventElapsedTime(out: *mut f32, first: u64,last:u64) -> usize { check_resource(first); check_resource(last); trace(Call::Elapsed(first,last)); unsafe { *out = 2.5; } 0 }
+    pub unsafe fn rtEventRecord(event: u64, stream: u64) -> usize { check_resource(event); check_resource(stream); trace(Call::Record(event,stream)); let stage=FAILURE_STAGE.load(Ordering::Relaxed); if matches!((stage,event),(1,11)|(3,13)|(5,12)) {17} else {0} }
+    pub unsafe fn rtStreamWaitEvent(stream: u64, event: u64) -> usize { check_resource(stream); check_resource(event); trace(Call::Wait(stream,event)); if FAILURE_STAGE.load(Ordering::Relaxed)==4 {17} else {0} }
+    pub unsafe fn rtStreamSynchronize(stream: u64) -> i32 { check_resource(stream); trace(Call::StreamSync(stream)); let observer = *SYNC_OBSERVER.lock().unwrap(); if let Some(observe) = observer { observe(); } if FAILURE_STAGE.load(Ordering::Relaxed)==6 {17} else {0} }
+    pub unsafe fn rtDeviceSynchronize() -> i32 { trace(Call::DeviceSync); if FAILURE_STAGE.load(Ordering::Relaxed)==8 {17} else {0} }
+    pub unsafe fn rtEventElapsedTime(out: *mut f32, first: u64,last:u64) -> usize { check_resource(first); check_resource(last); trace(Call::Elapsed(first,last)); unsafe { *out = f32::from_bits(ELAPSED_BITS.load(Ordering::Relaxed)); } if FAILURE_STAGE.load(Ordering::Relaxed)==7 {17} else {0} }
     std::thread_local! { static CONTEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
     pub fn set_context(context: u64) { CONTEXT.set(context); }
     pub unsafe fn rtCtxGetCurrent(out: *mut u64) -> i32 { unsafe { *out = CONTEXT.get() }; 0 }
@@ -102,5 +104,5 @@ pub mod externed_api {
     pub fn current_device() -> i32 { DEVICE.get() }
     pub unsafe fn rtSetDevice(device: i32) -> i32 { DEVICE.set(device); 0 }
     pub unsafe fn rtGetDevice(out: *mut i32) -> i32 { unsafe { *out=DEVICE.get(); } 0 }
-    pub unsafe fn rtStreamGetCaptureInfo(stream: u64, status: *mut u32,_: *mut u64) -> i32 { trace(Call::Capture(stream)); unsafe { *status=CAPTURE_STATUS.load(Ordering::Relaxed); } 0 }
+    pub unsafe fn rtStreamGetCaptureInfo(stream: u64, status: *mut u32,_: *mut u64) -> i32 { trace(Call::Capture(stream)); unsafe { *status=CAPTURE_STATUS.load(Ordering::Relaxed); } if FAILURE_STAGE.load(Ordering::Relaxed)==2 {17} else {0} }
 }

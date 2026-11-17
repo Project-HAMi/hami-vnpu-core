@@ -40,7 +40,9 @@ static unsigned char *domain(const char *base, int physical) {
     assert(fd >= 0 && !ftruncate(fd, 6768));
     unsigned char *shm = mmap(NULL, 6768, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     assert(shm != MAP_FAILED); close(fd);
+    atomic_store((_Atomic uint64_t *)(shm + 16), 100); // configured compute limit
     atomic_store((_Atomic int32_t *)(shm + 6200), getppid()); // live manager owner
+    atomic_store((_Atomic uint32_t *)(shm + 6204), 1); // published lease generation
     atomic_store((_Atomic uint64_t *)(shm + 6208), UINT64_MAX); // fresh heartbeat
     atomic_store((_Atomic uint32_t *)(shm + 6220), 1); // initialized
     atomic_store((_Atomic uint64_t *)(shm + 32), 1); // batch
