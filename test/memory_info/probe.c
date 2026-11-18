@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -30,12 +31,18 @@ static void domain(const char *base, int physical, uint64_t quota, uint64_t used
         return;
     }
     atomic_store((_Atomic uint64_t *)(shm + 0), quota);
+    const char *compute = getenv("NPU_COMPUTE_LIMIT");
+    atomic_store((_Atomic uint64_t *)(shm + 16), compute ? strtoull(compute, NULL, 10) : 1);
     atomic_store((_Atomic int32_t *)(shm + 1080), getpid());
     atomic_store((_Atomic uint64_t *)(shm + 1088), used);
     atomic_store((_Atomic uint32_t *)(shm + 1152), 1);
     /* Keep the synthetic manager lease alive even on a slow CI machine. */
     atomic_store((_Atomic int32_t *)(shm + 6200), getppid());
+    atomic_store((_Atomic uint32_t *)(shm + 6204), 1);
     atomic_store((_Atomic uint64_t *)(shm + 6208), UINT64_MAX);
+    const char *policy = getenv("NPU_SCHED_POLICY");
+    atomic_store((_Atomic int32_t *)(shm + 6216),
+                 policy && !strcmp(policy, "spatial") ? -1 : 0);
     atomic_store((_Atomic uint32_t *)(shm + 6220), 1);
     assert(!munmap(shm, 6768));
 }

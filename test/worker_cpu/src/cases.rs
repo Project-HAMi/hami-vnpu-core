@@ -19,7 +19,7 @@ fn client(tokens: u64, active: bool) -> SchedulerClient {
             my_slot_idx: 0,
             lock: RwLock::new(InnerLock { internal_stream:10, start_event:11, end_event:12,
                 tracking_event:13, batch_active:active, current_batch_id:if active {42} else {0},
-                last_user_stream:6, start_time_us:if active {100} else {0}, admitted_tokens:AtomicU64::new(0) }),
+                last_user_stream:6, start_time_us:if active {100} else {0}, admitted_tokens:AtomicU64::new(0), measurement_valid:active }),
             retired: AtomicBool::new(false),
         }))])),
         hbm_handle_map:Mutex::new(HashMap::new()), is_stub:false, sched_policy:SchedPolicy::Dynamic,
@@ -480,6 +480,183 @@ fn no_stream_drains_without_reporting_request_idle_time_as_execution() { untimed
 
 #[test]
 fn capture_drains_without_reporting_request_idle_time_as_execution() { untimed_completion(6, 1); }
+
+#[test]
+fn failed_measurement_calls_drain_without_training_and_next_batch_recovers() {
+    use crate::externed_api::FAILURE_STAGE;
+    for stage in 1..=7 {
+        clear_calls();
+        let c = client(1, false);
+        FAILURE_STAGE.store(stage, Ordering::Release);
+        c.wait_for_token(6);
+        if stage == 1 {
+            // The failed start must stay invalid after later SDK calls recover.
+            FAILURE_STAGE.store(0, Ordering::Release);
+        }
+        c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+        let context = timing(&c);
+        c.measure_and_report_batch(&context, &mut context.lock.write().unwrap());
+        assert_eq!(c.inner.shmem.reports[0].duration_us.load(Ordering::Acquire), 0,
+            "SDK failure at stage {stage} published a timing sample");
+        assert!(calls().contains(&Call::DeviceSync), "stage {stage} did not drain safely");
+        assert_eq!(c.inner.shmem.reports[0].batch_id.load(Ordering::Acquire), 42);
+        assert_eq!(c.inner.shmem.admitted_tokens[0].load(Ordering::Acquire), 1);
+
+        FAILURE_STAGE.store(0, Ordering::Release);
+        c.inner.shmem.batch_id.store(43, Ordering::Relaxed);
+        c.inner.shmem.active_workers.store(0, Ordering::Relaxed);
+        c.inner.shmem.reported_count.store(0, Ordering::Relaxed);
+        assert!(c.inner.shmem.tokens_remaining.open(43, 1));
+        c.inner.shmem.state.store(STATE_RUNNING, Ordering::Release);
+        c.wait_for_token(6);
+        c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+        c.measure_and_report_batch(&context, &mut context.lock.write().unwrap());
+        assert_eq!(c.inner.shmem.reports[0].duration_us.load(Ordering::Acquire), 2500,
+            "stage {stage} poisoned a later valid batch");
+    }
+}
+
+#[test]
+fn accepted_stream_switch_drains_all_work_without_training_partial_sample() {
+    let c = client(3, false);
+    c.wait_for_token(6);
+    c.wait_for_token(7);
+    c.wait_for_token(6); // Switching back cannot restore single-stream validity.
+    clear_calls();
+    c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+    let context = timing(&c);
+    c.measure_and_report_batch(&context, &mut context.lock.write().unwrap());
+    assert_eq!(calls(), vec![Call::DeviceSync]);
+    assert_eq!(c.inner.shmem.reports[0].duration_us.load(Ordering::Acquire), 0);
+    assert_eq!(c.inner.shmem.admitted_tokens[0].load(Ordering::Acquire), 3);
+}
+
+#[test]
+fn invalid_elapsed_values_are_not_published_as_execution_time() {
+    use crate::externed_api::ELAPSED_BITS;
+    for value in [f32::NAN, f32::INFINITY, -1.0] {
+        clear_calls();
+        let c = client(1, false);
+        c.wait_for_token(6);
+        ELAPSED_BITS.store(value.to_bits(), Ordering::Release);
+        c.inner.shmem.state.store(STATE_MEASURING, Ordering::Release);
+        let context = timing(&c);
+        c.measure_and_report_batch(&context, &mut context.lock.write().unwrap());
+        assert_eq!(c.inner.shmem.reports[0].duration_us.load(Ordering::Acquire), 0);
+        assert!(calls().contains(&Call::DeviceSync));
+    }
+    ELAPSED_BITS.store(2.5f32.to_bits(), Ordering::Release);
+}
+
+#[test]
+fn failed_device_drain_stops_instead_of_publishing_completion() {
+    const CHILD: &str = "HAMI_TEST_FAILED_DRAIN_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let c = client(1, true);
+        let context = timing(&c);
+        context.lock.write().unwrap().last_user_stream = 0;
+        crate::externed_api::FAILURE_STAGE.store(8, Ordering::Release);
+        c.measure_and_report_batch(&context, &mut context.lock.write().unwrap());
+        panic!("failed device drain returned to the application");
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "worker::audit::failed_device_drain_stops_instead_of_publishing_completion", "--nocapture"])
+        .env(CHILD, "1")
+        .output().unwrap();
+    assert_eq!(output.status.code(), Some(78), "{}", String::from_utf8_lossy(&output.stdout));
+}
+
+fn ready_manager_fixture() -> (&'static LocalContainerShmem, ManagerConfig, u64) {
+    let shared = Box::leak(Box::new(unsafe { std::mem::zeroed::<LocalContainerShmem>() }));
+    let config = ManagerConfig {
+        global_shm_path: String::new(), local_shm_path: String::new(), physical_device_id: Some(0),
+        compute_limit: 50, memory_limit_mb: 1, sched_policy: SchedPolicy::Dynamic,
+        overdraft: crate::config::OverdraftConfig { limit:10, timeout_us:5000, poll_interval_us:1000 },
+    };
+    let now = 5_000_000;
+    shared.manager_pid.store(std::process::id() as i32, Ordering::Relaxed);
+    shared.manager_generation.store(1, Ordering::Relaxed);
+    shared.manager_heartbeat.store(now, Ordering::Relaxed);
+    shared.manager_global_idx.store(0, Ordering::Relaxed);
+    shared.memory_limit.store(1024 * 1024, Ordering::Relaxed);
+    shared.compute_limit.store(50, Ordering::Relaxed);
+    shared.initialized.store(1, Ordering::Release);
+    (shared, config, now)
+}
+
+#[test]
+fn initialized_file_needs_a_live_published_manager_with_matching_limits() {
+    let (shared, config, now) = ready_manager_fixture();
+    assert!(SchedulerClient::shared_manager_ready(shared, &config, now));
+    shared.manager_pid.store(0, Ordering::Release);
+    assert!(!SchedulerClient::shared_manager_ready(shared, &config, now));
+    shared.manager_pid.store(std::process::id() as i32, Ordering::Release);
+    shared.manager_generation.store(0, Ordering::Release);
+    assert!(!SchedulerClient::shared_manager_ready(shared, &config, now));
+    shared.manager_generation.store(1, Ordering::Release);
+    assert!(!SchedulerClient::shared_manager_ready(shared, &config,
+        now + crate::config::MANAGER_HEARTBEAT_TIMEOUT_US + 1));
+    shared.memory_limit.store(8 * 1024 * 1024, Ordering::Release);
+    assert!(!SchedulerClient::shared_manager_ready(shared, &config, now));
+    shared.memory_limit.store(1024 * 1024, Ordering::Release);
+    shared.compute_limit.store(100, Ordering::Release);
+    assert!(!SchedulerClient::shared_manager_ready(shared, &config, now));
+    shared.compute_limit.store(50, Ordering::Release);
+    shared.initialized.store(0, Ordering::Release);
+    assert!(!SchedulerClient::shared_manager_ready(shared, &config, now));
+    shared.initialized.store(1, Ordering::Release);
+    assert!(SchedulerClient::shared_manager_ready(shared, &config, now));
+}
+
+#[test]
+fn manager_readiness_distinguishes_compute_and_memory_only_domains() {
+    let (shared, mut config, now) = ready_manager_fixture();
+    shared.manager_global_idx.store(-1, Ordering::Release);
+    assert!(!SchedulerClient::shared_manager_ready(shared, &config, now));
+    config.sched_policy = SchedPolicy::Spatial;
+    assert!(SchedulerClient::shared_manager_ready(shared, &config, now));
+    shared.manager_global_idx.store(0, Ordering::Release);
+    assert!(!SchedulerClient::shared_manager_ready(shared, &config, now));
+    config.sched_policy = SchedPolicy::Overdraft;
+    assert!(!SchedulerClient::shared_manager_ready(shared, &config, now));
+    shared.overdraft_limit.store(config.overdraft.limit, Ordering::Release);
+    assert!(SchedulerClient::shared_manager_ready(shared, &config, now));
+}
+
+#[test]
+fn startup_waits_for_republication_instead_of_using_a_stale_quota() {
+    let base = std::env::temp_dir().join(format!("vnpu-startup-{}", std::process::id()));
+    let local = base.with_extension("local");
+    let global = base.with_extension("global");
+    let path = format!("{}.device-0", local.display());
+    let shared = shmem::setup::create_shmem::<LocalContainerShmem>(&path);
+    shared.memory_limit.store(8 * 1024 * 1024, Ordering::Relaxed);
+    shared.initialized.store(1, Ordering::Release);
+    unsafe {
+        std::env::set_var("NPU_LOCAL_SHM_PATH", &local);
+        std::env::set_var("NPU_GLOBAL_SHM_PATH", &global);
+        std::env::set_var("NPU_MEMORY_LIMIT_MB", "1");
+        std::env::set_var("NPU_COMPUTE_LIMIT", "50");
+        std::env::set_var("NPU_SCHED_POLICY", "dynamic");
+    }
+    let (tx, rx) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        let c = SchedulerClient::for_device(0);
+        tx.send((c.get_hbm_quota(), c.check_memory_quota(2 * 1024 * 1024))).unwrap();
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(50)).is_err(), "accepted manager-less stale SHM");
+    shared.initialized.swap(0, Ordering::AcqRel);
+    shared.memory_limit.store(1024 * 1024, Ordering::Relaxed);
+    shared.compute_limit.store(50, Ordering::Relaxed);
+    shared.manager_pid.store(std::process::id() as i32, Ordering::Relaxed);
+    shared.manager_generation.store(1, Ordering::Relaxed);
+    shared.manager_global_idx.store(0, Ordering::Relaxed);
+    shared.manager_heartbeat.store(get_time_us(), Ordering::Relaxed);
+    shared.initialized.store(1, Ordering::Release);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), (1024 * 1024, RT_ERROR_MEMORY_ALLOCATION));
+    thread.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
 
 #[test]
 fn contexts_on_one_card_have_independent_timing_resources_and_report_slots() {

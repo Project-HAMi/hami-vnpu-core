@@ -1,5 +1,21 @@
 use super::*;
 
+#[test]
+fn lease_cleanup_clears_only_its_own_ready_publication() {
+    let m = manager(50.0, false, 500);
+    let local = m.local;
+    local.initialized.store(1, Ordering::Release);
+    drop(m);
+    assert_eq!(local.initialized.load(Ordering::Acquire), 0);
+
+    let m = manager(50.0, false, 500);
+    let local = m.local;
+    local.initialized.store(1, Ordering::Release);
+    local.manager_generation.store(2, Ordering::Release);
+    drop(m);
+    assert_eq!(local.initialized.load(Ordering::Acquire), 1);
+}
+
 fn manager(priority: f64, fixed: bool, average: u64) -> ContainerManager {
     let global = Box::leak(Box::new(unsafe { std::mem::zeroed::<GlobalRegistry>() }));
     let local = Box::leak(Box::new(unsafe {
@@ -555,7 +571,8 @@ fn spatial_memory_manager_does_not_register_or_change_another_pods_compute_turn(
     global.queue_tail.store(12, Ordering::Relaxed);
     global.signal_counter.store(14, Ordering::Relaxed);
     let before = global_snapshot(global);
-    local.initialized.store(1, Ordering::Relaxed);
+    // Election invalidates readiness; this must not erase the live ledger metric.
+    local.initialized.store(0, Ordering::Relaxed);
     local.memory_used.store(4096, Ordering::Relaxed);
     local.manager_pid.store(std::process::id() as i32, Ordering::Relaxed);
     let round = local.overdraft_pool.begin_round().unwrap();

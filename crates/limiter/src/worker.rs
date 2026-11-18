@@ -9,15 +9,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use log::{debug, info, warn};
 
 use crate::check_rts;
-use crate::config::{ManagerConfig, SchedPolicy, VIRTUAL_OVERHEAD_MB};
+use crate::config::{
+    MANAGER_HEARTBEAT_TIMEOUT_US, ManagerConfig, SchedPolicy, VIRTUAL_OVERHEAD_MB,
+};
 use crate::externed_api::*;
 use crate::shmem::{
     self, LocalContainerShmem, MAX_WORKERS, STATE_IDLE, STATE_MEASURING, STATE_RUNNING, futex,
 };
 
 /// Max time a worker waits for the manager to create + initialize shmem before
-/// giving up. On timeout SchedulerClient::new panics and npu_limiter() falls back
-/// to a no-op stub, so a worker never hangs forever when no manager is elected.
+/// giving up. Requested limits fail closed rather than accepting stale shared
+/// state or falling back to an unregulated stub.
 const SHMEM_WAIT_TIMEOUT_SECS: u64 = 10;
 
 /// Atomically subtract `v` from `a`, saturating at 0 (never wraps to ~2^64 on an
@@ -96,6 +98,7 @@ struct InnerLock {
     last_user_stream: u64,      // To track where to record the tracking_event
     start_time_us: u64,         // Wall-clock fallback start timestamp
     admitted_tokens: AtomicU64, // Accepted launches in this context and batch
+    measurement_valid: bool,
 }
 
 /// Runtime virtual addresses and opaque physical-memory handles are separate namespaces.
@@ -408,18 +411,24 @@ impl SchedulerClient {
             &config.local_shm_path,
         );
         let sched_policy = config.sched_policy;
-        let shmem_path = config.local_shm_path;
+        let shmem_path = &config.local_shm_path;
         info!("[Worker PID:{my_pid}] initialize physical device {physical_id}");
         let deadline = Instant::now() + Duration::from_secs(SHMEM_WAIT_TIMEOUT_SECS);
+        let mut mapped = None;
         let shmem = loop {
-            if let Some(s) = shmem::setup::try_open_shmem::<LocalContainerShmem>(&shmem_path)
-                && s.initialized.load(Ordering::Acquire) == 1
+            // Retain a single mapping while waiting for publication. Reopening
+            // an existing, not-ready file leaks a mapping on every retry.
+            if mapped.is_none() {
+                mapped = shmem::setup::try_open_shmem::<LocalContainerShmem>(shmem_path);
+            }
+            if let Some(s) = mapped
+                && Self::shared_manager_ready(s, &config, get_time_us())
             {
                 break s;
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "[Worker PID:{my_pid}] timed out after {SHMEM_WAIT_TIMEOUT_SECS}s waiting for device {physical_id} manager"
+                    "[Worker PID:{my_pid}] timed out after {SHMEM_WAIT_TIMEOUT_SECS}s waiting for a live device {physical_id} manager with matching limits"
                 );
             }
             thread::sleep(Duration::from_millis(200));
@@ -436,6 +445,45 @@ impl SchedulerClient {
                 sched_policy,
             }),
         }
+    }
+
+    fn shared_manager_ready(
+        shared: &LocalContainerShmem,
+        config: &ManagerConfig,
+        now_us: u64,
+    ) -> bool {
+        if shared.initialized.load(Ordering::Acquire) != 1 {
+            return false;
+        }
+        let generation = shared.manager_generation.load(Ordering::Acquire);
+        let pid = shared.manager_pid.load(Ordering::Acquire);
+        let heartbeat = shared.manager_heartbeat.load(Ordering::Acquire);
+        let index = shared.manager_global_idx.load(Ordering::Acquire);
+        let valid_index = if config.sched_policy.is_time_sliced() {
+            (0..shmem::MAX_MANAGERS as i32).contains(&index)
+        } else {
+            index == -1
+        };
+        let expected_overdraft = if config.sched_policy == SchedPolicy::Overdraft {
+            config.overdraft.limit
+        } else {
+            0
+        };
+        generation != 0
+            && pid > 0
+            && heartbeat != 0
+            && now_us.saturating_sub(heartbeat) <= MANAGER_HEARTBEAT_TIMEOUT_US
+            && valid_index
+            && shared.memory_limit.load(Ordering::Acquire)
+                == config.memory_limit_mb * 1024 * 1024
+            && shared.compute_limit.load(Ordering::Acquire) == u64::from(config.compute_limit)
+            && shared.overdraft_limit.load(Ordering::Acquire) == expected_overdraft
+            && proc_alive(pid)
+            // Election invalidates initialized before replacing the lease;
+            // generation and PID rechecks reject a takeover during this read.
+            && shared.initialized.load(Ordering::Acquire) == 1
+            && shared.manager_generation.load(Ordering::Acquire) == generation
+            && shared.manager_pid.load(Ordering::Acquire) == pid
     }
 
     fn current_context() -> u64 {
@@ -626,6 +674,7 @@ impl SchedulerClient {
             last_user_stream: 0,
             start_time_us: 0,
             admitted_tokens: AtomicU64::new(0),
+            measurement_valid: false,
         }
     }
 }
@@ -732,6 +781,13 @@ impl SchedulerClient {
                         // A pending request must not change the previous batch's
                         // measurement stream. Publish this request's stream only
                         // after admission, including after releasing the lock to wait.
+                        if lock.batch_active && lock.last_user_stream != user_stream {
+                            // A tail event on only the last stream cannot drain
+                            // independent work admitted earlier in this batch.
+                            // Keep application streams concurrent; use an
+                            // untimed device drain instead of adding dependencies.
+                            lock.measurement_valid = false;
+                        }
                         lock.last_user_stream = user_stream;
 
                         // First Token of Batch
@@ -763,9 +819,9 @@ impl SchedulerClient {
                             lock.start_time_us = now_us;
 
                             // GPU Start Event (Internal Stream)
-                            check_rts!(unsafe {
+                            lock.measurement_valid = check_rts!(unsafe {
                                 rtEventRecord(lock.start_event, lock.internal_stream)
-                            });
+                            }) == 0;
                         }
 
                         lock.admitted_tokens.fetch_add(1, Ordering::Relaxed);
@@ -845,45 +901,16 @@ impl SchedulerClient {
         // report later publishes this timestamp through its batch_id release-store.
         self.inner.shmem.measurement_started_us[timing.my_slot_idx]
             .store(shmem::monotonic_time_us(), Ordering::Release);
-        let mut duration_us: u64 = 0;
-        let mut untimed_drain = false;
-
-        if lock.last_user_stream != 0 {
-            let mut status: u32 = 0;
-            let mut model: u64 = 0;
-            let _ = check_rts!(unsafe {
-                rtStreamGetCaptureInfo(lock.last_user_stream, &mut status, &mut model)
-            });
-            if status != 0 {
-                debug!(
-                    "[Limiter] stream 0x{:x} is capturing; draining without a timing sample.",
-                    lock.last_user_stream
-                );
-                check_rts!(unsafe { rtDeviceSynchronize() });
-                // Wall time includes request gaps and delayed reporting. Mark
-                // completion, but do not use it to train the scheduling average.
-                untimed_drain = true;
+        let duration_us = self.measured_duration(lock).unwrap_or_else(|| {
+            // Missing, multi-stream, capturing or failed timing cannot train
+            // the average. Completion still requires a successful device drain.
+            // A failed drain must not let this process submit another batch.
+            if check_rts!(unsafe { rtDeviceSynchronize() }) != 0 {
+                eprintln!("[hami-vnpu-core] cannot drain NPU work after an invalid measurement");
+                unsafe { libc::_exit(78) }
             }
-        }
-
-        // With no user stream, drain the device without a timing sample.
-        if !untimed_drain && lock.last_user_stream == 0 {
-            debug!("[Limiter] no last user stream; draining without a timing sample.");
-            check_rts!(unsafe { rtDeviceSynchronize() });
-            // This synchronizes outstanding work without claiming a measured
-            // execution duration. A zero duration is an untimed completion.
-            untimed_drain = true;
-        }
-
-        if !untimed_drain {
-            check_rts!(unsafe { rtEventRecord(lock.tracking_event, lock.last_user_stream) });
-            check_rts!(unsafe { rtStreamWaitEvent(lock.internal_stream, lock.tracking_event) });
-            check_rts!(unsafe { rtEventRecord(lock.end_event, lock.internal_stream) });
-            check_rts!(unsafe { rtStreamSynchronize(lock.internal_stream) });
-            let mut ms: f32 = 0.0;
-            check_rts!(unsafe { rtEventElapsedTime(&mut ms, lock.start_event, lock.end_event) });
-            duration_us = (ms * 1000.0) as u64;
-        }
+            0
+        });
 
         // Report to Shared Memory
         let slot = &self.inner.shmem.reports[timing.my_slot_idx];
@@ -902,6 +929,33 @@ impl SchedulerClient {
 
         lock.batch_active = false;
         lock.start_time_us = 0;
+    }
+
+    fn measured_duration(&self, lock: &InnerLock) -> Option<u64> {
+        if !lock.measurement_valid || lock.last_user_stream == 0 {
+            return None;
+        }
+        let mut status = 0;
+        let mut model = 0;
+        if check_rts!(unsafe {
+            rtStreamGetCaptureInfo(lock.last_user_stream, &mut status, &mut model)
+        }) != 0
+            || status != 0
+            || check_rts!(unsafe { rtEventRecord(lock.tracking_event, lock.last_user_stream) }) != 0
+            || check_rts!(unsafe { rtStreamWaitEvent(lock.internal_stream, lock.tracking_event) })
+                != 0
+            || check_rts!(unsafe { rtEventRecord(lock.end_event, lock.internal_stream) }) != 0
+            || check_rts!(unsafe { rtStreamSynchronize(lock.internal_stream) }) != 0
+        {
+            return None;
+        }
+        let mut ms = 0.0;
+        if check_rts!(unsafe { rtEventElapsedTime(&mut ms, lock.start_event, lock.end_event) }) != 0
+        {
+            return None;
+        }
+        let us = f64::from(ms) * 1000.0;
+        (us.is_finite() && us >= 0.0 && us < u64::MAX as f64).then_some(us as u64)
     }
 }
 

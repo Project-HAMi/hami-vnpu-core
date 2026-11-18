@@ -25,7 +25,7 @@ use std::sync::Arc;
 /// Kept comfortably above the global watchdog (1s) so the two mechanisms don't fight,
 /// and well above the sub-millisecond window between winning election and the first
 /// heartbeat write.
-const TAKEOVER_TIMEOUT_US: u64 = 3_000_000;
+const TAKEOVER_TIMEOUT_US: u64 = crate::config::MANAGER_HEARTBEAT_TIMEOUT_US;
 /// How long to sleep between election attempts / watch polls.
 const POLL_MS: u64 = 500;
 
@@ -172,24 +172,17 @@ fn run_configured(physical_device_id: Option<u32>) {
 /// now own it — `0` for a fast-path win (no dead predecessor), or the dead manager's pid we
 /// took over from (so the caller reclaims exactly that manager's global slot). `None` on loss.
 fn try_become_manager(local: &LocalContainerShmem, my_pid: i32) -> Option<i32> {
-    if local
-        .manager_pid
-        .compare_exchange(0, my_pid, Ordering::AcqRel, Ordering::Relaxed)
-        .is_ok()
-    {
-        local
-            .manager_heartbeat
-            .store(get_time_us(), Ordering::Release);
-        return Some(0);
+    let owner = local.manager_pid.load(Ordering::Acquire);
+    if owner != 0 && owner != my_pid && manager_alive(local, owner) {
+        return None;
     }
 
-    let owner = local.manager_pid.load(Ordering::Acquire);
-    if owner == my_pid {
-        return Some(0);
-    }
-    if owner != 0
-        && !manager_alive(local, owner)
-        && local
+    // The registry transaction serializes every election and lease cleanup.
+    // Clear readiness before changing any lease/configuration fields. The
+    // acquire half keeps subsequent writes behind this invalidation.
+    local.initialized.swap(0, Ordering::AcqRel);
+    if owner == my_pid
+        || local
             .manager_pid
             .compare_exchange(owner, my_pid, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
@@ -197,11 +190,13 @@ fn try_become_manager(local: &LocalContainerShmem, my_pid: i32) -> Option<i32> {
         local
             .manager_heartbeat
             .store(get_time_us(), Ordering::Release);
-        warn!(
-            "[Supervisor PID:{}] took over from dead/stale manager {}",
-            my_pid, owner
-        );
-        return Some(owner);
+        if owner != 0 && owner != my_pid {
+            warn!(
+                "[Supervisor PID:{}] took over from dead/stale manager {}",
+                my_pid, owner
+            );
+        }
+        return Some(if owner == my_pid { 0 } else { owner });
     }
     None
 }
@@ -264,4 +259,23 @@ fn get_time_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn election_invalidates_ready_state_before_new_configuration() {
+        let local: LocalContainerShmem = unsafe { std::mem::zeroed() };
+        let pid = std::process::id() as i32;
+        local.initialized.store(1, Ordering::Release);
+        assert_eq!(try_become_manager(&local, pid), Some(0));
+        assert_eq!(local.initialized.load(Ordering::Acquire), 0);
+        assert_eq!(local.manager_pid.load(Ordering::Acquire), pid);
+        // Re-election of this process must also wait for republication.
+        local.initialized.store(1, Ordering::Release);
+        assert_eq!(try_become_manager(&local, pid), Some(0));
+        assert_eq!(local.initialized.load(Ordering::Acquire), 0);
+    }
 }

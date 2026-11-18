@@ -167,9 +167,8 @@ impl ContainerManager {
         local
             .memory_limit
             .store(memory_limit_bytes, Ordering::Relaxed);
-        if local.initialized.load(Ordering::Acquire) == 0 {
-            local.memory_used.store(0, Ordering::Relaxed);
-        }
+        // Fresh mappings are zeroed already. A takeover clears readiness but
+        // must preserve the live process ledger and its compatibility metric.
         local
             .compute_limit
             .store(compute_limit as u64, Ordering::Relaxed);
@@ -843,6 +842,7 @@ impl Drop for ContainerManager {
             }
         }
         if self.owns_local_lease() {
+            self.local.initialized.swap(0, Ordering::AcqRel);
             self.local.overdraft_pool.close();
             self.local.manager_pid.store(0, Ordering::Release);
             self.local.manager_global_idx.store(-1, Ordering::Release);

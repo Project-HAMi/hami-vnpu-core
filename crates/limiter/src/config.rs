@@ -18,6 +18,7 @@ pub const DEFAULT_LOCAL_SHMEM_PATH: &str = "/tmp/vnpu_local_shmem";
 pub const DEFAULT_COMPUTE_LIMIT: u32 = 1;
 pub const DEFAULT_MEMORY_LIMIT_MB: u64 = 0;
 pub const DEFAULT_SCHED_POLICY: SchedPolicy = SchedPolicy::Spatial;
+pub(crate) const MANAGER_HEARTBEAT_TIMEOUT_US: u64 = 3_000_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct OverdraftConfig {
